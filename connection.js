@@ -11,7 +11,6 @@ const ethUtil = require('ethereumjs-util');
 const crypto = require('crypto');
 const DiodeRPC = require('./rpc');
 const abi = require('ethereumjs-abi');
-
 class DiodeConnection extends EventEmitter {
   constructor(host, port, certPath) {
     super();
@@ -230,6 +229,7 @@ class DiodeConnection extends EventEmitter {
 
         const ecPrivateKey = ECPrivateKeyASN.decode(privateKeyOctetString, 'der');
         privateKeyBytes = ecPrivateKey.privateKey;
+        console.log('Private key bytes:', privateKeyBytes.toString('hex'));
       } else {
         throw new Error('Unsupported key format. Expected EC PRIVATE KEY or PRIVATE KEY in PEM format.');
       }
@@ -264,6 +264,8 @@ class DiodeConnection extends EventEmitter {
       const publicKeyBuffer = Buffer.isBuffer(serverCert.pubkey)
         ? serverCert.pubkey
         : Buffer.from(serverCert.pubkey);
+
+      console.log('Public key Server:', publicKeyBuffer.toString('hex'));
 
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
@@ -381,6 +383,7 @@ class DiodeConnection extends EventEmitter {
   }
 
   async createTicketSignature(serverIdBuffer, totalConnections, totalBytes, localAddress = '') {
+    this.getEthereumAddress()
     const chainId = 1284;
     const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
   
@@ -389,17 +392,17 @@ class DiodeConnection extends EventEmitter {
     const epoch = await rpc.getEpoch();
   
     // Hash of localAddress (empty string)
-    const localAddressHash = ethUtil.keccak256(Buffer.from(localAddress, 'utf8'));
+    const localAddressHash = crypto.createHash('sha256').update(Buffer.from(localAddress, 'utf8')).digest();
   
     // Data to sign
     const dataToSign = [
-      ethUtil.toBuffer(chainId),
-      ethUtil.toBuffer(epoch),
-      fleetContractBuffer,
-      serverIdBuffer,
-      ethUtil.toBuffer(totalConnections),
-      ethUtil.toBuffer(totalBytes),
-      localAddressHash,
+      ethUtil.setLengthLeft(ethUtil.toBuffer(chainId), 32),
+      ethUtil.setLengthLeft(ethUtil.toBuffer(epoch), 32),
+      ethUtil.setLengthLeft(fleetContractBuffer, 32),
+      ethUtil.setLengthLeft(ethUtil.toBuffer(serverIdBuffer), 32),
+      ethUtil.setLengthLeft(ethUtil.toBuffer(totalConnections), 32),
+      ethUtil.setLengthLeft(ethUtil.toBuffer(totalBytes), 32),
+      ethUtil.setLengthLeft(localAddressHash, 32),
     ];
 
     // Convert each element in dataToSign to bytes32 and concatenate them
@@ -414,8 +417,8 @@ class DiodeConnection extends EventEmitter {
     const privateKey = this.getPrivateKey();
     const msgHash = ethUtil.keccak256(encodedData);
     console.log('Message hash:', msgHash.toString('hex'));
-    const signature = ethUtil.ecsign(msgHash, privateKey);
-  
+    const signature = secp256k1.ecdsaSign(msgHash, privateKey);
+    console.log('Signature:', signature);
     // // Extract r, s, and rec (v)
     // const r = signature.r;
     // const s = signature.s;
@@ -423,9 +426,8 @@ class DiodeConnection extends EventEmitter {
   
     // return { r, s, rec };
     const signatureBuffer = Buffer.concat([
-      signature.r,
-      signature.s,
-      Buffer.from([signature.v]),
+      ethUtil.toBuffer([signature.recid]),
+      signature.signature
     ]);
 
     return signatureBuffer;
@@ -459,6 +461,7 @@ class DiodeConnection extends EventEmitter {
       totalBytes,
       localAddress
     );
+    console.log('Signature hex:', signature.toString('hex'));
     // Get epoch
     const rpc = new DiodeRPC(this);
     const epoch = await rpc.getEpoch();
@@ -491,5 +494,6 @@ class DiodeConnection extends EventEmitter {
     this.socket.end();
   }
 }
+
 
 module.exports = DiodeConnection;
