@@ -3,6 +3,10 @@ const { makeReadable, parseRequestId, parseResponseType, parseReason } = require
 class DiodeRPC {
     constructor(connection) {
       this.connection = connection;
+      this.epochCache = {
+        epoch: null,
+        expiry: null,
+      };
     }
   
     getBlockPeak() {
@@ -17,7 +21,7 @@ class DiodeRPC {
           } else if (typeof blockNumberRaw === 'number') {
             blockNumber = blockNumberRaw;
           } else {
-            throw new Error('Invalid block number format');
+            throw new Error('Invalid block number format. response:', makeReadable(responseData));
           }
           return blockNumber;
         });
@@ -80,23 +84,21 @@ class DiodeRPC {
         const bytesToSend = data.length;
         this.connection.totalBytes += bytesToSend;
     
-        // Send a new ticket before sending data
-        try {
-          const ticketCommand = await this.connection.createTicketCommand();
-          const ticketResponse = await this.connection.sendCommand(ticketCommand);
-          console.log('Ticket updated:', ticketResponse);
-        } catch (error) {
-          console.error('Error updating ticket:', error);
-          throw error;
-        }
-    
         // Now send the data
-        return this.connection.sendCommand(['portsend', ref, data]).then((responseData) => {
+        return this.connection.sendCommand(['portsend', ref, data]).then(async (responseData) => {
           // responseData is [status]
           const [statusRaw] = responseData;
           const status = parseResponseType(statusRaw);
       
           if (status === 'ok') {
+            try {
+              const ticketCommand = await this.connection.createTicketCommand();
+              const ticketResponse = this.connection.sendCommand(ticketCommand);
+              console.log('Ticket updated:', ticketResponse);
+            } catch (error) {
+              console.error('Error updating ticket:', error);
+              throw error;
+            }
             return;
           } else if (status === 'error') {
             throw new Error('Error during port send');
@@ -124,7 +126,17 @@ class DiodeRPC {
         });
       }
 
+      sendError(sessionId, ref, error) {
+        return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId);
+      }
+
       async getEpoch() {
+        const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
+        if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
+          console.log('Using cached epoch:', this.epochCache.epoch);
+          return this.epochCache.epoch;
+        }
+        console.log('Fetching new epoch. Expiry:', this.epochCache.expiry);
         const blockPeak = await this.getBlockPeak();
         const blockHeader = await this.getBlockHeader(blockPeak);
     
@@ -133,6 +145,13 @@ class DiodeRPC {
         const epochDuration = 2592000; // 30 days in seconds
         const epoch = Math.floor(timestamp / epochDuration);
     
+        // Calculate the time left for the next epoch
+        const timeLeft = epochDuration - (timestamp % epochDuration);
+
+        // Cache the epoch and the expiry time
+        this.epochCache.epoch = epoch;
+        this.epochCache.expiry = currentTime + timeLeft;
+
         return epoch;
       }
     

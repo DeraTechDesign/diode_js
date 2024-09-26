@@ -1,7 +1,7 @@
 const { DiodeConnection, BindPort } = require('../index');
 
 async function main() {
-    const host = 'eu2.prenet.diode.io';
+    const host = 'us2.prenet.diode.io';
     const port = 41046;
     const certPath = 'device_certificate.pem';
   

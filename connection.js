@@ -24,6 +24,7 @@ class DiodeConnection extends EventEmitter {
     this.totalBytes = 128000; // start with 128KB
     // Add buffer to handle partial data
     this.receiveBuffer = Buffer.alloc(0);
+    this.RPC = new DiodeRPC(this);
   }
 
   connect() {
@@ -85,7 +86,7 @@ class DiodeConnection extends EventEmitter {
   
       try {
         const decodedMessage = RLP.decode(Uint8Array.from(messageBuffer));
-        console.log('Decoded message:', decodedMessage);
+        console.log('Decoded message:', makeReadable(decodedMessage));
     
         if (Array.isArray(decodedMessage) && decodedMessage.length > 1) {
           const requestIdRaw = decodedMessage[0];
@@ -101,6 +102,7 @@ class DiodeConnection extends EventEmitter {
           if (requestId !== null && this.pendingRequests.has(requestId)) {
             // This is a response to a pending request
             const [responseTypeRaw, ...responseData] = responseArray;
+            const responseRaw = responseData[0];
     
             // Debug statements
             console.log('responseTypeRaw:', responseTypeRaw);
@@ -117,6 +119,14 @@ class DiodeConnection extends EventEmitter {
             const { resolve, reject } = this.pendingRequests.get(requestId);
     
             if (responseType === 'response') {
+              if (!Array.isArray(responseRaw) && makeReadable(responseRaw) === 'too_low') {
+                this.fixResponse(responseData);
+                // Re-send the ticket command
+                this.createTicketCommand().then((ticketCommand) => {
+                  this.sendCommand(ticketCommand).then(resolve).catch(reject);
+                }).catch(reject);
+                resolve(responseData);
+              }
               resolve(responseData);
             } else if (responseType === 'error') {
               const errorCode = responseData[0]; // Optional: You can log or use this
@@ -149,6 +159,25 @@ class DiodeConnection extends EventEmitter {
     this.receiveBuffer = this.receiveBuffer.slice(offset);
   }
 
+  fixResponse(response) {
+    /* response is : 
+    [
+    'too_low',
+    1284,
+    666,
+    11,
+    135591,
+    'test',
+    '0x01eb1726dd7286d2dab222ea5dfef7c820cd01c30936240f5780a6e468e731f3b55d4c963b3eb768663263b396555aa52be49d7d3ae2a9173732fa410ad46434f3'
+  ]
+    [3] is last totalConnections
+    [4] is last totalBytes
+    */
+    const totalConnectionsBuffer = Buffer.from(response[3]);
+    const totalBytesBuffer = Buffer.from(response[4]);
+    this.totalConnections = parseInt(totalConnectionsBuffer.readUIntBE(0, totalConnectionsBuffer.length), 10) +1;
+    this.totalBytes = parseInt(totalBytesBuffer.readUIntBE(0, totalBytesBuffer.length), 10) + 128000;
+  }
 
   sendCommand(commandArray) {
     return new Promise((resolve, reject) => {
@@ -161,6 +190,39 @@ class DiodeConnection extends EventEmitter {
         return;
       }
       const requestId = this._getNextRequestId();
+      // Build the message as [requestId, [commandArray]]
+      const commandWithId = [requestId, commandArray];
+
+      // Store the promise callbacks to resolve/reject later
+      this.pendingRequests.set(requestId, { resolve, reject });
+
+      const commandBuffer = RLP.encode(commandWithId);
+      const byteLength = Buffer.byteLength(commandBuffer);
+
+      // Create a 2-byte length buffer
+      const lengthBuffer = Buffer.alloc(2);
+      lengthBuffer.writeUInt16BE(byteLength, 0);
+
+      const message = Buffer.concat([lengthBuffer, commandBuffer]);
+
+      console.log(`Sending command with requestId ${requestId}:`, commandArray);
+      console.log('Command buffer:', message.toString('hex'));
+
+      this.socket.write(message);
+    });
+  }
+
+  sendCommandWithSessionId(commandArray, sessionId) {
+    return new Promise((resolve, reject) => {
+      //check if connection is alive
+      if (!this.socket || this.socket.destroyed) {
+        //reconnect
+        this.connect().then(() => {
+          this.sendCommand(commandArray).then(resolve).catch(reject);
+        }).catch(reject);
+        return;
+      }
+      const requestId = sessionId;
       // Build the message as [requestId, [commandArray]]
       const commandWithId = [requestId, commandArray];
 
@@ -388,8 +450,7 @@ class DiodeConnection extends EventEmitter {
     const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
   
     // Get epoch
-    const rpc = new DiodeRPC(this);
-    const epoch = await rpc.getEpoch();
+    const epoch = await this.RPC.getEpoch();
   
     // Hash of localAddress (empty string)
     const localAddressHash = crypto.createHash('sha256').update(Buffer.from(localAddress, 'utf8')).digest();
@@ -436,7 +497,7 @@ class DiodeConnection extends EventEmitter {
   async createTicketCommand() {
     const chainId = 1284;
     const fleetContract = ethUtil.toBuffer('0x6000000000000000000000000000000000000000')
-    const localAddress = 'test'; // Always empty string
+    const localAddress = 'test2'; // Always empty string
   
     // Increment totalConnections
     this.totalConnections += 1;
@@ -463,8 +524,7 @@ class DiodeConnection extends EventEmitter {
     );
     console.log('Signature hex:', signature.toString('hex'));
     // Get epoch
-    const rpc = new DiodeRPC(this);
-    const epoch = await rpc.getEpoch();
+    const epoch = await this.RPC.getEpoch();
   
     // Construct the ticket command
     const ticketCommand = [

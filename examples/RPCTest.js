@@ -8,8 +8,7 @@ async function main() {
 
   const connection = new DiodeConnection(host, port, certPath);
   await connection.connect();
-
-  const rpc = new DiodeRPC(connection);
+  const rpc = connection.RPC;
 
   try {
     const address = connection.getEthereumAddress();
