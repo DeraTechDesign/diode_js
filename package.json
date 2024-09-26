@@ -1,7 +1,7 @@
 {
-  "name": "diode_client_js",
-  "version": "1.0.0",
-  "description": "",
+  "name": "diodejs",
+  "version": "0.0.3",
+  "description": "A JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
