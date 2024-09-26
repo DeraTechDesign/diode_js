@@ -3,6 +3,10 @@
 ## Overview
 `diode_js` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind ports, send RPC commands, and handle responses.
 
+## Installation
+```bash
+npm install diodejs
+```
 ## Quick Start
 
 To get started, you need to generate a device certificate using OpenSSL. You can use this command:
