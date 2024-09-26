@@ -56,7 +56,13 @@ class DiodeConnection extends EventEmitter {
         }
       });
 
-      this.socket.on('data', (data) => this._handleData(data));
+      this.socket.on('data', (data) => {
+        try {
+          this._handleData(data);
+        } catch (error) {
+          console.error('Error handling data:', error);
+        }
+      });
       this.socket.on('error', (err) => {
         console.error('Connection error:', err);
         reject(err);
@@ -117,28 +123,30 @@ class DiodeConnection extends EventEmitter {
             console.log(`Response Type: '${responseType}'`);
     
             const { resolve, reject } = this.pendingRequests.get(requestId);
-    
-            if (responseType === 'response') {
-              if (!Array.isArray(responseRaw) && makeReadable(responseRaw) === 'too_low') {
-                this.fixResponse(responseData);
-                // Re-send the ticket command
-                this.createTicketCommand().then((ticketCommand) => {
-                  this.sendCommand(ticketCommand).then(resolve).catch(reject);
-                }).catch(reject);
+            try{
+              if (responseType === 'response') {
+                if (!Array.isArray(responseRaw) && makeReadable(responseRaw) === 'too_low') {
+                  this.fixResponse(responseData);
+                  // Re-send the ticket command
+                  this.createTicketCommand().then((ticketCommand) => {
+                    this.sendCommand(ticketCommand).then(resolve).catch(reject);
+                  }).catch(reject);
+                  resolve(responseData);
+                }
+                resolve(responseData);
+              } else if (responseType === 'error') {
+                if (responseData.length > 1) {
+                  const reason = parseReason(responseData[1]);
+                  reject(new Error(reason));
+                } else {
+                  const reason = parseReason(responseData[0]);
+                  reject(new Error(reason));
+                }
+              } else {
                 resolve(responseData);
               }
-              resolve(responseData);
-            } else if (responseType === 'error') {
-              const errorCode = responseData[0]; // Optional: You can log or use this
-              if (responseData.length > 1) {
-                const reason = parseReason(responseData[1]);
-                reject(new Error(reason));
-              } else {
-                const reason = parseReason(responseData[0]);
-                reject(new Error(reason));
-              }
-            } else {
-              resolve(responseData);
+            } catch (error) {
+              console.error('Error handling response:', error);
             }
             this.pendingRequests.delete(requestId);
           } else {
@@ -154,6 +162,7 @@ class DiodeConnection extends EventEmitter {
         console.error('Error decoding message:', error);
       }
     }
+    
   
     // Remove processed data from the buffer
     this.receiveBuffer = this.receiveBuffer.slice(offset);
@@ -444,13 +453,10 @@ class DiodeConnection extends EventEmitter {
     }
   }
 
-  async createTicketSignature(serverIdBuffer, totalConnections, totalBytes, localAddress = '') {
+  async createTicketSignature(serverIdBuffer, totalConnections, totalBytes, localAddress, epoch) { 
     this.getEthereumAddress()
     const chainId = 1284;
     const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
-  
-    // Get epoch
-    const epoch = await this.RPC.getEpoch();
   
     // Hash of localAddress (empty string)
     const localAddressHash = crypto.createHash('sha256').update(Buffer.from(localAddress, 'utf8')).digest();
@@ -480,12 +486,7 @@ class DiodeConnection extends EventEmitter {
     console.log('Message hash:', msgHash.toString('hex'));
     const signature = secp256k1.ecdsaSign(msgHash, privateKey);
     console.log('Signature:', signature);
-    // // Extract r, s, and rec (v)
-    // const r = signature.r;
-    // const s = signature.s;
-    // const rec = Buffer.from([signature.v - 27]); // Adjust v to rec (v should be 27 or 28)
-  
-    // return { r, s, rec };
+    
     const signatureBuffer = Buffer.concat([
       ethUtil.toBuffer([signature.recid]),
       signature.signature
@@ -501,30 +502,25 @@ class DiodeConnection extends EventEmitter {
   
     // Increment totalConnections
     this.totalConnections += 1;
+    const totalConnections = this.totalConnections;
   
     // Assume totalBytes is managed elsewhere
     const totalBytes = this.totalBytes;
   
     // Get server Ethereum address as Buffer
     const serverIdBuffer = this.getServerEthereumAddress();
-  
-    // Create device signature and extract r, s, rec
-    // const { r, s, rec } = await this.createTicketSignature(
-    //   serverIdBuffer,
-    //   this.totalConnections,
-    //   totalBytes,
-    //   localAddress
-    // );
-  
-    const signature = await this.createTicketSignature(
-      serverIdBuffer,
-      this.totalConnections,
-      totalBytes,
-      localAddress
-    );
-    console.log('Signature hex:', signature.toString('hex'));
+
     // Get epoch
     const epoch = await this.RPC.getEpoch();
+    const signature = await this.createTicketSignature(
+      serverIdBuffer,
+      totalConnections,
+      totalBytes,
+      localAddress,
+      epoch
+    );
+    console.log('Signature hex:', signature.toString('hex'));
+
   
     // Construct the ticket command
     const ticketCommand = [
@@ -532,13 +528,10 @@ class DiodeConnection extends EventEmitter {
       chainId,
       epoch,
       fleetContract,
-      this.totalConnections,
+      totalConnections,
       totalBytes,
       localAddress,
       signature
-      // r,
-      // s,
-      // rec,
     ];
   
     return ticketCommand;

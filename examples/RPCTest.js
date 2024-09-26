@@ -13,13 +13,12 @@ async function main() {
   try {
     const address = connection.getEthereumAddress();
     console.log('Address:', address);
-    // const ping = await rpc.ping();
-    // console.log('Ping:', ping);
-    // const blockPeak = await rpc.getBlockPeak();
-    // console.log('Current Block Peak:', blockPeak);
-
-    // const blockHeader = await rpc.getBlockHeader(blockPeak);
-    // console.log('Block Header:', makeReadable(blockHeader));
+    const ping = await rpc.ping();
+    console.log('Ping:', ping);
+    const blockPeak = await rpc.getBlockPeak();
+    console.log('Current Block Peak:', blockPeak);
+    const blockHeader = await rpc.getBlockHeader(blockPeak);
+    console.log('Block Header:', makeReadable(blockHeader));
   } catch (error) {
     console.error('RPC Error:', error);
   } finally {

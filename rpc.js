@@ -1,3 +1,4 @@
+//rpc.js
 const { makeReadable, parseRequestId, parseResponseType, parseReason } = require('./utils');
 
 class DiodeRPC {
@@ -93,7 +94,7 @@ class DiodeRPC {
           if (status === 'ok') {
             try {
               const ticketCommand = await this.connection.createTicketCommand();
-              const ticketResponse = this.connection.sendCommand(ticketCommand);
+              const ticketResponse = await this.connection.sendCommand(ticketCommand);
               console.log('Ticket updated:', ticketResponse);
             } catch (error) {
               console.error('Error updating ticket:', error);
@@ -130,6 +131,10 @@ class DiodeRPC {
         return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId);
       }
 
+      sendResponse(sessionId, ref, response) {
+        return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId);
+      }
+
       async getEpoch() {
         const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
         if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
@@ -157,8 +162,6 @@ class DiodeRPC {
     
       parseTimestamp(blockHeader) {
         // Implement parsing of timestamp from blockHeader
-        // This depends on the format of blockHeader
-        // For example:
         const timestampRaw = blockHeader[0][1]; // Adjust index based on actual structure
         //Timestamp Raw: [ 'timestamp', 1726689425 ]
         if (timestampRaw instanceof Uint8Array || Buffer.isBuffer(timestampRaw)) {

@@ -12,9 +12,8 @@ async function startPublishing() {
   await connection.connect();
 
   const publishedPorts = [8080]; // Ports you want to publish
-  const publishPort = new PublishPort(connection, publishedPorts);
+  const publishPort = new PublishPort(connection, publishedPorts, certPath);
 
-  // Now the PublishPort class will handle incoming port requests
 }
 
 startPublishing();
