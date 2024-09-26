@@ -1,7 +1,7 @@
-# diode_client_js
+# diode_js
 
 ## Overview
-`diode_client_js` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind ports, send RPC commands, and handle responses.
+`diode_js` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind ports, send RPC commands, and handle responses.
 
 ## Quick Start
 
