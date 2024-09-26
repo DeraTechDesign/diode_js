@@ -1,8 +1,13 @@
+//rpc.js
 const { makeReadable, parseRequestId, parseResponseType, parseReason } = require('./utils');
 
 class DiodeRPC {
     constructor(connection) {
       this.connection = connection;
+      this.epochCache = {
+        epoch: null,
+        expiry: null,
+      };
     }
   
     getBlockPeak() {
@@ -17,7 +22,7 @@ class DiodeRPC {
           } else if (typeof blockNumberRaw === 'number') {
             blockNumber = blockNumberRaw;
           } else {
-            throw new Error('Invalid block number format');
+            throw new Error('Invalid block number format. response:', makeReadable(responseData));
           }
           return blockNumber;
         });
@@ -75,13 +80,26 @@ class DiodeRPC {
         });
       }
     
-      portSend(ref, data) {
-        return this.connection.sendCommand(['portsend', ref, data]).then((responseData) => {
+      async portSend(ref, data) {
+        // Update totalBytes
+        const bytesToSend = data.length;
+        this.connection.totalBytes += bytesToSend;
+    
+        // Now send the data
+        return this.connection.sendCommand(['portsend', ref, data]).then(async (responseData) => {
           // responseData is [status]
           const [statusRaw] = responseData;
           const status = parseResponseType(statusRaw);
       
           if (status === 'ok') {
+            try {
+              const ticketCommand = await this.connection.createTicketCommand();
+              const ticketResponse = await this.connection.sendCommand(ticketCommand);
+              console.log('Ticket updated:', ticketResponse);
+            } catch (error) {
+              console.error('Error updating ticket:', error);
+              throw error;
+            }
             return;
           } else if (status === 'error') {
             throw new Error('Error during port send');
@@ -107,6 +125,52 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         });
+      }
+
+      sendError(sessionId, ref, error) {
+        return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId);
+      }
+
+      sendResponse(sessionId, ref, response) {
+        return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId);
+      }
+
+      async getEpoch() {
+        const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
+        if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
+          console.log('Using cached epoch:', this.epochCache.epoch);
+          return this.epochCache.epoch;
+        }
+        console.log('Fetching new epoch. Expiry:', this.epochCache.expiry);
+        const blockPeak = await this.getBlockPeak();
+        const blockHeader = await this.getBlockHeader(blockPeak);
+    
+        // Assuming blockHeader is an object with a timestamp property
+        const timestamp = this.parseTimestamp(blockHeader);
+        const epochDuration = 2592000; // 30 days in seconds
+        const epoch = Math.floor(timestamp / epochDuration);
+    
+        // Calculate the time left for the next epoch
+        const timeLeft = epochDuration - (timestamp % epochDuration);
+
+        // Cache the epoch and the expiry time
+        this.epochCache.epoch = epoch;
+        this.epochCache.expiry = currentTime + timeLeft;
+
+        return epoch;
+      }
+    
+      parseTimestamp(blockHeader) {
+        // Implement parsing of timestamp from blockHeader
+        const timestampRaw = blockHeader[0][1]; // Adjust index based on actual structure
+        //Timestamp Raw: [ 'timestamp', 1726689425 ]
+        if (timestampRaw instanceof Uint8Array || Buffer.isBuffer(timestampRaw)) {
+          return Buffer.from(timestampRaw).readUIntBE(0, timestampRaw.length);
+        } else if (typeof timestampRaw === 'number') {
+          return timestampRaw;
+        } else {
+          throw new Error('Invalid timestamp format in block header');
+        }
       }
   }
   

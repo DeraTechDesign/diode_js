@@ -138,3 +138,6 @@ device_certificate.pem
 secp256k1_params.pem
 index.html
 testCode.js
+ec-secp256k1-pub-key.pem
+EdgeV2RPCDocs.md
+pubKey.js

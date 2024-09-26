@@ -12,7 +12,7 @@ function makeReadable(decodedMessage) {
       return str;
     } else if (buffer.length <= 6) {
       // If it's a small Buffer, interpret it as an integer
-      return buffer.readUIntBE(0, buffer.length);
+      return buffer.length > 0 && buffer.length <= 6 ? buffer.readUIntBE(0, buffer.length) : '0x' + buffer.toString('hex');
     } else {
       // Otherwise, return the hex representation
       return '0x' + buffer.toString('hex');

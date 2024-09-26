@@ -17,8 +17,7 @@ openssl req -newkey ec:./secp256k1_params.pem -nodes -keyout device_certificate.
 Here's a quick example to get you started with RPC functions using `DiodeRPC` Class
 
 ```javascript
-const { DiodeConnection, DiodeRPC } = require('../index');
-const { makeReadable } = require('../utils');
+const { DiodeConnection, DiodeRPC, makeReadable } = require('diodejs');
 
 async function main() {
   const host = 'eu2.prenet.diode.io';
@@ -53,7 +52,7 @@ main();
 Here's a quick example to get you started with port forwarding using the `BindPort` class.
 
 ```javascript
-const { DiodeConnection, BindPort } = require('../index');
+const { DiodeConnection, BindPort } = require('diodejs');
 
 async function main() {
     const host = 'eu2.prenet.diode.io';
@@ -70,4 +69,26 @@ async function main() {
 
 main();
 ```
+### Publish Port
 
+Here's a quick example to get you started with publishing ports using the `PublishPort` class:
+
+```javascript
+const { DiodeConnection, PublishPort } = require('diodejs');
+
+async function main() {
+  const host = 'us2.prenet.diode.io';
+  const port = 41046;
+  const certPath = 'device_certificate.pem';
+
+  const connection = new DiodeConnection(host, port, certPath);
+  await connection.connect();
+
+  const publishedPorts = [8080]; // Ports you want to publish
+  const publishPort = new PublishPort(connection, publishedPorts, certPath);
+
+}
+
+main();
+
+```

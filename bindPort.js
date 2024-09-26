@@ -87,7 +87,6 @@ class BindPort {
         console.log('Client disconnected');
         clientSockets.delete(ref.toString('hex'));
         try {
-          await rpc.portClose(ref);
           console.log(`Port closed on device for ref: ${ref.toString('hex')}`);
         } catch (error) {
           console.error('Error closing port on device:', error);
