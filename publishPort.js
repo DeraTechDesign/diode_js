@@ -8,7 +8,7 @@ const { Buffer } = require('buffer');
 const EventEmitter = require('events');
 const { Duplex } = require('stream');
 const DiodeRPC = require('./rpc');
-
+const { makeReadable } = require('./utils');
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
     super();
@@ -70,15 +70,26 @@ class PublishPort extends EventEmitter {
     const deviceIdRaw = messageContent[3];
 
     const sessionId = Buffer.from(sessionIdRaw);
-    const portString = Buffer.from(portStringRaw).toString('utf8');
+    const portString = makeReadable(portStringRaw);
     const ref = Buffer.from(refRaw);
     const deviceId = Buffer.from(deviceIdRaw).toString('hex');
 
     console.log(`Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
 
     // Extract protocol and port number from portString
-    const [protocol, portStr] = portString.split(':');
-    const port = parseInt(portStr, 10);
+    var protocol = 'tcp';
+    var port = 0;
+    if (typeof portString == 'number') {
+      port = portString;
+    } else {
+      var [protocol, portStr] = portString.split(':');
+      console.log(`Protocol: ${protocol}, Port: ${portStr}`);
+      if (!portStr) {
+        portStr = protocol;
+        protocol = 'tcp';
+      }
+      port = parseInt(portStr, 10);
+    }
 
     // Check if the port is published
     if (!this.publishedPorts.includes(port)) {
