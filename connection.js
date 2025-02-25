@@ -47,7 +47,7 @@ class DiodeConnection extends EventEmitter {
         // Send the ticketv2 command
         try {
           const ticketCommand = await this.createTicketCommand();
-          const response = await this.sendCommand(ticketCommand);
+          const response = await this.sendCommand(ticketCommand).catch(reject);
           console.log('Ticket accepted:', response);
           resolve();
         } catch (error) {
@@ -137,10 +137,10 @@ class DiodeConnection extends EventEmitter {
               } else if (responseType === 'error') {
                 if (responseData.length > 1) {
                   const reason = parseReason(responseData[1]);
-                  reject(new Error(reason));
+                  reject(reason);
                 } else {
                   const reason = parseReason(responseData[0]);
-                  reject(new Error(reason));
+                  reject(reason);
                 }
               } else {
                 resolve(responseData);

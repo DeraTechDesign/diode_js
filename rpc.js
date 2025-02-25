@@ -25,35 +25,47 @@ class DiodeRPC {
             throw new Error('Invalid block number format. response:', makeReadable(responseData));
           }
           return blockNumber;
+        }).catch((error) => {
+          console.error('Error during get block peak:', error);
+          return;
         });
       }
     getBlockHeader(index) {
       return this.connection.sendCommand(['getblockheader', index]).then((responseData) => {
         return responseData[0]; // block_header
+      }).catch((error) => {
+        console.error('Error during get block header:', error);
+        return;
       });
     }
   
     getBlock(index) {
       return this.connection.sendCommand(['getblock', index]).then((responseData) => {
         return responseData[0]; // block
+      }).catch((error) => {
+        console.error('Error during get block:', error);
+        return;
       });
     }
   
     ping() {
-        return this.connection.sendCommand(['ping']).then((responseData) => {
-            // responseData is an array containing [status]
-            const statusRaw = responseData[0];
-            const status = parseResponseType(statusRaw);
-        
-            if (status === 'pong') {
-                return true;
-            } else if (status === 'error') {
-                throw new Error('Ping failed');
-            } else {
-                throw new Error(`Unknown status in response: '${status}'`);
-            }
-            });
+      return this.connection.sendCommand(['ping']).then((responseData) => {
+        // responseData is an array containing [status]
+        const statusRaw = responseData[0];
+        const status = parseResponseType(statusRaw);
+    
+        if (status === 'pong') {
+            return true;
+        } else if (status === 'error') {
+            throw new Error('Ping failed');
+        } else {
+            throw new Error(`Unknown status in response: '${status}'`);
         }
+        }).catch((error) => {
+          console.error('Error during ping:', error);
+          return false;
+        })
+    }
 
         
 
@@ -77,6 +89,9 @@ class DiodeRPC {
           } else {
             throw new Error(`Unknown status in response: '${status}'`);
           }
+        }).catch((error) => {
+          console.error('Error during port open:', error);
+          return;
         });
       }
     
@@ -94,7 +109,10 @@ class DiodeRPC {
           if (status === 'ok') {
             try {
               const ticketCommand = await this.connection.createTicketCommand();
-              const ticketResponse = await this.connection.sendCommand(ticketCommand);
+              const ticketResponse = await this.connection.sendCommand(ticketCommand).catch((error) => {
+                console.error('Error during ticket command:', error);
+                throw error;
+              });
               console.log('Ticket updated:', ticketResponse);
             } catch (error) {
               console.error('Error updating ticket:', error);
@@ -106,6 +124,9 @@ class DiodeRPC {
           } else {
             throw new Error(`Unknown status in response: '${status}'`);
           }
+        }).catch((error) => {
+          console.error('Error during port send:', error);
+          return;
         });
       }
     
@@ -124,15 +145,24 @@ class DiodeRPC {
           } else {
             throw new Error(`Unknown status in response: '${status}'`);
           }
+        }).catch((error) => {
+          console.error('Error during port close:', error);
+          return;
         });
       }
 
       sendError(sessionId, ref, error) {
-        return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId);
+        return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId).catch((error) => {
+          console.error('Error during send error:', error);
+          return;
+        });
       }
 
       sendResponse(sessionId, ref, response) {
-        return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId);
+        return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId).catch((error) => {
+          console.error('Error during send response:', error);
+          return;
+        });
       }
 
       async getEpoch() {

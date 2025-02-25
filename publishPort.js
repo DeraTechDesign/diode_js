@@ -244,7 +244,7 @@ class PublishPort extends EventEmitter {
 
     const sessionId = Buffer.from(sessionIdRaw);
     const ref = Buffer.from(refRaw);
-    const data = Buffer.from(dataRaw).slice(4);
+    const data = Buffer.from(dataRaw)//.slice(4);
 
     const connectionInfo = this.connections.get(ref.toString('hex'));
     if (connectionInfo) {
