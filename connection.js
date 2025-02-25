@@ -11,6 +11,7 @@ const ethUtil = require('ethereumjs-util');
 const crypto = require('crypto');
 const DiodeRPC = require('./rpc');
 const abi = require('ethereumjs-abi');
+const logger = require('./logger');
 class DiodeConnection extends EventEmitter {
   constructor(host, port, certPath) {
     super();
@@ -25,6 +26,8 @@ class DiodeConnection extends EventEmitter {
     // Add buffer to handle partial data
     this.receiveBuffer = Buffer.alloc(0);
     this.RPC = new DiodeRPC(this);
+    this.isReconnecting = false;
+    this.connectPromise = null;
   }
 
   connect() {
@@ -40,7 +43,7 @@ class DiodeConnection extends EventEmitter {
       };
 
       this.socket = tls.connect(this.port, this.host, options, async () => {
-        console.log('Connected to Diode.io server');
+        logger.info('Connected to Diode.io server');
         // Set keep-alive to prevent connection timeout forever
         this.socket.setKeepAlive(true, 0);
   
@@ -48,33 +51,55 @@ class DiodeConnection extends EventEmitter {
         try {
           const ticketCommand = await this.createTicketCommand();
           const response = await this.sendCommand(ticketCommand).catch(reject);
-          console.log('Ticket accepted:', response);
+          logger.info(`Ticket accepted: ${makeReadable(response)}`);
           resolve();
         } catch (error) {
-          console.error('Error sending ticket:', error);
+          logger.error(`Error sending ticket: ${error}`);
           reject(error);
         }
       });
 
       this.socket.on('data', (data) => {
+        logger.debug(`Received data: ${data.toString('hex')}`);
         try {
           this._handleData(data);
         } catch (error) {
-          console.error('Error handling data:', error);
+          logger.error(`Error handling data: ${error}`);
         }
       });
       this.socket.on('error', (err) => {
-        console.error('Connection error:', err);
+        logger.error(`Connection error: ${err}`);
         reject(err);
       });
-      this.socket.on('end', () => console.log('Disconnected from server'));
+      this.socket.on('end', () => logger.info('Disconnected from server'));
     });
+  }
+
+  _ensureConnected() {
+    if (this.socket && !this.socket.destroyed) {
+      return Promise.resolve();
+    }
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+    this.isReconnecting = true;
+    this.connectPromise = this.connect()
+      .then(() => {
+        this.isReconnecting = false;
+        this.connectPromise = null;
+      })
+      .catch((err) => {
+        this.isReconnecting = false;
+        this.connectPromise = null;
+        throw err;
+      });
+    return this.connectPromise;
   }
 
   _handleData(data) {
     // Append new data to the receive buffer
     this.receiveBuffer = Buffer.concat([this.receiveBuffer, data]);
-    console.log('Received data:', data.toString('hex'));
+    logger.debug(`Received data: ${data.toString('hex')}`);
   
     let offset = 0;
     while (offset + 2 <= this.receiveBuffer.length) {
@@ -92,7 +117,7 @@ class DiodeConnection extends EventEmitter {
   
       try {
         const decodedMessage = RLP.decode(Uint8Array.from(messageBuffer));
-        console.log('Decoded message:', makeReadable(decodedMessage));
+        logger.debug(`Decoded message: ${makeReadable(decodedMessage)}`);
     
         if (Array.isArray(decodedMessage) && decodedMessage.length > 1) {
           const requestIdRaw = decodedMessage[0];
@@ -102,8 +127,8 @@ class DiodeConnection extends EventEmitter {
           const requestId = parseRequestId(requestIdRaw);
     
           // Debug statements
-          console.log('requestIdRaw:', requestIdRaw);
-          console.log('Parsed requestId:', requestId);
+          logger.debug(`requestIdRaw: ${requestIdRaw}`);
+          logger.debug(`Parsed requestId: ${requestId}`);
     
           if (requestId !== null && this.pendingRequests.has(requestId)) {
             // This is a response to a pending request
@@ -111,16 +136,14 @@ class DiodeConnection extends EventEmitter {
             const responseRaw = responseData[0];
     
             // Debug statements
-            console.log('responseTypeRaw:', responseTypeRaw);
-            console.log('Type of responseTypeRaw:', typeof responseTypeRaw);
-            console.log('Instance of responseTypeRaw:', responseTypeRaw instanceof Uint8Array);
-            console.log('Is Array:', Array.isArray(responseTypeRaw));
+            logger.debug(`responseTypeRaw: ${responseTypeRaw}`);
+            logger.debug(`Type of responseTypeRaw: ${typeof responseTypeRaw}`);
     
             // Parse responseType
             const responseType = parseResponseType(responseTypeRaw);
     
-            console.log(`Received response for requestId: ${requestId}`);
-            console.log(`Response Type: '${responseType}'`);
+            logger.debug(`Received response for requestId: ${requestId}`);
+            logger.debug(`Response Type: '${responseType}'`);
     
             const { resolve, reject } = this.pendingRequests.get(requestId);
             try{
@@ -146,20 +169,20 @@ class DiodeConnection extends EventEmitter {
                 resolve(responseData);
               }
             } catch (error) {
-              console.error('Error handling response:', error);
+              logger.error(`Error handling response: ${error}`);
             }
             this.pendingRequests.delete(requestId);
           } else {
             // This is an unsolicited message
-            console.log('Received unsolicited message:', decodedMessage);
+            logger.debug(`Received unsolicited message: ${makeReadable(decodedMessage)}`);
             this.emit('unsolicited', decodedMessage);
           }
         } else {
           // Invalid message format
-          console.error('Invalid message format:', decodedMessage);
+          logger.error(`Invalid message format: ${makeReadable(decodedMessage)}`);
         }
       } catch (error) {
-        console.error('Error decoding message:', error);
+        logger.error(`Error decoding message: ${error}`);
       }
     }
     
@@ -190,67 +213,55 @@ class DiodeConnection extends EventEmitter {
 
   sendCommand(commandArray) {
     return new Promise((resolve, reject) => {
-      //check if connection is alive
-      if (!this.socket || this.socket.destroyed) {
-        //reconnect
-        this.connect().then(() => {
-          this.sendCommand(commandArray).then(resolve).catch(reject);
-        }).catch(reject);
-        return;
-      }
-      const requestId = this._getNextRequestId();
-      // Build the message as [requestId, [commandArray]]
-      const commandWithId = [requestId, commandArray];
-
-      // Store the promise callbacks to resolve/reject later
-      this.pendingRequests.set(requestId, { resolve, reject });
-
-      const commandBuffer = RLP.encode(commandWithId);
-      const byteLength = Buffer.byteLength(commandBuffer);
-
-      // Create a 2-byte length buffer
-      const lengthBuffer = Buffer.alloc(2);
-      lengthBuffer.writeUInt16BE(byteLength, 0);
-
-      const message = Buffer.concat([lengthBuffer, commandBuffer]);
-
-      console.log(`Sending command with requestId ${requestId}:`, commandArray);
-      console.log('Command buffer:', message.toString('hex'));
-
-      this.socket.write(message);
+      this._ensureConnected().then(() => {
+        const requestId = this._getNextRequestId();
+        // Build the message as [requestId, [commandArray]]
+        const commandWithId = [requestId, commandArray];
+  
+        // Store the promise callbacks to resolve/reject later
+        this.pendingRequests.set(requestId, { resolve, reject });
+  
+        const commandBuffer = RLP.encode(commandWithId);
+        const byteLength = Buffer.byteLength(commandBuffer);
+  
+        // Create a 2-byte length buffer
+        const lengthBuffer = Buffer.alloc(2);
+        lengthBuffer.writeUInt16BE(byteLength, 0);
+  
+        const message = Buffer.concat([lengthBuffer, commandBuffer]);
+  
+        logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
+        logger.debug(`Command buffer: ${message.toString('hex')}`);
+  
+        this.socket.write(message);
+      }).catch(reject);
     });
   }
 
   sendCommandWithSessionId(commandArray, sessionId) {
     return new Promise((resolve, reject) => {
-      //check if connection is alive
-      if (!this.socket || this.socket.destroyed) {
-        //reconnect
-        this.connect().then(() => {
-          this.sendCommand(commandArray).then(resolve).catch(reject);
-        }).catch(reject);
-        return;
-      }
-      const requestId = sessionId;
-      // Build the message as [requestId, [commandArray]]
-      const commandWithId = [requestId, commandArray];
-
-      // Store the promise callbacks to resolve/reject later
-      this.pendingRequests.set(requestId, { resolve, reject });
-
-      const commandBuffer = RLP.encode(commandWithId);
-      const byteLength = Buffer.byteLength(commandBuffer);
-
-      // Create a 2-byte length buffer
-      const lengthBuffer = Buffer.alloc(2);
-      lengthBuffer.writeUInt16BE(byteLength, 0);
-
-      const message = Buffer.concat([lengthBuffer, commandBuffer]);
-
-      console.log(`Sending command with requestId ${requestId}:`, commandArray);
-      console.log('Command buffer:', message.toString('hex'));
-
-      this.socket.write(message);
+      this._ensureConnected().then(() => {
+        const requestId = sessionId;
+        // Build the message as [requestId, [commandArray]]
+        const commandWithId = [requestId, commandArray];
+  
+        // Store the promise callbacks to resolve/reject later
+        this.pendingRequests.set(requestId, { resolve, reject });
+  
+        const commandBuffer = RLP.encode(commandWithId);
+        const byteLength = Buffer.byteLength(commandBuffer);
+  
+        // Create a 2-byte length buffer
+        const lengthBuffer = Buffer.alloc(2);
+        lengthBuffer.writeUInt16BE(byteLength, 0);
+  
+        const message = Buffer.concat([lengthBuffer, commandBuffer]);
+  
+        logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
+        logger.debug(`Command buffer: ${message.toString('hex')}`);
+  
+        this.socket.write(message);
+      }).catch(reject);
     });
   }
 
@@ -300,7 +311,7 @@ class DiodeConnection extends EventEmitter {
 
         const ecPrivateKey = ECPrivateKeyASN.decode(privateKeyOctetString, 'der');
         privateKeyBytes = ecPrivateKey.privateKey;
-        console.log('Private key bytes:', privateKeyBytes.toString('hex'));
+        logger.debug(`Private key bytes: ${privateKeyBytes.toString('hex')}`);
       } else {
         throw new Error('Unsupported key format. Expected EC PRIVATE KEY or PRIVATE KEY in PEM format.');
       }
@@ -317,10 +328,10 @@ class DiodeConnection extends EventEmitter {
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
 
-      console.log('Ethereum address:', address);
+      logger.info(`Ethereum address: ${address}`);
       return address;
     } catch (error) {
-      console.error('Error extracting Ethereum address:', error);
+      logger.error(`Error extracting Ethereum address: ${error}`);
       throw error;
     }
   }
@@ -336,15 +347,15 @@ class DiodeConnection extends EventEmitter {
         ? serverCert.pubkey
         : Buffer.from(serverCert.pubkey);
 
-      console.log('Public key Server:', publicKeyBuffer.toString('hex'));
+      logger.debug(`Public key Server: ${publicKeyBuffer.toString('hex')}`);
 
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
 
-      console.log('Server Ethereum address:', address);
+      logger.info(`Server Ethereum address: ${address}`);
       return address;
     } catch (error) {
-      console.error('Error extracting server Ethereum address:', error);
+      logger.error(`Error extracting server Ethereum address: ${error}`);
       throw error;
     }
   }
@@ -448,7 +459,7 @@ class DiodeConnection extends EventEmitter {
 
       return privateKeyBytes;
     } catch (error) {
-      console.error('Error extracting Ethereum address:', error);
+      logger.error(`Error extracting Ethereum address: ${error}`);
       throw error;
     }
   }
@@ -475,17 +486,17 @@ class DiodeConnection extends EventEmitter {
     // Convert each element in dataToSign to bytes32 and concatenate them
     const encodedData = Buffer.concat(dataToSign.map(item => abi.rawEncode(['bytes32'], [item])));
 
-    console.log('Encoded data:', encodedData.toString('hex'));
+    logger.debug(`Encoded data: ${encodedData.toString('hex')}`);
 
-    console.log('Data to sign:', makeReadable(dataToSign));
+    logger.debug(`Data to sign: ${makeReadable(dataToSign)}`);
   
   
     // Sign the data
     const privateKey = this.getPrivateKey();
     const msgHash = ethUtil.keccak256(encodedData);
-    console.log('Message hash:', msgHash.toString('hex'));
+    logger.debug(`Message hash: ${msgHash.toString('hex')}`);
     const signature = secp256k1.ecdsaSign(msgHash, privateKey);
-    console.log('Signature:', signature);
+    logger.debug(`Signature: ${signature.signature.toString('hex')}`);
     
     const signatureBuffer = Buffer.concat([
       ethUtil.toBuffer([signature.recid]),
@@ -519,7 +530,7 @@ class DiodeConnection extends EventEmitter {
       localAddress,
       epoch
     );
-    console.log('Signature hex:', signature.toString('hex'));
+    logger.debug(`Signature hex: ${signature.toString('hex')}`);
 
   
     // Construct the ticket command

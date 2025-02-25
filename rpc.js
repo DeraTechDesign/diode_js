@@ -1,5 +1,6 @@
 //rpc.js
 const { makeReadable, parseRequestId, parseResponseType, parseReason } = require('./utils');
+const logger = require('./logger');
 
 class DiodeRPC {
     constructor(connection) {
@@ -24,9 +25,10 @@ class DiodeRPC {
           } else {
             throw new Error('Invalid block number format. response:', makeReadable(responseData));
           }
+          logger.debug(`Block number is: ${blockNumber}`);
           return blockNumber;
         }).catch((error) => {
-          console.error('Error during get block peak:', error);
+          logger.error(`Error during get block peak: ${error}`);
           return;
         });
       }
@@ -34,7 +36,7 @@ class DiodeRPC {
       return this.connection.sendCommand(['getblockheader', index]).then((responseData) => {
         return responseData[0]; // block_header
       }).catch((error) => {
-        console.error('Error during get block header:', error);
+        logger.error(`Error during get block header: ${error}`);
         return;
       });
     }
@@ -43,7 +45,7 @@ class DiodeRPC {
       return this.connection.sendCommand(['getblock', index]).then((responseData) => {
         return responseData[0]; // block
       }).catch((error) => {
-        console.error('Error during get block:', error);
+        logger.error(`Error during get block: ${error}`);
         return;
       });
     }
@@ -62,7 +64,7 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
         }
         }).catch((error) => {
-          console.error('Error during ping:', error);
+          logger.error(`Error during ping: ${error}`);
           return false;
         })
     }
@@ -90,7 +92,7 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         }).catch((error) => {
-          console.error('Error during port open:', error);
+          logger.error(`Error during port open: ${error}`);
           return;
         });
       }
@@ -110,12 +112,12 @@ class DiodeRPC {
             try {
               const ticketCommand = await this.connection.createTicketCommand();
               const ticketResponse = await this.connection.sendCommand(ticketCommand).catch((error) => {
-                console.error('Error during ticket command:', error);
+                logger.error(`Error during ticket command: ${error}`);
                 throw error;
               });
-              console.log('Ticket updated:', ticketResponse);
+              logger.debug(`Ticket updated: ${makeReadable(ticketResponse)}`);
             } catch (error) {
-              console.error('Error updating ticket:', error);
+              logger.error(`Error updating ticket: ${error}`);
               throw error;
             }
             return;
@@ -125,7 +127,7 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         }).catch((error) => {
-          console.error('Error during port send:', error);
+          logger.error(`Error during port send: ${error}`);
           return;
         });
       }
@@ -146,21 +148,21 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         }).catch((error) => {
-          console.error('Error during port close:', error);
+          logger.error(`Error during port close: ${error}`);
           return;
         });
       }
 
       sendError(sessionId, ref, error) {
         return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId).catch((error) => {
-          console.error('Error during send error:', error);
+          logger.error(`Error during send error: ${error}`);
           return;
         });
       }
 
       sendResponse(sessionId, ref, response) {
         return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId).catch((error) => {
-          console.error('Error during send response:', error);
+          logger.error(`Error during send response: ${error}`);
           return;
         });
       }
@@ -168,10 +170,10 @@ class DiodeRPC {
       async getEpoch() {
         const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
         if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
-          console.log('Using cached epoch:', this.epochCache.epoch);
+          logger.debug(`Using cached epoch: ${this.epochCache.epoch}`);
           return this.epochCache.epoch;
         }
-        console.log('Fetching new epoch. Expiry:', this.epochCache.expiry);
+        logger.debug(`Fetching new epoch. Expiry: ${this.epochCache.expiry}, Current time: ${currentTime}`);
         const blockPeak = await this.getBlockPeak();
         const blockHeader = await this.getBlockHeader(blockPeak);
     
@@ -205,4 +207,3 @@ class DiodeRPC {
   }
   
   module.exports = DiodeRPC;
-  
