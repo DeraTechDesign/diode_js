@@ -3,7 +3,7 @@ const tls = require('tls');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
-const { makeReadable, parseRequestId, parseResponseType, parseReason } = require('./utils');
+const { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert } = require('./utils');
 const { Buffer } = require('buffer'); // Import Buffer
 const asn1 = require('asn1.js');
 const secp256k1 = require('secp256k1');
@@ -13,7 +13,7 @@ const DiodeRPC = require('./rpc');
 const abi = require('ethereumjs-abi');
 const logger = require('./logger');
 class DiodeConnection extends EventEmitter {
-  constructor(host, port, certPath) {
+  constructor(host, port, certPath = './cert/device_certificate.pem') {
     super();
     this.host = host;
     this.port = port;
@@ -28,6 +28,11 @@ class DiodeConnection extends EventEmitter {
     this.RPC = new DiodeRPC(this);
     this.isReconnecting = false;
     this.connectPromise = null;
+
+    // Check if certPath exists, if not generate the certificate
+    if (!fs.existsSync(this.certPath)) {
+      generateCert(this.certPath);
+    }
   }
 
   connect() {

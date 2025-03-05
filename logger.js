@@ -1,6 +1,7 @@
 const setupLogger = require('dera-logger');
-
+require('dotenv').config();
 const isDebug = (process.env.DEBUG === 'true'); // Simple debug flag
+const isLogEnabled = (process.env.LOG === 'true'); // Simple log flag
 
 const options = {
   logDirectory: 'logs',
@@ -20,8 +21,8 @@ const logger = setupLogger(options);
 
 // Wrap logger calls to respect debug mode
 module.exports = {
-  debug: (...args) => { if (isDebug) logger.debug(...args, 'app'); },
-  info: (...args) => logger.info(...args, 'app'),
-  warn: (...args) => logger.warn(...args, 'app'),
-  error: (...args) => logger.error(...args, 'app'),
+  debug: (...args) => { if (isDebug && isLogEnabled) logger.debug(...args, 'app'); },
+  info: (...args) => { if (isLogEnabled) logger.info(...args, 'app'); },
+  warn: (...args) => { if (isLogEnabled) logger.warn(...args, 'app'); },
+  error: (...args) => { if (isLogEnabled) logger.error(...args, 'app'); },
 };

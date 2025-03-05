@@ -1,20 +1,19 @@
-# diode_js
+# DiodeJs
 
 ## Overview
-`diode_js` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.
+`diodejs` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.
 
 ## Installation
 ```bash
 npm install diodejs
 ```
-## Quick Start
 
-To get started, you need to generate a device certificate using OpenSSL. You can use this command:
+### Quick Start
 
-```bash
-openssl ecparam -name secp256k1 -out secp256k1_params.pem
-openssl req -newkey ec:./secp256k1_params.pem -nodes -keyout device_certificate.pem -x509 -days 365 -out device_certificate.pem -subj "/CN=device"
-```
+If you want to enable logs, set environment variable LOG to true. 
+If you want to enable debug logs, set environment variable DEBUG to true. 
+
+Can also use .env files
 
 ### Test RPC
 
@@ -96,3 +95,65 @@ async function main() {
 main();
 
 ```
+
+## Reference
+
+### Classes and Methods
+
+#### `DiodeConnection`
+
+- **Constructor**: `new DiodeConnection(host, port, certPath)`
+  - `host` (string): The host address of the Diode server.
+  - `port` (number): The port number of the Diode server.
+  - `certPath` (string)(default: ./cert/device_certificate.pem): The path to the device certificate. If doesn't exist, generates automaticly. 
+
+- **Methods**:
+  - `connect()`: Connects to the Diode server. Returns a promise.
+  - `sendCommand(commandArray)`: Sends a command to the Diode server. Returns a promise.
+  - `sendCommandWithSessionId(commandArray, sessionId)`: Sends a command with a session ID. Returns a promise.
+  - `getEthereumAddress()`: Returns the Ethereum address derived from the device certificate.
+  - `getServerEthereumAddress()`: Returns the Ethereum address of the server.
+  - `createTicketCommand()`: Creates a ticket command for authentication. Returns a promise.
+  - `close()`: Closes the connection to the Diode server.
+
+#### `DiodeRPC`
+
+- **Constructor**: `new DiodeRPC(connection)`
+  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+
+- **Methods**:
+  - `getBlockPeak()`: Retrieves the current block peak. Returns a promise.
+  - `getBlockHeader(index)`: Retrieves the block header for a given index. Returns a promise.
+  - `getBlock(index)`: Retrieves the block for a given index. Returns a promise.
+  - `ping()`: Sends a ping command. Returns a promise.
+  - `portOpen(deviceId, port, flags)`: Opens a port on the device. Returns a promise.
+  - `portSend(ref, data)`: Sends data to the device. Returns a promise.
+  - `portClose(ref)`: Closes a port on the device. Returns a promise.
+  - `sendError(sessionId, ref, error)`: Sends an error response. Returns a promise.
+  - `sendResponse(sessionId, ref, response)`: Sends a response. Returns a promise.
+  - `getEpoch()`: Retrieves the current epoch. Returns a promise.
+  - `parseTimestamp(blockHeader)`: Parses the timestamp from a block header. Returns a number.
+
+#### `BindPort`
+
+- **Constructor**: `new BindPort(connection, localPort, targetPort, deviceIdHex)`
+  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+  - `localPort` (number): The local port to bind.
+  - `targetPort` (number): The target port on the device.
+  - `deviceIdHex` (string): The device ID in hexadecimal format.
+
+- **Methods**:
+  - `bind()`: Binds the local port to the target port on the device.
+
+#### `PublishPort`
+
+- **Constructor**: `new PublishPort(connection, publishedPorts, certPath)`
+  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+  - `publishedPorts` (array): An array of ports to publish.
+  - `certPath` (string): The path to the device certificate.
+
+- **Methods**:
+  - `startListening()`: Starts listening for unsolicited messages.
+  - `handlePortOpen(sessionIdRaw, messageContent)`: Handles port open requests.
+  - `handlePortSend(sessionIdRaw, messageContent)`: Handles port send requests.
+  - `handlePortClose(sessionIdRaw, messageContent)`: Handles port close requests.

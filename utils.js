@@ -1,6 +1,11 @@
 // utils.js
 const { Buffer } = require('buffer');
 const logger = require('./logger');
+const { KJUR } = require("jsrsasign");
+const { KEYUTIL } = require("jsrsasign");
+const fs = require('fs');
+var path = require('path');
+
 function makeReadable(decodedMessage) {
   if (Array.isArray(decodedMessage)) {
     return decodedMessage.map((item) => makeReadable(item));
@@ -75,4 +80,45 @@ function parseReason(reasonRaw) {
   }
 }
 
-module.exports = { makeReadable, parseRequestId, parseResponseType, parseReason };
+function generateCert(path) {
+  var kp = KEYUTIL.generateKeypair("EC", "secp256k1");
+
+  var priv = KEYUTIL.getPEM(kp.prvKeyObj, "PKCS8PRV");
+
+  pub = KEYUTIL.getPEM(kp.pubKeyObj, "PKCS8PUB");
+
+  var x = new KJUR.asn1.x509.Certificate({
+      version: 3,
+      serial: { int: 4 },
+      issuer: { str: "/CN=device" },
+      subject: { str: "/CN=device" },
+      sbjpubkey: kp.pubKeyObj, 
+      ext: [
+          { extname: "basicConstraints", cA: false },
+          { extname: "keyUsage", critical: true, names: ["digitalSignature"] },
+          {
+              extname: "cRLDistributionPoints",
+              array: [{ fulluri: 'https://diode.io/' }]
+          }
+      ],
+      sigalg: "SHA256withECDSA",
+      cakey: kp.prvKeyObj
+  });
+
+
+  const pemFile = priv + x.getPEM();
+  ensureDirectoryExistence(path);
+
+  fs.writeFileSync(path, pemFile , 'utf8');
+}
+
+function ensureDirectoryExistence(filePath) {
+  var dirname = path.dirname(filePath);
+  if (fs.existsSync(dirname)) {
+    return true;
+  }
+  ensureDirectoryExistence(dirname);
+  fs.mkdirSync(dirname);
+}
+
+module.exports = { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert };

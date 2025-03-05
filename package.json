@@ -1,6 +1,6 @@
 {
   "name": "diodejs",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "A JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.",
   "main": "index.js",
   "scripts": {
@@ -16,10 +16,12 @@
     "crypto": "^1.0.1",
     "dera-logger": "^2.0.0",
     "dgram": "^1.0.1",
+    "dotenv": "^16.4.7",
     "ethereumjs-abi": "^0.6.8",
     "ethereumjs-util": "^7.1.5",
     "ethers": "^6.13.2",
     "fs": "^0.0.1-security",
+    "jsrsasign": "^11.1.0",
     "net": "^1.0.2",
     "node-fetch": "^2.7.0",
     "rlp": "^3.0.0",
