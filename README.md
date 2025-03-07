@@ -54,6 +54,7 @@ main();
 ### Bind Port
 Here's a quick example to get you started with port forwarding using the `BindPort` class.
 
+#### Port Binding
 ```javascript
 const { DiodeConnection, BindPort } = require('diodejs');
 
@@ -65,13 +66,43 @@ async function main() {
     const connection = new DiodeConnection(host, port, certPath);
     await connection.connect();
   
-    const portForward = new BindPort(connection, 3002, 80, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    // Multiple or single port binding with configuration object
+    const portsConfig = {
+      3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" },
+      3003: { targetPort: 443, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" }
+    };
+    
+    const portForward = new BindPort(connection, portsConfig);
     portForward.bind();
     
+    // You can also dynamically add and remove ports
+    portForward.addPort(3004, 8080, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    portForward.removePort(3003);
 }
 
 main();
 ```
+
+#### Single Port Binding (Legacy)
+```javascript
+const { DiodeConnection, BindPort } = require('diodejs');
+
+async function main() {
+    const host = 'eu2.prenet.diode.io';
+    const port = 41046;
+    const certPath = 'device_certificate.pem';
+  
+    const connection = new DiodeConnection(host, port, certPath);
+    await connection.connect();
+  
+    // Legacy method - single port binding
+    const portForward = new BindPort(connection, 3002, 80, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    portForward.bind();
+}
+
+main();
+```
+
 ### Publish Port
 
 Here's a quick example to get you started with publishing ports using the `PublishPort` class:
@@ -145,14 +176,27 @@ main();
 
 #### `BindPort`
 
-- **Constructor**: `new BindPort(connection, localPort, targetPort, deviceIdHex)`
-  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
-  - `localPort` (number): The local port to bind.
-  - `targetPort` (number): The target port on the device.
-  - `deviceIdHex` (string): The device ID in hexadecimal format.
+- **Constructors**:
+  
+  Legacy Constructor:
+  - `new BindPort(connection, localPort, targetPort, deviceIdHex)`
+    - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+    - `localPort` (number): The local port to bind.
+    - `targetPort` (number): The target port on the device.
+    - `deviceIdHex` (string): The device ID in hexadecimal format.
+  
+  New Constructor:
+  - `new BindPort(connection, portsConfig)`
+    - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+    - `portsConfig` (object): A configuration object where keys are local ports and values are objects with `targetPort` and `deviceIdHex`.
+      Example: `{ 3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" } }`
 
 - **Methods**:
-  - `bind()`: Binds the local port to the target port on the device.
+  - `bind()`: Binds all configured local ports to their target ports on the devices.
+  - `addPort(localPort, targetPort, deviceIdHex)`: Adds a new port binding configuration.
+  - `removePort(localPort)`: Removes a port binding configuration.
+  - `bindSinglePort(localPort)`: Binds a single local port to its target.
+  - `closeAllServers()`: Closes all active server instances.
 
 #### `PublishPort`
 
