@@ -208,6 +208,15 @@ main();
   - `certPath` (string): The path to the device certificate.
 
 - **Methods**:
+  - `addPort(port, config)`: Adds a new port to publish. Config is optional and defaults to public mode.
+    - `port` (number): The port number to publish.
+    - `config` (object): Optional configuration with `mode` ('public'|'private') and `whitelist` array.
+  - `removePort(port)`: Removes a published port.
+    - `port` (number): The port number to remove.
+  - `addPorts(ports)`: Adds multiple ports at once (equivalent to the constructor's publishedPorts parameter).
+    - `ports` (array|object): Either an array of port numbers or an object mapping ports to their configurations.
+  - `getPublishedPorts()`: Returns a plain object with all published ports and their configurations.
+  - `clearPorts()`: Removes all published ports. Returns the number of ports that were cleared.
   - `startListening()`: Starts listening for unsolicited messages.
   - `handlePortOpen(sessionIdRaw, messageContent)`: Handles port open requests.
   - `handlePortSend(sessionIdRaw, messageContent)`: Handles port send requests.

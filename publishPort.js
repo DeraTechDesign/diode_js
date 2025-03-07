@@ -39,36 +39,96 @@ class PublishPort extends EventEmitter {
   constructor(connection, publishedPorts, certPath) {
     super();
     this.connection = connection;
+    this.certPath = certPath;
+    this.rpc = new DiodeRPC(connection);
     
     // Convert publishedPorts to a Map with configurations
     this.publishedPorts = new Map();
     
-    // Handle both array format and object format
-    if (Array.isArray(publishedPorts)) {
-      // Legacy array format - treat all ports as public
-      publishedPorts.forEach(port => {
-        this.publishedPorts.set(port, { mode: 'public', whitelist: [] });
-      });
-    } else if (typeof publishedPorts === 'object' && publishedPorts !== null) {
-      // New object format with configurations
-      Object.entries(publishedPorts).forEach(([port, config]) => {
-        const portNum = parseInt(port, 10);
-        // Ensure config is properly structured
-        const portConfig = typeof config === 'object' && config !== null
-          ? { 
-              mode: config.mode || 'public', 
-              whitelist: Array.isArray(config.whitelist) ? config.whitelist : [] 
-            }
-          : { mode: 'public', whitelist: [] };
-        
-        this.publishedPorts.set(portNum, portConfig);
-      });
+    // Initialize with the provided ports
+    if (publishedPorts) {
+      this.addPorts(publishedPorts);
     }
     
     this.startListening();
-    logger.info(`Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
-    this.rpc = new DiodeRPC(connection);
-    this.certPath = certPath;
+    if (this.publishedPorts.size > 0) {
+      logger.info(`Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
+    } else {
+      logger.info("No ports published initially");
+    }
+  }
+
+  // Add a single port with configuration
+  addPort(port, config = { mode: 'public', whitelist: [] }) {
+    const portNum = parseInt(port, 10);
+    
+    // Normalize the configuration
+    const portConfig = {
+      mode: config.mode || 'public',
+      whitelist: Array.isArray(config.whitelist) ? config.whitelist : []
+    };
+    
+    // Add to map
+    this.publishedPorts.set(portNum, portConfig);
+    logger.info(`Added published port ${portNum} with mode: ${portConfig.mode}`);
+    
+    return true;
+  }
+  
+  // Remove a published port
+  removePort(port) {
+    const portNum = parseInt(port, 10);
+    
+    if (!this.publishedPorts.has(portNum)) {
+      logger.warn(`Port ${portNum} is not published`);
+      return false;
+    }
+    
+    // Close any active connections for this port
+    // This could require tracking active connections by port
+    // For now, let's log about active connections
+    const activeConnections = Array.from(this.connection.connections.values())
+      .filter(conn => conn.port === portNum);
+      
+    if (activeConnections.length > 0) {
+      logger.warn(`Removing port ${portNum} with ${activeConnections.length} active connections`);
+      // We could close these connections, but they'll be rejected naturally on next data transfer
+    }
+    
+    this.publishedPorts.delete(portNum);
+    logger.info(`Removed published port ${portNum}`);
+    
+    return true;
+  }
+  
+  // Add multiple ports at once (from array or object)
+  addPorts(ports) {
+    if (Array.isArray(ports)) {
+      // Legacy array format - treat all ports as public
+      ports.forEach(port => {
+        this.addPort(port);
+      });
+    } else if (typeof ports === 'object' && ports !== null) {
+      // New object format with configurations
+      Object.entries(ports).forEach(([port, config]) => {
+        this.addPort(port, config);
+      });
+    }
+    
+    return this;
+  }
+  
+  // Get all published ports with their configurations
+  getPublishedPorts() {
+    return Object.fromEntries(this.publishedPorts.entries());
+  }
+  
+  // Clear all published ports
+  clearPorts() {
+    const portCount = this.publishedPorts.size;
+    this.publishedPorts.clear();
+    logger.info(`Cleared ${portCount} published ports`);
+    return portCount;
   }
 
   startListening() {
@@ -112,7 +172,6 @@ class PublishPort extends EventEmitter {
       port = portString;
     } else {
       var [protocol, portStr] = portString.split(':');
-      console.log(`Protocol: ${protocol}, Port: ${portStr}`);
       if (!portStr) {
         portStr = protocol;
         protocol = 'tcp';
@@ -141,11 +200,11 @@ class PublishPort extends EventEmitter {
 
     // Handle based on protocol
     if (protocol === 'tcp') {
-      this.handleTCPConnection(sessionId, ref, port);
+      this.handleTCPConnection(sessionId, ref, port, deviceId);
     } else if (protocol === 'tls') {
-      this.handleTLSConnection(sessionId, ref, port);
+      this.handleTLSConnection(sessionId, ref, port, deviceId);
     } else if (protocol === 'udp') {
-      this.handleUDPConnection(sessionId, ref, port);
+      this.handleUDPConnection(sessionId, ref, port, deviceId);
     } else {
       logger.warn(`Unsupported protocol: ${protocol}`);
       this.rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`);
@@ -177,7 +236,7 @@ class PublishPort extends EventEmitter {
     }
   }
 
-  handleTCPConnection(sessionId, ref, port) {
+  handleTCPConnection(sessionId, ref, port, deviceId) {
     // Create a TCP connection to the local service on the specified port
     const localSocket = net.connect({ port: port }, () => {
       logger.info(`Connected to local TCP service on port ${port}`);
@@ -189,10 +248,10 @@ class PublishPort extends EventEmitter {
     this.setupLocalSocketHandlers(localSocket, ref, 'tcp');
 
     // Store the local socket with the ref using connection's method
-    this.connection.addConnection(ref, { socket: localSocket, protocol: 'tcp' });
+    this.connection.addConnection(ref, { socket: localSocket, protocol: 'tcp', port, deviceId });
   }
 
-  handleTLSConnection(sessionId, ref, port) {
+  handleTLSConnection(sessionId, ref, port, deviceId) {
     // Create a DiodeSocket instance
     const diodeSocket = new DiodeSocket(ref, this.rpc);
 
@@ -231,7 +290,6 @@ class PublishPort extends EventEmitter {
     });
 
     tlsSocket.on('close', () => {
-      console.log('TLS Socket closed');
       this.connection.deleteConnection(ref);
     });
 
@@ -241,10 +299,12 @@ class PublishPort extends EventEmitter {
       tlsSocket,
       localSocket,
       protocol: 'tls',
+      port,
+      deviceId,
     });
   }
 
-  handleUDPConnection(sessionId, ref, port) {
+  handleUDPConnection(sessionId, ref, port, deviceId) {
     // Create a UDP socket
     const localSocket = dgram.createSocket('udp4');
 
@@ -259,6 +319,8 @@ class PublishPort extends EventEmitter {
       socket: localSocket,
       protocol: 'udp',
       remoteInfo,
+      port,
+      deviceId
     });
 
     logger.info(`UDP connection set up on port ${port}`);
@@ -289,8 +351,26 @@ class PublishPort extends EventEmitter {
     const data = Buffer.from(dataRaw)//.slice(4);
 
     const connectionInfo = this.connection.getConnection(ref);
+    // Check if the port is still open and address is still in whitelist
     if (connectionInfo) {
-      const { socket: localSocket, protocol, remoteInfo } = connectionInfo;
+      const { socket: localSocket, protocol, remoteInfo, port, deviceId } = connectionInfo;
+
+      if (!this.publishedPorts.has(port)) {
+        logger.warn(`Port ${port} is not published. Sending portclose.`);
+        this.rpc.portClose(ref);
+        this.connection.deleteConnection(ref);
+        return;
+      }
+
+      const portConfig = this.publishedPorts.get(port);
+      if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
+        if (!portConfig.whitelist.includes(deviceId)) {
+          logger.warn(`Device ${deviceId} is not whitelisted for port ${port}. Sending portclose.`);
+          this.rpc.portClose(ref);
+          this.connection.deleteConnection(ref);
+          return;
+        }
+      }
 
       if (protocol === 'udp') {
         // Send data to the local UDP service
