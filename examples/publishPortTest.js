@@ -11,7 +11,7 @@ async function startPublishing() {
   const connection = new DiodeConnection(host, port, certPath);
   await connection.connect();
 
-  const publishedPorts = [8080]; // Ports you want to publish
+  const publishedPorts = {8080: {mode: 'private', whitelist: ['0xca1e71d8105a598810578fb6042fa8cbc1e7f039']}}
   const publishPort = new PublishPort(connection, publishedPorts, certPath);
 
 }

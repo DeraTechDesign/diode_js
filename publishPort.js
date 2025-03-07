@@ -39,9 +39,34 @@ class PublishPort extends EventEmitter {
   constructor(connection, publishedPorts, certPath) {
     super();
     this.connection = connection;
-    this.publishedPorts = new Set(publishedPorts); // Convert array to a Set
-    // Remove local connections map and use the one from connection
+    
+    // Convert publishedPorts to a Map with configurations
+    this.publishedPorts = new Map();
+    
+    // Handle both array format and object format
+    if (Array.isArray(publishedPorts)) {
+      // Legacy array format - treat all ports as public
+      publishedPorts.forEach(port => {
+        this.publishedPorts.set(port, { mode: 'public', whitelist: [] });
+      });
+    } else if (typeof publishedPorts === 'object' && publishedPorts !== null) {
+      // New object format with configurations
+      Object.entries(publishedPorts).forEach(([port, config]) => {
+        const portNum = parseInt(port, 10);
+        // Ensure config is properly structured
+        const portConfig = typeof config === 'object' && config !== null
+          ? { 
+              mode: config.mode || 'public', 
+              whitelist: Array.isArray(config.whitelist) ? config.whitelist : [] 
+            }
+          : { mode: 'public', whitelist: [] };
+        
+        this.publishedPorts.set(portNum, portConfig);
+      });
+    }
+    
     this.startListening();
+    logger.info(`Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
     this.rpc = new DiodeRPC(connection);
     this.certPath = certPath;
   }
@@ -76,7 +101,7 @@ class PublishPort extends EventEmitter {
     const sessionId = Buffer.from(sessionIdRaw);
     const portString = makeReadable(portStringRaw);
     const ref = Buffer.from(refRaw);
-    const deviceId = Buffer.from(deviceIdRaw).toString('hex');
+    const deviceId = `0x${Buffer.from(deviceIdRaw).toString('hex')}`;
 
     logger.info(`Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
 
@@ -96,11 +121,22 @@ class PublishPort extends EventEmitter {
     }
 
     // Check if the port is published
-    if (!this.publishedPorts.has(port)) { // Use .has() instead of .includes()
+    if (!this.publishedPorts.has(port)) {
       logger.warn(`Port ${port} is not published. Rejecting request.`);
       // Send error response
       this.rpc.sendError(sessionId, ref, 'Port is not published');
       return;
+    }
+
+    // Get port configuration and check whitelist if in private mode
+    const portConfig = this.publishedPorts.get(port);
+    if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
+      if (!portConfig.whitelist.includes(deviceId)) {
+        logger.warn(`Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
+        this.rpc.sendError(sessionId, ref, 'Device not whitelisted');
+        return;
+      }
+      logger.info(`Device ${deviceId} is whitelisted for port ${port}. Accepting request.`);
     }
 
     // Handle based on protocol

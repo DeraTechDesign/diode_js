@@ -87,13 +87,22 @@ async function main() {
   const connection = new DiodeConnection(host, port, certPath);
   await connection.connect();
 
-  const publishedPorts = [8080]; // Ports you want to publish
-  const publishPort = new PublishPort(connection, publishedPorts, certPath);
-
+  // Option 1: Simple array of ports (all public)
+  const publishedPorts = [8080, 3000]; 
+  
+  // Option 2: Object with port configurations for public/private access control
+  const publishedPortsWithConfig = {
+    8080: { mode: 'public' },  // Public port, accessible by any device
+    3000: { 
+      mode: 'private',  
+      whitelist: ['0x1234abcd5678...', '0x9876fedc5432...'] // Only these devices can connect
+    }
+  };
+  
+  const publishPort = new PublishPort(connection, publishedPortsWithConfig, certPath);
 }
 
 main();
-
 ```
 
 ## Reference
@@ -149,7 +158,9 @@ main();
 
 - **Constructor**: `new PublishPort(connection, publishedPorts, certPath)`
   - `connection` (DiodeConnection): An instance of `DiodeConnection`.
-  - `publishedPorts` (array): An array of ports to publish.
+  - `publishedPorts` (array|object): Either:
+    - An array of ports to publish (all public mode)
+    - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'] } }`
   - `certPath` (string): The path to the device certificate.
 
 - **Methods**:
