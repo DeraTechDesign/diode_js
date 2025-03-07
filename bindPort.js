@@ -13,8 +13,7 @@ class BindPort {
 
   bind () {
     const deviceId = Buffer.from(this.deviceIdHex, 'hex');
-    const clientSockets = new Map();
-
+    // Remove local clientSockets map and use the one from connection
     const rpc = new DiodeRPC(this.connection);
 
     // Listen for data events from the device
@@ -31,12 +30,17 @@ class BindPort {
         const dataRef = Buffer.from(refRaw);
         const data = Buffer.from(dataRaw);
 
-        // Find the associated client socket
-        const clientSocket = clientSockets.get(dataRef.toString('hex'));
+        // Find the associated client socket from connection
+        const clientSocket = this.connection.getClientSocket(dataRef);
         if (clientSocket) {
           clientSocket.write(data);
         } else {
-          logger.warn(`No client socket found for ref: ${dataRef.toString('hex')}`);
+          const connectionInfo = this.connection.getConnection(dataRef);
+          if (connectionInfo) {
+            logger.debug(`No client socket found for ref: ${dataRef.toString('hex')}, but connection exists for ${connectionInfo.host}:${connectionInfo.port}`);
+          } else {
+            logger.warn(`No client socket found for ref: ${dataRef.toString('hex')}`);
+          }
         }
       } else if (messageType === 'portclose') {
         const refRaw = messageContent[1];
@@ -44,14 +48,16 @@ class BindPort {
         const dataRef = Buffer.from(refRaw);
 
         // Close the associated client socket
-        const clientSocket = clientSockets.get(dataRef.toString('hex'));
+        const clientSocket = this.connection.getClientSocket(dataRef);
         if (clientSocket) {
           clientSocket.end();
-          clientSockets.delete(dataRef.toString('hex'));
+          this.connection.deleteClientSocket(dataRef);
           logger.info(`Port closed for ref: ${dataRef.toString('hex')}`);
         }
       } else {
-        logger.warn(`Unknown unsolicited message type: ${messageType}`);
+        if (messageType != 'portopen') {
+          logger.warn(`Unknown unsolicited message type: ${messageType}`);
+        }
       }
     });
 
@@ -76,8 +82,8 @@ class BindPort {
         return;
       }
 
-      // Store the client socket with the ref (using hex string as key)
-      clientSockets.set(ref.toString('hex'), clientSocket);
+      // Store the client socket with the ref using connection's method
+      this.connection.addClientSocket(ref, clientSocket);
 
       // When data is received from the client, send it to the device
       clientSocket.on('data', async (data) => {
@@ -92,11 +98,11 @@ class BindPort {
       // Handle client socket closure
       clientSocket.on('end', async () => {
         logger.info('Client disconnected');
-        if (ref && clientSockets.has(ref.toString('hex'))) {
+        if (ref && this.connection.hasClientSocket(ref)) {
           try {
             await rpc.portClose(ref);
             logger.info(`Port closed on device for ref: ${ref.toString('hex')}`);
-            clientSockets.delete(ref.toString('hex'));
+            this.connection.deleteClientSocket(ref);
           } catch (error) {
             logger.error(`Error closing port on device: ${error}`);
           }

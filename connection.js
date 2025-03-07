@@ -28,6 +28,10 @@ class DiodeConnection extends EventEmitter {
     this.RPC = new DiodeRPC(this);
     this.isReconnecting = false;
     this.connectPromise = null;
+    
+    // Add maps for storing client sockets and connections
+    this.clientSockets = new Map(); // For BindPort
+    this.connections = new Map(); // For PublishPort
 
     // Check if certPath exists, if not generate the certificate
     if (!fs.existsSync(this.certPath)) {
@@ -561,6 +565,40 @@ class DiodeConnection extends EventEmitter {
 
   close() {
     this.socket.end();
+  }
+
+  // Client sockets management methods (for BindPort)
+  addClientSocket(ref, socket) {
+    this.clientSockets.set(ref.toString('hex'), socket);
+  }
+
+  getClientSocket(ref) {
+    return this.clientSockets.get(ref.toString('hex'));
+  }
+
+  deleteClientSocket(ref) {
+    return this.clientSockets.delete(ref.toString('hex'));
+  }
+
+  hasClientSocket(ref) {
+    return this.clientSockets.has(ref.toString('hex'));
+  }
+
+  // Connections management methods (for PublishPort)
+  addConnection(ref, connectionInfo) {
+    this.connections.set(ref.toString('hex'), connectionInfo);
+  }
+
+  getConnection(ref) {
+    return this.connections.get(ref.toString('hex'));
+  }
+
+  deleteConnection(ref) {
+    return this.connections.delete(ref.toString('hex'));
+  }
+
+  hasConnection(ref) {
+    return this.connections.has(ref.toString('hex'));
   }
 }
 

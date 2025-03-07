@@ -40,7 +40,7 @@ class PublishPort extends EventEmitter {
     super();
     this.connection = connection;
     this.publishedPorts = new Set(publishedPorts); // Convert array to a Set
-    this.connections = new Map(); // Map to store active connections
+    // Remove local connections map and use the one from connection
     this.startListening();
     this.rpc = new DiodeRPC(connection);
     this.certPath = certPath;
@@ -60,7 +60,9 @@ class PublishPort extends EventEmitter {
       } else if (messageType === 'portclose') {
         this.handlePortClose(sessionIdRaw, messageContent);
       } else {
-        logger.warn(`Unknown unsolicited message type: ${messageType}`);
+        if (messageType != 'data') {
+          logger.warn(`Unknown unsolicited message type: ${messageType}`);
+        }
       }
     });
   }
@@ -127,14 +129,14 @@ class PublishPort extends EventEmitter {
         logger.info(`Local service disconnected`);
         // Send portclose message to Diode
         this.rpc.portClose(ref);
-        this.connections.delete(ref.toString('hex'));
+        this.connection.deleteConnection(ref);
       });
 
       localSocket.on('error', (err) => {
         logger.error(`Error with local service: ${err}`);
         // Send portclose message to Diode
         this.rpc.portClose(ref);
-        this.connections.delete(ref.toString('hex'));
+        this.connection.deleteConnection(ref);
       });
     }
   }
@@ -150,8 +152,8 @@ class PublishPort extends EventEmitter {
     // Handle data, end, and error events
     this.setupLocalSocketHandlers(localSocket, ref, 'tcp');
 
-    // Store the local socket with the ref
-    this.connections.set(ref.toString('hex'), { socket: localSocket, protocol: 'tcp' });
+    // Store the local socket with the ref using connection's method
+    this.connection.addConnection(ref, { socket: localSocket, protocol: 'tcp' });
   }
 
   handleTLSConnection(sessionId, ref, port) {
@@ -189,16 +191,16 @@ class PublishPort extends EventEmitter {
     tlsSocket.on('error', (err) => {
       logger.error(`TLS Socket error: ${err}`);
       this.rpc.portClose(ref);
-      this.connections.delete(ref.toString('hex'));
+      this.connection.deleteConnection(ref);
     });
 
     tlsSocket.on('close', () => {
       console.log('TLS Socket closed');
-      this.connections.delete(ref.toString('hex'));
+      this.connection.deleteConnection(ref);
     });
 
-    // Store the connection info
-    this.connections.set(ref.toString('hex'), {
+    // Store the connection info using connection's method
+    this.connection.addConnection(ref, {
       diodeSocket,
       tlsSocket,
       localSocket,
@@ -216,8 +218,8 @@ class PublishPort extends EventEmitter {
     // Send success response
     this.rpc.sendResponse(sessionId, ref, 'ok');
 
-    // Store the connection info
-    this.connections.set(ref.toString('hex'), {
+    // Store the connection info using connection's method
+    this.connection.addConnection(ref, {
       socket: localSocket,
       protocol: 'udp',
       remoteInfo,
@@ -238,7 +240,7 @@ class PublishPort extends EventEmitter {
     localSocket.on('error', (err) => {
       logger.error(`UDP Socket error: ${err}`);
       this.rpc.portClose(ref);
-      this.connections.delete(ref.toString('hex'));
+      this.connection.deleteConnection(ref);
     });
   }
 
@@ -250,7 +252,7 @@ class PublishPort extends EventEmitter {
     const ref = Buffer.from(refRaw);
     const data = Buffer.from(dataRaw)//.slice(4);
 
-    const connectionInfo = this.connections.get(ref.toString('hex'));
+    const connectionInfo = this.connection.getConnection(ref);
     if (connectionInfo) {
       const { socket: localSocket, protocol, remoteInfo } = connectionInfo;
 
@@ -277,8 +279,13 @@ class PublishPort extends EventEmitter {
         diodeSocket.pushData(data);
       }
     } else {
-      logger.warn(`No local connection found for ref ${ref.toString('hex')}. Sending portclose.`);
-      this.rpc.sendError(sessionId, ref, 'No local connection found');
+      const clientSocket = this.connection.getClientSocket(ref);
+      if (clientSocket) {
+        logger.debug(`No local connection found for ref: ${ref.toString('hex')}, but client socket exists`);
+      } else {
+        logger.warn(`No local connection found for ref ${ref.toString('hex')}. Sending portclose.`);
+        this.rpc.sendError(sessionId, ref, 'No local connection found');
+      }
     }
   }
 
@@ -289,7 +296,7 @@ class PublishPort extends EventEmitter {
 
     logger.info(`Received portclose for ref ${ref.toString('hex')}`);
 
-    const connectionInfo = this.connections.get(ref.toString('hex'));
+    const connectionInfo = this.connection.getConnection(ref);
     if (connectionInfo) {
       const { diodeSocket, tlsSocket, socket: localSocket } = connectionInfo;
       // End all sockets
@@ -302,7 +309,7 @@ class PublishPort extends EventEmitter {
           localSocket.end();
         }
       }
-      this.connections.delete(ref.toString('hex'));
+      this.connection.deleteConnection(ref);
     }
   }
 }
