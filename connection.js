@@ -3,7 +3,7 @@ const tls = require('tls');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
-const { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert } = require('./utils');
+const { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert, ensureDirectoryExistence, loadOrGenerateKeyPair } = require('./utils');
 const { Buffer } = require('buffer'); // Import Buffer
 const asn1 = require('asn1.js');
 const secp256k1 = require('secp256k1');
@@ -12,12 +12,14 @@ const crypto = require('crypto');
 const DiodeRPC = require('./rpc');
 const abi = require('ethereumjs-abi');
 const logger = require('./logger');
+const path = require('path');
+
 class DiodeConnection extends EventEmitter {
-  constructor(host, port, certPath = './cert/device_certificate.pem') {
+  constructor(host, port, keyLocation = './db/keys.json') {
     super();
     this.host = host;
     this.port = port;
-    this.certPath = certPath;
+    this.keyLocation = keyLocation;
     this.socket = null;
     this.requestId = 0; // Initialize request ID counter
     this.pendingRequests = new Map(); // Map to store pending requests
@@ -32,18 +34,19 @@ class DiodeConnection extends EventEmitter {
     // Add maps for storing client sockets and connections
     this.clientSockets = new Map(); // For BindPort
     this.connections = new Map(); // For PublishPort
-
-    // Check if certPath exists, if not generate the certificate
-    if (!fs.existsSync(this.certPath)) {
-      generateCert(this.certPath);
-    }
+    this.certPem = null;
+    // Load or generate keypair
+    this.keyPair = loadOrGenerateKeyPair(this.keyLocation);
   }
 
   connect() {
     return new Promise((resolve, reject) => {
+      // Generate a temporary certificate valid for 1 month
+      this.certPem = generateCert(this.keyPair.prvKeyObj, this.keyPair.pubKeyObj);
+
       const options = {
-        cert: fs.readFileSync(this.certPath),
-        key: fs.readFileSync(this.certPath),
+        cert: this.certPem,
+        key: this.certPem,
         rejectUnauthorized: false,
         ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384',
         ecdhCurve: 'secp256k1',
@@ -276,63 +279,10 @@ class DiodeConnection extends EventEmitter {
 
   getEthereumAddress() {
     try {
-      const pem = fs.readFileSync(this.certPath, 'utf8');
-      let privateKeyPem;
-      let privateKeyDer;
-      let privateKeyBytes;
-
-      if (pem.includes('-----BEGIN PRIVATE KEY-----')) {
-        // Handle PKCS#8 format
-        privateKeyPem = pem
-          .replace('-----BEGIN PRIVATE KEY-----', '')
-          .replace('-----END PRIVATE KEY-----', '')
-          .replace(/\r?\n|\r/g, '');
-
-        privateKeyDer = Buffer.from(privateKeyPem, 'base64');
-
-        // Define ASN.1 structure for PKCS#8 private key
-        const PrivateKeyInfoASN = asn1.define('PrivateKeyInfo', function () {
-          this.seq().obj(
-            this.key('version').int(),
-            this.key('privateKeyAlgorithm').seq().obj(
-              this.key('algorithm').objid(),
-              this.key('parameters').optional()
-            ),
-            this.key('privateKey').octstr(),
-            this.key('attributes').implicit(0).any().optional(),
-            this.key('publicKey').implicit(1).bitstr().optional()
-          );
-        });
-
-        // Decode the DER-encoded private key
-        const privateKeyInfo = PrivateKeyInfoASN.decode(privateKeyDer, 'der');
-        const privateKeyOctetString = privateKeyInfo.privateKey;
-
-        // Now parse the ECPrivateKey structure inside the octet string
-        const ECPrivateKeyASN = asn1.define('ECPrivateKey', function () {
-          this.seq().obj(
-            this.key('version').int(),
-            this.key('privateKey').octstr(),
-            this.key('parameters').explicit(0).objid().optional(),
-            this.key('publicKey').explicit(1).bitstr().optional()
-          );
-        });
-
-        const ecPrivateKey = ECPrivateKeyASN.decode(privateKeyOctetString, 'der');
-        privateKeyBytes = ecPrivateKey.privateKey;
-        logger.debug(`Private key bytes: ${privateKeyBytes.toString('hex')}`);
-      } else {
-        throw new Error('Unsupported key format. Expected EC PRIVATE KEY or PRIVATE KEY in PEM format.');
-      }
-
-      // Compute the public key
-      const publicKeyUint8Array = secp256k1.publicKeyCreate(privateKeyBytes, false); // uncompressed
-
-      // Convert publicKey to Buffer if necessary
-      const publicKeyBuffer = Buffer.isBuffer(publicKeyUint8Array)
-        ? publicKeyUint8Array
-        : Buffer.from(publicKeyUint8Array);
-
+      // Use the stored keyPair.pubKeyObj to derive Ethereum address
+      const publicKeyDer = this.keyPair.prvKeyObj.generatePublicKeyHex();
+      const publicKeyBuffer = Buffer.from(publicKeyDer, 'hex');
+      
       // Derive the Ethereum address
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
@@ -369,106 +319,15 @@ class DiodeConnection extends EventEmitter {
     }
   }
 
-  // getServerEthereumAddress() {
-  //   try {
-  //     const serverCert = this.socket.getPeerCertificate(true);
-  //     if (!serverCert.raw) {
-  //       throw new Error('Failed to get server certificate.');
-  //     }
-  
-  //     // Extract public key from the certificate
-  //     const publicKey = serverCert.pubkey; // May need to parse ASN.1 structure to get the public key
-  //     // Assume you have a method to extract the public key buffer from the certificate
-  
-  //     // Compute Ethereum address from public key
-  //     const publicKeyBuffer = Buffer.from(publicKey); // Ensure it's a Buffer
-  //     const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
-  
-  //     return addressBuffer; // Return as Buffer
-  //   } catch (error) {
-  //     console.error('Error extracting server Ethereum address:', error);
-  //     throw error;
-  //   }
-  // }
-
-  // Method to extract private key bytes from certPath
+  // Method to extract private key bytes from keyPair
   getPrivateKey() {
-    // Similar to getEthereumAddress(), but return privateKeyBytes
-    // Ensure to handle different key formats (EC PRIVATE KEY and PRIVATE KEY)
     try {
-      const pem = fs.readFileSync(this.certPath, 'utf8');
-      let privateKeyPem;
-      let privateKeyDer;
-      let privateKeyBytes;
-
-      if (pem.includes('-----BEGIN PRIVATE KEY-----')) {
-        // Handle PKCS#8 format
-        privateKeyPem = pem
-          .replace('-----BEGIN PRIVATE KEY-----', '')
-          .replace('-----END PRIVATE KEY-----', '')
-          .replace(/\r?\n|\r/g, '');
-
-        privateKeyDer = Buffer.from(privateKeyPem, 'base64');
-
-        // Define ASN.1 structure for PKCS#8 private key
-        const PrivateKeyInfoASN = asn1.define('PrivateKeyInfo', function () {
-          this.seq().obj(
-            this.key('version').int(),
-            this.key('privateKeyAlgorithm').seq().obj(
-              this.key('algorithm').objid(),
-              this.key('parameters').optional()
-            ),
-            this.key('privateKey').octstr(),
-            this.key('attributes').implicit(0).any().optional(),
-            this.key('publicKey').implicit(1).bitstr().optional()
-          );
-        });
-
-        // Decode the DER-encoded private key
-        const privateKeyInfo = PrivateKeyInfoASN.decode(privateKeyDer, 'der');
-        const privateKeyOctetString = privateKeyInfo.privateKey;
-
-        // Now parse the ECPrivateKey structure inside the octet string
-        const ECPrivateKeyASN = asn1.define('ECPrivateKey', function () {
-          this.seq().obj(
-            this.key('version').int(),
-            this.key('privateKey').octstr(),
-            this.key('parameters').explicit(0).objid().optional(),
-            this.key('publicKey').explicit(1).bitstr().optional()
-          );
-        });
-
-        const ecPrivateKey = ECPrivateKeyASN.decode(privateKeyOctetString, 'der');
-        privateKeyBytes = ecPrivateKey.privateKey;
-      } else if (pem.includes('-----BEGIN EC PRIVATE KEY-----')) {
-        // Handle EC PRIVATE KEY format
-        privateKeyPem = pem
-          .replace('-----BEGIN EC PRIVATE KEY-----', '')
-          .replace('-----END EC PRIVATE KEY-----', '')
-          .replace(/\r?\n|\r/g, '');
-
-        privateKeyDer = Buffer.from(privateKeyPem, 'base64');
-
-        // Define ASN.1 structure for EC private key
-        const ECPrivateKeyASN = asn1.define('ECPrivateKey', function () {
-          this.seq().obj(
-            this.key('version').int(),
-            this.key('privateKey').octstr(),
-            this.key('parameters').explicit(0).objid().optional(),
-            this.key('publicKey').explicit(1).bitstr().optional()
-          );
-        });
-
-        // Decode the DER-encoded private key
-        const ecPrivateKey = ECPrivateKeyASN.decode(privateKeyDer, 'der');
-        privateKeyBytes = ecPrivateKey.privateKey;
-      } else {
-        throw new Error('Unsupported key format. Expected EC PRIVATE KEY or PRIVATE KEY in PEM format.');
-      }
-
+      // Extract private key bytes from the keyPair.prvKeyObj
+      const privateKeyHex = this.keyPair.prvKeyObj.prvKeyHex;
+      const privateKeyBytes = Buffer.from(privateKeyHex, 'hex');
       return privateKeyBytes;
     } catch (error) {
-      logger.error(`Error extracting Ethereum address: ${error}`);
+      logger.error(`Error extracting private key: ${error}`);
       throw error;
     }
   }
@@ -556,6 +415,12 @@ class DiodeConnection extends EventEmitter {
   
     return ticketCommand;
   }
+
+  getDeviceCertificate() {
+    return this.certPem;
+  }
+
+    
 
   _getNextRequestId() {
     // Increment the request ID counter, wrap around if necessary

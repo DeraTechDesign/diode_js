@@ -25,9 +25,9 @@ const { DiodeConnection, DiodeRPC, makeReadable } = require('diodejs');
 async function main() {
   const host = 'eu2.prenet.diode.io';
   const port = 41046;
-  const certPath = 'device_certificate.pem';
+  const keyLocation = './db/keys.json'; // Optional, defaults to './db/keys.json'
 
-  const connection = new DiodeConnection(host, port, certPath);
+  const connection = new DiodeConnection(host, port, keyLocation);
   await connection.connect();
 
   const rpc = new DiodeRPC(connection);
@@ -61,9 +61,9 @@ const { DiodeConnection, BindPort } = require('diodejs');
 async function main() {
     const host = 'eu2.prenet.diode.io';
     const port = 41046;
-    const certPath = 'device_certificate.pem';
+    const keyLocation = './db/keys.json';
   
-    const connection = new DiodeConnection(host, port, certPath);
+    const connection = new DiodeConnection(host, port, keyLocation);
     await connection.connect();
   
     // Multiple or single port binding with configuration object
@@ -90,9 +90,9 @@ const { DiodeConnection, BindPort } = require('diodejs');
 async function main() {
     const host = 'eu2.prenet.diode.io';
     const port = 41046;
-    const certPath = 'device_certificate.pem';
+    const keyLocation = './db/keys.json';
   
-    const connection = new DiodeConnection(host, port, certPath);
+    const connection = new DiodeConnection(host, port, keyLocation);
     await connection.connect();
   
     // Legacy method - single port binding
@@ -113,9 +113,9 @@ const { DiodeConnection, PublishPort } = require('diodejs');
 async function main() {
   const host = 'us2.prenet.diode.io';
   const port = 41046;
-  const certPath = 'device_certificate.pem';
+  const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, certPath);
+  const connection = new DiodeConnection(host, port, keyLocation);
   await connection.connect();
 
   // Option 1: Simple array of ports (all public)
@@ -130,7 +130,8 @@ async function main() {
     }
   };
   
-  const publishPort = new PublishPort(connection, publishedPortsWithConfig, certPath);
+  // certPath parameter is maintained for backward compatibility but not required
+  const publishPort = new PublishPort(connection, publishedPortsWithConfig);
 }
 
 main();
@@ -142,19 +143,20 @@ main();
 
 #### `DiodeConnection`
 
-- **Constructor**: `new DiodeConnection(host, port, certPath)`
+- **Constructor**: `new DiodeConnection(host, port, keyLocation)`
   - `host` (string): The host address of the Diode server.
   - `port` (number): The port number of the Diode server.
-  - `certPath` (string)(default: ./cert/device_certificate.pem): The path to the device certificate. If doesn't exist, generates automaticly. 
+  - `keyLocation` (string)(default: './db/keys.json'): The path to the key storage file. If the file doesn't exist, keys are generated automatically.
 
 - **Methods**:
   - `connect()`: Connects to the Diode server. Returns a promise.
   - `sendCommand(commandArray)`: Sends a command to the Diode server. Returns a promise.
   - `sendCommandWithSessionId(commandArray, sessionId)`: Sends a command with a session ID. Returns a promise.
-  - `getEthereumAddress()`: Returns the Ethereum address derived from the device certificate.
+  - `getEthereumAddress()`: Returns the Ethereum address derived from the device keys.
   - `getServerEthereumAddress()`: Returns the Ethereum address of the server.
   - `createTicketCommand()`: Creates a ticket command for authentication. Returns a promise.
   - `close()`: Closes the connection to the Diode server.
+  - `getDeviceCertificate()`: Returns the generated certificate PEM.
 
 #### `DiodeRPC`
 
@@ -200,12 +202,12 @@ main();
 
 #### `PublishPort`
 
-- **Constructor**: `new PublishPort(connection, publishedPorts, certPath)`
+- **Constructor**: `new PublishPort(connection, publishedPorts, _certPath)`
   - `connection` (DiodeConnection): An instance of `DiodeConnection`.
   - `publishedPorts` (array|object): Either:
     - An array of ports to publish (all public mode)
     - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'] } }`
-  - `certPath` (string): The path to the device certificate.
+  - `_certPath` (string): Has no functionality and maintained for backward compatibility.
 
 - **Methods**:
   - `addPort(port, config)`: Adds a new port to publish. Config is optional and defaults to public mode.

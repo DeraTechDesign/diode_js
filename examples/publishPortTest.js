@@ -5,9 +5,9 @@ const { DiodeConnection, PublishPort } = require('../index');
 async function startPublishing() {
   const host = 'us2.prenet.diode.io';
   const port = 41046;
-  const certPath = 'device_certificate.pem';
+  const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, certPath);
+  const connection = new DiodeConnection(host, port, keyLocation);
   await connection.connect();
 
   // Create a PublishPort instance with initial ports
@@ -17,7 +17,7 @@ async function startPublishing() {
       mode: 'private',
       whitelist: ['0xca1e71d8105a598810578fb6042fa8cbc1e7f039'] // Replace with actual addresses
     }
-  }, certPath);
+  }, keyLocation);
   
   console.log('Initial published ports:', publishPort.getPublishedPorts());
   

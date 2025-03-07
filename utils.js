@@ -80,19 +80,32 @@ function parseReason(reasonRaw) {
   }
 }
 
-function generateCert(path) {
-  var kp = KEYUTIL.generateKeypair("EC", "secp256k1");
-
-  var priv = KEYUTIL.getPEM(kp.prvKeyObj, "PKCS8PRV");
-
-  pub = KEYUTIL.getPEM(kp.pubKeyObj, "PKCS8PUB");
-
+function generateCert(privateKeyObj, publicKeyObj) {
+  // Generate a certificate valid for 1 month
+  function formatDate(date) {
+    const pad = n => n < 10 ? '0' + n : n;
+    return String(date.getUTCFullYear()).slice(2) +
+           pad(date.getUTCMonth() + 1) +
+           pad(date.getUTCDate()) +
+           pad(date.getUTCHours()) +
+           pad(date.getUTCMinutes()) +
+           pad(date.getUTCSeconds()) +
+           'Z';
+  }
+  
+  const now = new Date();
+  const notBefore = formatDate(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)); // 30 days before now
+  const notAfter = formatDate(new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000));  // 30 days after now
+  
+  
   var x = new KJUR.asn1.x509.Certificate({
       version: 3,
-      serial: { int: 4 },
+      serial: { int: Math.floor(Math.random() * 1000000) },
       issuer: { str: "/CN=device" },
+      notbefore: notBefore,
+      notafter: notAfter,
       subject: { str: "/CN=device" },
-      sbjpubkey: kp.pubKeyObj, 
+      sbjpubkey: publicKeyObj, 
       ext: [
           { extname: "basicConstraints", cA: false },
           { extname: "keyUsage", critical: true, names: ["digitalSignature"] },
@@ -102,14 +115,52 @@ function generateCert(path) {
           }
       ],
       sigalg: "SHA256withECDSA",
-      cakey: kp.prvKeyObj
+      cakey: privateKeyObj
   });
 
+  // Get PEM representations
+  const priv = KEYUTIL.getPEM(privateKeyObj, "PKCS8PRV");
+  
+  
+  // Return the certificate with private key
+  return priv + x.getPEM();
+}
 
-  const pemFile = priv + x.getPEM();
-  ensureDirectoryExistence(path);
-
-  fs.writeFileSync(path, pemFile , 'utf8');
+function loadOrGenerateKeyPair(keyLocation) {
+  try {
+    ensureDirectoryExistence(keyLocation);
+    
+    // Try to load existing keys
+    if (fs.existsSync(keyLocation)) {
+      logger.info(`Loading keys from ${keyLocation}`);
+      const keyData = JSON.parse(fs.readFileSync(keyLocation, 'utf8'));
+      
+      // Convert the stored JSON back to keypair objects
+      const prvKeyObj = KEYUTIL.getKeyFromPlainPrivatePKCS8PEM(keyData.privateKey);
+      const pubKeyObj = KEYUTIL.getKey(keyData.publicKey);
+      
+      return { prvKeyObj, pubKeyObj };
+    } else {
+      // Generate new keypair
+      logger.info(`Generating new key pair at ${keyLocation}`);
+      const kp = KEYUTIL.generateKeypair("EC", "secp256k1");
+      
+      // Store the keys in a serializable format
+      const keyData = {
+        privateKey: KEYUTIL.getPEM(kp.prvKeyObj, "PKCS8PRV"),
+        publicKey: KEYUTIL.getPEM(kp.pubKeyObj, "PKCS8PUB"),
+        check: kp.prvKeyObj.prvKeyHex
+      };
+      
+      // Save to file
+      fs.writeFileSync(keyLocation, JSON.stringify(keyData, null, 2), 'utf8');
+      
+      return kp;
+    }
+  } catch (error) {
+    logger.error(`Error loading or generating key pair: ${error}`);
+    throw error;
+  }
 }
 
 function ensureDirectoryExistence(filePath) {
@@ -121,4 +172,12 @@ function ensureDirectoryExistence(filePath) {
   fs.mkdirSync(dirname);
 }
 
-module.exports = { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert };
+module.exports = { 
+  makeReadable, 
+  parseRequestId, 
+  parseResponseType, 
+  parseReason, 
+  generateCert, 
+  loadOrGenerateKeyPair,
+  ensureDirectoryExistence 
+};

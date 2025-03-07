@@ -4,9 +4,9 @@ const { makeReadable } = require('../utils');
 async function main() {
   const host = 'us2.prenet.diode.io';
   const port = 41046;
-  const certPath = 'device_certificate.pem';
+  const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, certPath);
+  const connection = new DiodeConnection(host, port, keyLocation);
   await connection.connect();
   const rpc = connection.RPC;
 

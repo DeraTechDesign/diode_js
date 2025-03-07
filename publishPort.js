@@ -36,10 +36,9 @@ class DiodeSocket extends Duplex {
 }
 
 class PublishPort extends EventEmitter {
-  constructor(connection, publishedPorts, certPath) {
+  constructor(connection, publishedPorts, _certPath = null) {
     super();
     this.connection = connection;
-    this.certPath = certPath;
     this.rpc = new DiodeRPC(connection);
     
     // Convert publishedPorts to a Map with configurations
@@ -255,10 +254,12 @@ class PublishPort extends EventEmitter {
     // Create a DiodeSocket instance
     const diodeSocket = new DiodeSocket(ref, this.rpc);
 
+    certPem = this.connection.getDeviceCertificate();
+
     // TLS options with your server's certificate and key
     const tlsOptions = {
-      cert: fs.readFileSync(this.certPath),
-      key: fs.readFileSync(this.certPath),
+      cert: certPem,
+      key: certPem,
       rejectUnauthorized: false,
       ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384',
       ecdhCurve: 'secp256k1',
