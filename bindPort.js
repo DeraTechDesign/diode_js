@@ -10,11 +10,21 @@ class BindPort {
     // Handle legacy constructor (connection, localPort, targetPort, deviceIdHex)
     if (typeof localPortOrPortsConfig === 'number' && targetPort !== undefined && deviceIdHex !== undefined) {
       this.portsConfig = {
-        [localPortOrPortsConfig]: { targetPort, deviceIdHex }
+        [localPortOrPortsConfig]: { 
+          targetPort, 
+          deviceIdHex: this._stripHexPrefix(deviceIdHex) 
+        }
       };
     } else {
       // New constructor (connection, portsConfig)
       this.portsConfig = localPortOrPortsConfig || {};
+      
+      // Strip 0x prefix from all deviceIdHex values in portsConfig
+      for (const port in this.portsConfig) {
+        if (this.portsConfig[port].deviceIdHex) {
+          this.portsConfig[port].deviceIdHex = this._stripHexPrefix(this.portsConfig[port].deviceIdHex);
+        }
+      }
     }
     
     this.servers = new Map(); // Track server instances by localPort
@@ -22,6 +32,14 @@ class BindPort {
     
     // Set up listener for unsolicited messages once
     this._setupMessageListener();
+  }
+  
+  // Helper method to strip 0x prefix from hex strings
+  _stripHexPrefix(hexString) {
+    if (typeof hexString === 'string' && hexString.toLowerCase().startsWith('0x')) {
+      return hexString.slice(2);
+    }
+    return hexString;
   }
   
   _setupMessageListener() {
@@ -88,7 +106,10 @@ class BindPort {
       return false;
     }
     
-    this.portsConfig[localPort] = { targetPort, deviceIdHex };
+    this.portsConfig[localPort] = { 
+      targetPort, 
+      deviceIdHex: this._stripHexPrefix(deviceIdHex) 
+    };
     
     this.bindSinglePort(localPort);
     

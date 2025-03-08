@@ -9,7 +9,7 @@ async function main() {
     await connection.connect();
   
     const portForward = new BindPort(connection, {
-        3003: { targetPort: 8080, deviceIdHex: "ca1e71d8105a598810578fb6042fa8cbc1e7f039" },
+        3003: { targetPort: 8080, deviceIdHex: "0xca1e71d8105a598810578fb6042fa8cbc1e7f039" },
         3004: { targetPort: 443, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" }
       });
     portForward.bind();
@@ -23,7 +23,7 @@ async function main() {
     // after 10 seconds, add port 3003 back
     setTimeout(() => {
         console.log("Adding port 3003 back");
-        portForward.addPort(3003, 8080, "ca1e71d8105a598810578fb6042fa8cbc1e7f039");
+        portForward.addPort(3003, 8080, "0xca1e71d8105a598810578fb6042fa8cbc1e7f039");
     }, 10000);
     
     

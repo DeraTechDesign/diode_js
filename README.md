@@ -69,7 +69,7 @@ async function main() {
     // Multiple or single port binding with configuration object
     const portsConfig = {
       3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" },
-      3003: { targetPort: 443, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" }
+      3003: { targetPort: 443, deviceIdHex: "0x5365baf29cb7ab58de588dfc448913cb609283e2" } // Works with or without 0x prefix
     };
     
     const portForward = new BindPort(connection, portsConfig);
@@ -185,17 +185,18 @@ main();
     - `connection` (DiodeConnection): An instance of `DiodeConnection`.
     - `localPort` (number): The local port to bind.
     - `targetPort` (number): The target port on the device.
-    - `deviceIdHex` (string): The device ID in hexadecimal format.
+    - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
   
   New Constructor:
   - `new BindPort(connection, portsConfig)`
     - `connection` (DiodeConnection): An instance of `DiodeConnection`.
     - `portsConfig` (object): A configuration object where keys are local ports and values are objects with `targetPort` and `deviceIdHex`.
       Example: `{ 3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" } }`
+      Note: deviceIdHex can be provided with or without the '0x' prefix.
 
 - **Methods**:
   - `bind()`: Binds all configured local ports to their target ports on the devices.
-  - `addPort(localPort, targetPort, deviceIdHex)`: Adds a new port binding configuration.
+  - `addPort(localPort, targetPort, deviceIdHex)`: Adds a new port binding configuration. deviceIdHex can include '0x' prefix.
   - `removePort(localPort)`: Removes a port binding configuration.
   - `bindSinglePort(localPort)`: Binds a single local port to its target.
   - `closeAllServers()`: Closes all active server instances.
