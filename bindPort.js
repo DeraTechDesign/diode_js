@@ -90,10 +90,7 @@ class BindPort {
     
     this.portsConfig[localPort] = { targetPort, deviceIdHex };
     
-    // If we're already bound, set up this new port immediately
-    if (this.servers.size > 0) {
-      this.bindSinglePort(localPort);
-    }
+    this.bindSinglePort(localPort);
     
     return true;
   }
