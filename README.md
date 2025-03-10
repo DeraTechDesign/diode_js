@@ -15,6 +15,35 @@ If you want to enable debug logs, set environment variable DEBUG to true.
 
 Can also use .env files
 
+### Connection Settings
+
+Connection retry behavior can be configured via environment variables:
+
+| Environment Variable | Description | Default |
+|----------------------|-------------|---------|
+| DIODE_MAX_RETRIES | Maximum number of reconnection attempts | Infinity |
+| DIODE_RETRY_DELAY | Initial delay between retries (ms) | 1000 |
+| DIODE_MAX_RETRY_DELAY | Maximum delay between retries (ms) | 30000 |
+| DIODE_AUTO_RECONNECT | Whether to automatically reconnect | true |
+
+Example `.env` file:
+```
+DIODE_MAX_RETRIES=10
+DIODE_RETRY_DELAY=2000
+DIODE_MAX_RETRY_DELAY=20000
+DIODE_AUTO_RECONNECT=true
+```
+
+These settings can also be configured programmatically:
+```javascript
+connection.setReconnectOptions({
+  maxRetries: 10,
+  retryDelay: 2000,
+  maxRetryDelay: 20000,
+  autoReconnect: true
+});
+```
+
 ### Test RPC
 
 Here's a quick example to get you started with RPC functions using `DiodeRPC` Class
@@ -28,6 +57,26 @@ async function main() {
   const keyLocation = './db/keys.json'; // Optional, defaults to './db/keys.json'
 
   const connection = new DiodeConnection(host, port, keyLocation);
+  
+  // Configure reconnection (optional - overrides environment variables)
+  connection.setReconnectOptions({
+    maxRetries: Infinity, // Unlimited reconnection attempts
+    retryDelay: 1000,     // Initial delay of 1 second
+    maxRetryDelay: 30000, // Maximum delay of 30 seconds
+    autoReconnect: true   // Automatically reconnect on disconnection
+  });
+  
+  // Listen for reconnection events (optional)
+  connection.on('reconnecting', (info) => {
+    console.log(`Reconnecting... Attempt #${info.attempt} in ${info.delay}ms`);
+  });
+  connection.on('reconnected', () => {
+    console.log('Successfully reconnected!');
+  });
+  connection.on('reconnect_failed', () => {
+    console.log('Failed to reconnect after maximum attempts');
+  });
+  
   await connection.connect();
 
   const rpc = new DiodeRPC(connection);
@@ -157,6 +206,16 @@ main();
   - `createTicketCommand()`: Creates a ticket command for authentication. Returns a promise.
   - `close()`: Closes the connection to the Diode server.
   - `getDeviceCertificate()`: Returns the generated certificate PEM.
+  - `setReconnectOptions(options)`: Configures reconnection behavior with the following options:
+    - `maxRetries` (number): Maximum reconnection attempts (default: Infinity)
+    - `retryDelay` (number): Initial delay between retries in ms (default: 1000)
+    - `maxRetryDelay` (number): Maximum delay between retries in ms (default: 30000)
+    - `autoReconnect` (boolean): Whether to automatically reconnect on disconnection (default: true)
+
+- **Events**:
+  - `reconnecting`: Emitted when a reconnection attempt is about to start, with `attempt` and `delay` information
+  - `reconnected`: Emitted when reconnection is successful
+  - `reconnect_failed`: Emitted when all reconnection attempts have failed
 
 #### `DiodeRPC`
 

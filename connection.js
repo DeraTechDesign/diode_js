@@ -13,6 +13,8 @@ const DiodeRPC = require('./rpc');
 const abi = require('ethereumjs-abi');
 const logger = require('./logger');
 const path = require('path');
+// Add dotenv for environment variables
+require('dotenv').config();
 
 class DiodeConnection extends EventEmitter {
   constructor(host, port, keyLocation = './db/keys.json') {
@@ -37,9 +39,38 @@ class DiodeConnection extends EventEmitter {
     this.certPem = null;
     // Load or generate keypair
     this.keyPair = loadOrGenerateKeyPair(this.keyLocation);
+    
+    // Load reconnection properties from environment variables with defaults
+    const envMaxRetries = process.env.DIODE_MAX_RETRIES;
+    this.maxRetries = envMaxRetries !== undefined ? 
+                      (envMaxRetries.toLowerCase() === 'infinity' ? Infinity : parseInt(envMaxRetries, 10)) : 
+                      Infinity;
+    
+    this.retryDelay = parseInt(process.env.DIODE_RETRY_DELAY, 10) || 1000; // Default: 1 second
+    this.maxRetryDelay = parseInt(process.env.DIODE_MAX_RETRY_DELAY, 10) || 30000; // Default: 30 seconds
+    
+    // Parse boolean from string ('true'/'false')
+    const envAutoReconnect = process.env.DIODE_AUTO_RECONNECT;
+    this.autoReconnect = envAutoReconnect !== undefined ? 
+                        (envAutoReconnect.toLowerCase() === 'true') : 
+                        true;
+    
+    this.retryCount = 0;
+    this.retryTimeoutId = null;
+    
+    // Log the reconnection settings
+    logger.info(`Connection settings - Auto Reconnect: ${this.autoReconnect}, Max Retries: ${
+      this.maxRetries === Infinity ? 'Infinity' : this.maxRetries
+    }, Retry Delay: ${this.retryDelay}ms, Max Retry Delay: ${this.maxRetryDelay}ms`);
   }
 
   connect() {
+    // Clear any existing retry timeout
+    if (this.retryTimeoutId) {
+      clearTimeout(this.retryTimeoutId);
+      this.retryTimeoutId = null;
+    }
+
     return new Promise((resolve, reject) => {
       // Generate a temporary certificate valid for 1 month
       this.certPem = generateCert(this.keyPair.prvKeyObj, this.keyPair.pubKeyObj);
@@ -56,8 +87,10 @@ class DiodeConnection extends EventEmitter {
 
       this.socket = tls.connect(this.port, this.host, options, async () => {
         logger.info('Connected to Diode.io server');
+        // Reset retry counter on successful connection
+        this.retryCount = 0;
         // Set keep-alive to prevent connection timeout forever
-        this.socket.setKeepAlive(true, 0);
+        this.socket.setKeepAlive(true, 1500);
   
         // Send the ticketv2 command
         try {
@@ -79,12 +112,85 @@ class DiodeConnection extends EventEmitter {
           logger.error(`Error handling data: ${error}`);
         }
       });
+
       this.socket.on('error', (err) => {
         logger.error(`Connection error: ${err}`);
-        reject(err);
+          reject(err);
       });
-      this.socket.on('end', () => logger.info('Disconnected from server'));
+
+      this.socket.on('end', () => {
+        logger.info('Disconnected from server');
+        this._handleDisconnect();
+      });
+
+      this.socket.on('close', (hadError) => {
+        logger.info(`Connection closed${hadError ? ' due to error' : ''}`);
+        this._handleDisconnect();
+      });
+
+      this.socket.on('timeout', () => {
+        logger.warn('Connection timeout');
+        this._handleDisconnect();
+      });
     });
+  }
+
+  // New method to handle reconnection with exponential backoff
+  _reconnect() {
+    if (!this.autoReconnect || this.isReconnecting) return;
+    
+    this.retryCount++;
+    
+    if (this.maxRetries !== Infinity && this.retryCount > this.maxRetries) {
+      logger.error(`Maximum reconnection attempts (${this.maxRetries}) reached. Giving up.`);
+      this.emit('reconnect_failed');
+      return;
+    }
+    
+    // Calculate delay with exponential backoff
+    const delay = Math.min(this.retryDelay * Math.pow(1.5, this.retryCount - 1), this.maxRetryDelay);
+    
+    logger.info(`Reconnecting in ${delay}ms... (Attempt ${this.retryCount})`);
+    this.emit('reconnecting', { attempt: this.retryCount, delay });
+    
+    this.retryTimeoutId = setTimeout(() => {
+      this.isReconnecting = true;
+      
+      // Clear existing socket if any
+      if (this.socket) {
+        this.socket.removeAllListeners();
+        if (!this.socket.destroyed) {
+          this.socket.destroy();
+        }
+        this.socket = null;
+      }
+      
+      // Connect again
+      this.connect()
+        .then(() => {
+          this.isReconnecting = false;
+          this.emit('reconnected');
+          logger.info('Successfully reconnected to Diode.io server');
+        })
+        .catch((err) => {
+          this.isReconnecting = false;
+          logger.error(`Reconnection attempt failed: ${err}`);
+        });
+    }, delay);
+  }
+
+  // Helper method to handle disconnection events
+  _handleDisconnect() {
+    // Reset socket to null to ensure we don't try to use it
+    if (this.socket && !this.socket.destroyed) {
+      this.socket.destroy();
+    }
+    this.socket = null;
+    
+    // Don't try to reconnect if we're intentionally closing
+    if (this.autoReconnect && !this.isReconnecting) {
+      this._reconnect();
+    }
   }
 
   _ensureConnected() {
@@ -94,18 +200,56 @@ class DiodeConnection extends EventEmitter {
     if (this.connectPromise) {
       return this.connectPromise;
     }
-    this.isReconnecting = true;
-    this.connectPromise = this.connect()
-      .then(() => {
-        this.isReconnecting = false;
-        this.connectPromise = null;
-      })
-      .catch((err) => {
-        this.isReconnecting = false;
-        this.connectPromise = null;
-        throw err;
-      });
+    
+    this.connectPromise = new Promise((resolve, reject) => {
+
+      if (this.isReconnecting) {
+        // If we're already reconnecting, wait for the reconnection to complete
+        this.once('reconnected', resolve);
+        //wait for max retry delay
+        setTimeout(() => {
+          reject(new Error('Reconnection timed out'));
+        }, this.maxRetryDelay);
+      } else {
+        this._reconnect();
+        this.once('reconnected', resolve);
+        //wait for max retry delay
+        setTimeout(() => {
+          reject(new Error('Reconnection timed out'));
+        }, this.maxRetryDelay);
+      }
+    });
+    
     return this.connectPromise;
+  }
+
+  // Method to set reconnection options
+  setReconnectOptions(options = {}) {
+    if (typeof options.maxRetries === 'number') {
+      this.maxRetries = options.maxRetries;
+    }
+    if (typeof options.retryDelay === 'number') {
+      this.retryDelay = options.retryDelay;
+    }
+    if (typeof options.maxRetryDelay === 'number') {
+      this.maxRetryDelay = options.maxRetryDelay;
+    }
+    if (typeof options.autoReconnect === 'boolean') {
+      this.autoReconnect = options.autoReconnect;
+    }
+    return this;
+  }
+
+  // Update close method to prevent reconnection when intentionally closing
+  close() {
+    this.autoReconnect = false;
+    if (this.retryTimeoutId) {
+      clearTimeout(this.retryTimeoutId);
+      this.retryTimeoutId = null;
+    }
+    if (this.socket) {
+      this.socket.end();
+    }
   }
 
   _handleData(data) {
@@ -426,10 +570,6 @@ class DiodeConnection extends EventEmitter {
     // Increment the request ID counter, wrap around if necessary
     this.requestId = (this.requestId + 1) % Number.MAX_SAFE_INTEGER;
     return this.requestId;
-  }
-
-  close() {
-    this.socket.end();
   }
 
   // Client sockets management methods (for BindPort)
