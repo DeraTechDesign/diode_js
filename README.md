@@ -117,15 +117,23 @@ async function main() {
   
     // Multiple or single port binding with configuration object
     const portsConfig = {
-      3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" },
-      3003: { targetPort: 443, deviceIdHex: "0x5365baf29cb7ab58de588dfc448913cb609283e2" } // Works with or without 0x prefix
+      3002: { 
+        targetPort: 80, 
+        deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2",
+        protocol: "tls" // Optional - defaults to TLS if not specified
+      },
+      3003: { 
+        targetPort: 443, 
+        deviceIdHex: "0x5365baf29cb7ab58de588dfc448913cb609283e2",
+        protocol: "tcp" // Can be "tls", "tcp", or "udp"
+      }
     };
     
     const portForward = new BindPort(connection, portsConfig);
     portForward.bind();
     
-    // You can also dynamically add and remove ports
-    portForward.addPort(3004, 8080, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    // You can also dynamically add ports with protocol specification
+    portForward.addPort(3004, 8080, "5365baf29cb7ab58de588dfc448913cb609283e2", "udp");
     portForward.removePort(3003);
 }
 
@@ -144,7 +152,7 @@ async function main() {
     const connection = new DiodeConnection(host, port, keyLocation);
     await connection.connect();
   
-    // Legacy method - single port binding
+    // Legacy method - single port binding (defaults to TLS protocol)
     const portForward = new BindPort(connection, 3002, 80, "5365baf29cb7ab58de588dfc448913cb609283e2");
     portForward.bind();
 }
@@ -249,13 +257,15 @@ main();
   New Constructor:
   - `new BindPort(connection, portsConfig)`
     - `connection` (DiodeConnection): An instance of `DiodeConnection`.
-    - `portsConfig` (object): A configuration object where keys are local ports and values are objects with `targetPort` and `deviceIdHex`.
-      Example: `{ 3002: { targetPort: 80, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2" } }`
-      Note: deviceIdHex can be provided with or without the '0x' prefix.
+    - `portsConfig` (object): A configuration object where keys are local ports and values are objects with:
+      - `targetPort` (number): The target port on the device.
+      - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
+      - `protocol` (string, optional): The protocol to use ("tls", "tcp", or "udp"). Defaults to "tls".
 
 - **Methods**:
   - `bind()`: Binds all configured local ports to their target ports on the devices.
-  - `addPort(localPort, targetPort, deviceIdHex)`: Adds a new port binding configuration. deviceIdHex can include '0x' prefix.
+  - `addPort(localPort, targetPort, deviceIdHex, protocol)`: Adds a new port binding configuration.
+    - `protocol` (string, optional): The protocol to use. Can be "tls", "tcp", or "udp". Defaults to "tls".
   - `removePort(localPort)`: Removes a port binding configuration.
   - `bindSinglePort(localPort)`: Binds a single local port to its target.
   - `closeAllServers()`: Closes all active server instances.

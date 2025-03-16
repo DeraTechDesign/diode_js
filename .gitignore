@@ -145,4 +145,4 @@ howToUseDiode.md
 .vscode/launch.json
 device_certificate.json
 temp_cert.pem
-db/keys.json
+db
