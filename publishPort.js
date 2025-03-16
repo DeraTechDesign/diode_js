@@ -254,7 +254,7 @@ class PublishPort extends EventEmitter {
     // Create a DiodeSocket instance
     const diodeSocket = new DiodeSocket(ref, this.rpc);
 
-    certPem = this.connection.getDeviceCertificate();
+    let certPem = this.connection.getDeviceCertificate();
 
     // TLS options with your server's certificate and key
     const tlsOptions = {
