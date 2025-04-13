@@ -114,7 +114,7 @@ class DiodeConnection extends EventEmitter {
       });
 
       this.socket.on('data', (data) => {
-        logger.debug(`Received data: ${data.toString('hex')}`);
+        // logger.debug(`Received data: ${data.toString('hex')}`);
         try {
           this._handleData(data);
         } catch (error) {
@@ -274,7 +274,7 @@ class DiodeConnection extends EventEmitter {
   _handleData(data) {
     // Append new data to the receive buffer
     this.receiveBuffer = Buffer.concat([this.receiveBuffer, data]);
-    logger.debug(`Received data: ${data.toString('hex')}`);
+    // logger.debug(`Received data: ${data.toString('hex')}`);
   
     let offset = 0;
     while (offset + 2 <= this.receiveBuffer.length) {
@@ -292,7 +292,7 @@ class DiodeConnection extends EventEmitter {
   
       try {
         const decodedMessage = RLP.decode(Uint8Array.from(messageBuffer));
-        logger.debug(`Decoded message: ${makeReadable(decodedMessage)}`);
+        // logger.debug(`Decoded message: ${makeReadable(decodedMessage)}`);
     
         if (Array.isArray(decodedMessage) && decodedMessage.length > 1) {
           const requestIdRaw = decodedMessage[0];
@@ -349,7 +349,7 @@ class DiodeConnection extends EventEmitter {
             this.pendingRequests.delete(requestId);
           } else {
             // This is an unsolicited message
-            logger.debug(`Received unsolicited message: ${makeReadable(decodedMessage)}`);
+            logger.debug(`Received unsolicited message`);
             this.emit('unsolicited', decodedMessage);
           }
         } else {
@@ -406,7 +406,7 @@ class DiodeConnection extends EventEmitter {
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
         logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
-        logger.debug(`Command buffer: ${message.toString('hex')}`);
+        // logger.debug(`Command buffer: ${message.toString('hex')}`);
   
         this.socket.write(message);
       }).catch(reject);
@@ -433,7 +433,7 @@ class DiodeConnection extends EventEmitter {
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
         logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
-        logger.debug(`Command buffer: ${message.toString('hex')}`);
+        // logger.debug(`Command buffer: ${message.toString('hex')}`);
   
         this.socket.write(message);
       }).catch(reject);
@@ -644,21 +644,22 @@ class DiodeConnection extends EventEmitter {
     const timeSinceLastUpdate = Date.now() - this.lastTicketUpdate;
     
     if (force || 
-        this.accumulatedBytes >= this.ticketUpdateThreshold || 
-        timeSinceLastUpdate >= this.ticketUpdateInterval) {
+      (this.accumulatedBytes > 0 && 
+      (this.accumulatedBytes >= this.ticketUpdateThreshold || 
+      timeSinceLastUpdate >= this.ticketUpdateInterval))) {
       
       try {
-        if (this.accumulatedBytes > 0 || force) {
-          logger.debug(`Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
-          const ticketCommand = await this.createTicketCommand();
-          await this.sendCommand(ticketCommand);
-          
-          // Reset counters
-          this.accumulatedBytes = 0;
-          this.lastTicketUpdate = Date.now();
-        }
+      if (this.accumulatedBytes > 0 || force) {
+        logger.debug(`Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
+        const ticketCommand = await this.createTicketCommand();
+        await this.sendCommand(ticketCommand);
+        
+        // Reset counters
+        this.accumulatedBytes = 0;
+        this.lastTicketUpdate = Date.now();
+      }
       } catch (error) {
-        logger.error(`Error updating ticket: ${error}`);
+      logger.error(`Error updating ticket: ${error}`);
       }
     }
     

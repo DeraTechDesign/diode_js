@@ -102,24 +102,51 @@ class DiodeRPC {
         const bytesToSend = data.length;
         this.connection.addBytes(bytesToSend);
     
-        // Now send the data
-        return this.connection.sendCommand(['portsend', ref, data]).then(async (responseData) => {
-          // responseData is [status]
-          const [statusRaw] = responseData;
-          const status = parseResponseType(statusRaw);
-      
-          if (status === 'ok') {
-            // No ticket update here anymore - handled by batching mechanism
-            return;
-          } else if (status === 'error') {
-            throw new Error('Error during port send');
+        // Maximum size that can be sent in a single message (less than 65535 to be safe)
+        const MAX_CHUNK_SIZE = 65000;
+        
+        try {
+          // If data is too large, split it into chunks
+          if (data.length > MAX_CHUNK_SIZE) {
+            logger.debug(`Chunking large data of ${data.length} bytes into pieces of max ${MAX_CHUNK_SIZE} bytes`);
+            let offset = 0;
+            
+            while (offset < data.length) {
+              const chunkSize = Math.min(MAX_CHUNK_SIZE, data.length - offset);
+              const chunk = data.slice(offset, offset + chunkSize);
+              
+              // Send this chunk
+              const responseData = await this.connection.sendCommand(['portsend', ref, chunk]);
+              const [statusRaw] = responseData;
+              const status = parseResponseType(statusRaw);
+              
+              if (status !== 'ok') {
+                throw new Error(`Error during chunked port send: ${status}`);
+              }
+              
+              offset += chunkSize;
+            }
+            
+            return; // All chunks sent successfully
           } else {
-            throw new Error(`Unknown status in response: '${status}'`);
+            // Small enough to send in one piece
+            return this.connection.sendCommand(['portsend', ref, data]).then((responseData) => {
+              const [statusRaw] = responseData;
+              const status = parseResponseType(statusRaw);
+          
+              if (status === 'ok') {
+                return;
+              } else if (status === 'error') {
+                throw new Error('Error during port send');
+              } else {
+                throw new Error(`Unknown status in response: '${status}'`);
+              }
+            });
           }
-        }).catch((error) => {
+        } catch (error) {
           logger.error(`Error during port send: ${error}`);
-          return;
-        });
+          throw error; // Rethrow to allow proper error handling upstream
+        }
       }
     
       portClose(ref) {

@@ -52,10 +52,6 @@ function parseRequestId(requestIdRaw) {
 }
 
 function parseResponseType(responseTypeRaw) {
-  logger.debug(`responseTypeRaw: ${responseTypeRaw}`);
-  logger.debug(`Type of responseTypeRaw: ${typeof responseTypeRaw}`);
-  logger.debug(`Instance of responseTypeRaw: ${responseTypeRaw instanceof Uint8Array}`);
-  logger.debug(`Is Array: ${Array.isArray(responseTypeRaw)}`);
   if (responseTypeRaw instanceof Uint8Array || Buffer.isBuffer(responseTypeRaw)) {
     return Buffer.from(responseTypeRaw).toString('utf8');
   } else if (Array.isArray(responseTypeRaw)) {
