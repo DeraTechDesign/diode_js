@@ -25,6 +25,8 @@ Connection retry behavior can be configured via environment variables:
 | DIODE_RETRY_DELAY | Initial delay between retries (ms) | 1000 |
 | DIODE_MAX_RETRY_DELAY | Maximum delay between retries (ms) | 30000 |
 | DIODE_AUTO_RECONNECT | Whether to automatically reconnect | true |
+| DIODE_TICKET_BYTES_THRESHOLD | Bytes threshold for ticket updates | 512000 (512KB) |
+| DIODE_TICKET_UPDATE_INTERVAL | Time interval for ticket updates (ms) | 30000 (30s) |
 
 Example `.env` file:
 ```
@@ -32,6 +34,8 @@ DIODE_MAX_RETRIES=10
 DIODE_RETRY_DELAY=2000
 DIODE_MAX_RETRY_DELAY=20000
 DIODE_AUTO_RECONNECT=true
+DIODE_TICKET_BYTES_THRESHOLD=512000
+DIODE_TICKET_UPDATE_INTERVAL=30000
 ```
 
 These settings can also be configured programmatically:
@@ -40,7 +44,9 @@ connection.setReconnectOptions({
   maxRetries: 10,
   retryDelay: 2000,
   maxRetryDelay: 20000,
-  autoReconnect: true
+  autoReconnect: true,
+  ticketBytesThreshold: 512000,
+  ticketUpdateInterval: 30000
 });
 ```
 
@@ -63,7 +69,9 @@ async function main() {
     maxRetries: Infinity, // Unlimited reconnection attempts
     retryDelay: 1000,     // Initial delay of 1 second
     maxRetryDelay: 30000, // Maximum delay of 30 seconds
-    autoReconnect: true   // Automatically reconnect on disconnection
+    autoReconnect: true,  // Automatically reconnect on disconnection
+    ticketBytesThreshold: 512000, // Bytes threshold for ticket updates
+    ticketUpdateInterval: 30000   // Time interval for ticket updates
   });
   
   // Listen for reconnection events (optional)
@@ -219,6 +227,8 @@ main();
     - `retryDelay` (number): Initial delay between retries in ms (default: 1000)
     - `maxRetryDelay` (number): Maximum delay between retries in ms (default: 30000)
     - `autoReconnect` (boolean): Whether to automatically reconnect on disconnection (default: true)
+    - `ticketBytesThreshold` (number): Bytes threshold for ticket updates (default: 512000)
+    - `ticketUpdateInterval` (number): Time interval for ticket updates in ms (default: 30000)
 
 - **Events**:
   - `reconnecting`: Emitted when a reconnection attempt is about to start, with `attempt` and `delay` information

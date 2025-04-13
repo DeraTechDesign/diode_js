@@ -62,6 +62,16 @@ class DiodeConnection extends EventEmitter {
     logger.info(`Connection settings - Auto Reconnect: ${this.autoReconnect}, Max Retries: ${
       this.maxRetries === Infinity ? 'Infinity' : this.maxRetries
     }, Retry Delay: ${this.retryDelay}ms, Max Retry Delay: ${this.maxRetryDelay}ms`);
+
+    // Add ticket batching configuration
+    this.lastTicketUpdate = Date.now();
+    this.accumulatedBytes = 0;
+    this.ticketUpdateThreshold = parseInt(process.env.DIODE_TICKET_BYTES_THRESHOLD, 10) || 512000; // 512KB default
+    this.ticketUpdateInterval = parseInt(process.env.DIODE_TICKET_UPDATE_INTERVAL, 10) || 30000; // 30 seconds default
+    this.ticketUpdateTimer = null;
+    
+    // Log the ticket batching settings
+    logger.info(`Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
   }
 
   connect() {
@@ -96,7 +106,6 @@ class DiodeConnection extends EventEmitter {
         try {
           const ticketCommand = await this.createTicketCommand();
           const response = await this.sendCommand(ticketCommand).catch(reject);
-          logger.info(`Ticket accepted: ${makeReadable(response)}`);
           resolve();
         } catch (error) {
           logger.error(`Error sending ticket: ${error}`);
@@ -111,6 +120,11 @@ class DiodeConnection extends EventEmitter {
         } catch (error) {
           logger.error(`Error handling data: ${error}`);
         }
+      });
+
+      // Start the periodic ticket update timer after successful connection
+      this.socket.on('connect', () => {
+        this._startTicketUpdateTimer();
       });
 
       this.socket.on('error', (err) => {
@@ -242,6 +256,11 @@ class DiodeConnection extends EventEmitter {
 
   // Update close method to prevent reconnection when intentionally closing
   close() {
+    if (this.ticketUpdateTimer) {
+      clearTimeout(this.ticketUpdateTimer);
+      this.ticketUpdateTimer = null;
+    }
+    
     this.autoReconnect = false;
     if (this.retryTimeoutId) {
       clearTimeout(this.retryTimeoutId);
@@ -431,7 +450,6 @@ class DiodeConnection extends EventEmitter {
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
 
-      logger.info(`Ethereum address: ${address}`);
       return address;
     } catch (error) {
       logger.error(`Error extracting Ethereum address: ${error}`);
@@ -455,7 +473,6 @@ class DiodeConnection extends EventEmitter {
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
 
-      logger.info(`Server Ethereum address: ${address}`);
       return address;
     } catch (error) {
       logger.error(`Error extracting server Ethereum address: ${error}`);
@@ -604,6 +621,79 @@ class DiodeConnection extends EventEmitter {
 
   hasConnection(ref) {
     return this.connections.has(ref.toString('hex'));
+  }
+
+  // Start timer for periodic ticket updates
+  _startTicketUpdateTimer() {
+    if (this.ticketUpdateTimer) {
+      clearTimeout(this.ticketUpdateTimer);
+    }
+    
+    this.ticketUpdateTimer = setTimeout(() => {
+      this._updateTicketIfNeeded(true);
+    }, this.ticketUpdateInterval);
+  }
+
+  // Method to check if ticket update is needed and perform it
+  async _updateTicketIfNeeded(force = false) {
+    // If socket is not connected, don't try to update
+    if (!this.socket || this.socket.destroyed) {
+      return;
+    }
+    
+    const timeSinceLastUpdate = Date.now() - this.lastTicketUpdate;
+    
+    if (force || 
+        this.accumulatedBytes >= this.ticketUpdateThreshold || 
+        timeSinceLastUpdate >= this.ticketUpdateInterval) {
+      
+      try {
+        if (this.accumulatedBytes > 0 || force) {
+          logger.debug(`Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
+          const ticketCommand = await this.createTicketCommand();
+          await this.sendCommand(ticketCommand);
+          
+          // Reset counters
+          this.accumulatedBytes = 0;
+          this.lastTicketUpdate = Date.now();
+        }
+      } catch (error) {
+        logger.error(`Error updating ticket: ${error}`);
+      }
+    }
+    
+    // Restart the timer
+    this._startTicketUpdateTimer();
+  }
+
+  // Add method to track bytes without immediate ticket update
+  addBytes(bytesCount) {
+    this.totalBytes += bytesCount;
+    this.accumulatedBytes += bytesCount;
+    
+    // Optionally check if we should update ticket now
+    if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
+      this._updateTicketIfNeeded();
+    }
+  }
+
+  // Method to set ticket batching options
+  setTicketBatchingOptions(options = {}) {
+    if (typeof options.threshold === 'number') {
+      this.ticketUpdateThreshold = options.threshold;
+    }
+    if (typeof options.interval === 'number') {
+      this.ticketUpdateInterval = options.interval;
+    }
+    
+    logger.info(`Updated ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
+    
+    // Reset the timer with new interval
+    if (this.socket && !this.socket.destroyed) {
+      this._startTicketUpdateTimer();
+    }
+    
+    return this;
   }
 }
 

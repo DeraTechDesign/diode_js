@@ -98,9 +98,9 @@ class DiodeRPC {
       }
     
       async portSend(ref, data) {
-        // Update totalBytes
+        // Update bytes count but don't update ticket yet
         const bytesToSend = data.length;
-        this.connection.totalBytes += bytesToSend;
+        this.connection.addBytes(bytesToSend);
     
         // Now send the data
         return this.connection.sendCommand(['portsend', ref, data]).then(async (responseData) => {
@@ -109,17 +109,7 @@ class DiodeRPC {
           const status = parseResponseType(statusRaw);
       
           if (status === 'ok') {
-            try {
-              const ticketCommand = await this.connection.createTicketCommand();
-              const ticketResponse = await this.connection.sendCommand(ticketCommand).catch((error) => {
-                logger.error(`Error during ticket command: ${error}`);
-                throw error;
-              });
-              logger.debug(`Ticket updated: ${makeReadable(ticketResponse)}`);
-            } catch (error) {
-              logger.error(`Error updating ticket: ${error}`);
-              throw error;
-            }
+            // No ticket update here anymore - handled by batching mechanism
             return;
           } else if (status === 'error') {
             throw new Error('Error during port send');
@@ -192,17 +182,40 @@ class DiodeRPC {
         return epoch;
       }
     
-      parseTimestamp(blockHeader) {
-        // Implement parsing of timestamp from blockHeader
-        const timestampRaw = blockHeader[0][1]; // Adjust index based on actual structure
-        //Timestamp Raw: [ 'timestamp', 1726689425 ]
-        if (timestampRaw instanceof Uint8Array || Buffer.isBuffer(timestampRaw)) {
-          return Buffer.from(timestampRaw).readUIntBE(0, timestampRaw.length);
-        } else if (typeof timestampRaw === 'number') {
-          return timestampRaw;
-        } else {
-          throw new Error('Invalid timestamp format in block header');
+      parseTimestamp(blockHeader) {        
+        // Search for the timestamp field by name
+        if (Array.isArray(blockHeader)) {
+          for (const field of blockHeader) {
+            if (Array.isArray(field) && field.length >= 2 && field[0] === 'timestamp') {
+              const timestampValue = field[1];
+              
+              // Handle different timestamp value types
+              if (typeof timestampValue === 'number') {
+                return timestampValue;
+              } else if (typeof timestampValue === 'string' && timestampValue.startsWith('0x')) {
+                // Handle hex string
+                return parseInt(timestampValue.slice(2), 16);
+              } else if (typeof timestampValue === 'string') {
+                // Handle decimal string
+                return parseInt(timestampValue, 10);
+              } else if (timestampValue instanceof Uint8Array || Buffer.isBuffer(timestampValue)) {
+                // Handle buffer - carefully determine the byte length
+                const buf = Buffer.from(timestampValue);
+                // Use a safe approach to read the value based on buffer length
+                if (buf.length <= 6) {
+                  return buf.readUIntBE(0, buf.length);
+                } else {
+                  // For larger buffers, convert to hex string first
+                  return parseInt(buf.toString('hex'), 16);
+                }
+              }
+            }
+          }
         }
+        
+        // Fallback: if we couldn't find the timestamp or parse it correctly
+        logger.warn('Could not find or parse timestamp in block header, using current time');
+        return Math.floor(Date.now() / 1000);
       }
   }
   
