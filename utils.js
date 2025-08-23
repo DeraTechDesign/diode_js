@@ -128,7 +128,7 @@ function loadOrGenerateKeyPair(keyLocation) {
     
     // Try to load existing keys
     if (fs.existsSync(keyLocation)) {
-      logger.info(`Loading keys from ${keyLocation}`);
+      logger.info(() => `Loading keys from ${keyLocation}`);
       const keyData = JSON.parse(fs.readFileSync(keyLocation, 'utf8'));
       
       // Convert the stored JSON back to keypair objects
@@ -138,7 +138,7 @@ function loadOrGenerateKeyPair(keyLocation) {
       return { prvKeyObj, pubKeyObj };
     } else {
       // Generate new keypair
-      logger.info(`Generating new key pair at ${keyLocation}`);
+      logger.info(() => `Generating new key pair at ${keyLocation}`);
       const kp = KEYUTIL.generateKeypair("EC", "secp256k1");
       
       // Store the keys in a serializable format
@@ -154,7 +154,7 @@ function loadOrGenerateKeyPair(keyLocation) {
       return kp;
     }
   } catch (error) {
-    logger.error(`Error loading or generating key pair: ${error}`);
+    logger.error(() => `Error loading or generating key pair: ${error}`);
     throw error;
   }
 }

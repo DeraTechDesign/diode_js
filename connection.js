@@ -59,7 +59,7 @@ class DiodeConnection extends EventEmitter {
     this.retryTimeoutId = null;
     
     // Log the reconnection settings
-    logger.info(`Connection settings - Auto Reconnect: ${this.autoReconnect}, Max Retries: ${
+    logger.info(() => `Connection settings - Auto Reconnect: ${this.autoReconnect}, Max Retries: ${
       this.maxRetries === Infinity ? 'Infinity' : this.maxRetries
     }, Retry Delay: ${this.retryDelay}ms, Max Retry Delay: ${this.maxRetryDelay}ms`);
 
@@ -71,7 +71,7 @@ class DiodeConnection extends EventEmitter {
     this.ticketUpdateTimer = null;
     
     // Log the ticket batching settings
-    logger.info(`Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
+    logger.info(() => `Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
   }
 
   connect() {
@@ -96,29 +96,29 @@ class DiodeConnection extends EventEmitter {
       };
 
       this.socket = tls.connect(this.port, this.host, options, async () => {
-        logger.info('Connected to Diode.io server');
+        logger.info(() => 'Connected to Diode.io server');
         // Reset retry counter on successful connection
         this.retryCount = 0;
         // Set keep-alive to prevent connection timeout forever
         this.socket.setKeepAlive(true, 1500);
-  
+        this.socket.setNoDelay(true);
         // Send the ticketv2 command
         try {
           const ticketCommand = await this.createTicketCommand();
           const response = await this.sendCommand(ticketCommand).catch(reject);
           resolve();
         } catch (error) {
-          logger.error(`Error sending ticket: ${error}`);
+          logger.error(() => `Error sending ticket: ${error}`);
           reject(error);
         }
       });
 
       this.socket.on('data', (data) => {
-        // logger.debug(`Received data: ${data.toString('hex')}`);
+        // logger.debug(() => `Received data: ${data.toString('hex')}`);
         try {
           this._handleData(data);
         } catch (error) {
-          logger.error(`Error handling data: ${error}`);
+          logger.error(() => `Error handling data: ${error}`);
         }
       });
 
@@ -128,22 +128,22 @@ class DiodeConnection extends EventEmitter {
       });
 
       this.socket.on('error', (err) => {
-        logger.error(`Connection error: ${err}`);
+        logger.error(() => `Connection error: ${err}`);
           reject(err);
       });
 
       this.socket.on('end', () => {
-        logger.info('Disconnected from server');
+        logger.info(() => 'Disconnected from server');
         this._handleDisconnect();
       });
 
       this.socket.on('close', (hadError) => {
-        logger.info(`Connection closed${hadError ? ' due to error' : ''}`);
+        logger.info(() => `Connection closed${hadError ? ' due to error' : ''}`);
         this._handleDisconnect();
       });
 
       this.socket.on('timeout', () => {
-        logger.warn('Connection timeout');
+        logger.warn(() => 'Connection timeout');
         this._handleDisconnect();
       });
     });
@@ -156,7 +156,7 @@ class DiodeConnection extends EventEmitter {
     this.retryCount++;
     
     if (this.maxRetries !== Infinity && this.retryCount > this.maxRetries) {
-      logger.error(`Maximum reconnection attempts (${this.maxRetries}) reached. Giving up.`);
+      logger.error(() => `Maximum reconnection attempts (${this.maxRetries}) reached. Giving up.`);
       this.emit('reconnect_failed');
       return;
     }
@@ -164,7 +164,7 @@ class DiodeConnection extends EventEmitter {
     // Calculate delay with exponential backoff
     const delay = Math.min(this.retryDelay * Math.pow(1.5, this.retryCount - 1), this.maxRetryDelay);
     
-    logger.info(`Reconnecting in ${delay}ms... (Attempt ${this.retryCount})`);
+    logger.info(() => `Reconnecting in ${delay}ms... (Attempt ${this.retryCount})`);
     this.emit('reconnecting', { attempt: this.retryCount, delay });
     
     this.retryTimeoutId = setTimeout(() => {
@@ -184,11 +184,11 @@ class DiodeConnection extends EventEmitter {
         .then(() => {
           this.isReconnecting = false;
           this.emit('reconnected');
-          logger.info('Successfully reconnected to Diode.io server');
+          logger.info(() => 'Successfully reconnected to Diode.io server');
         })
         .catch((err) => {
           this.isReconnecting = false;
-          logger.error(`Reconnection attempt failed: ${err}`);
+          logger.error(() => `Reconnection attempt failed: ${err}`);
         });
     }, delay);
   }
@@ -274,7 +274,7 @@ class DiodeConnection extends EventEmitter {
   _handleData(data) {
     // Append new data to the receive buffer
     this.receiveBuffer = Buffer.concat([this.receiveBuffer, data]);
-    // logger.debug(`Received data: ${data.toString('hex')}`);
+    // logger.debug(() => `Received data: ${data.toString('hex')}`);
   
     let offset = 0;
     while (offset + 2 <= this.receiveBuffer.length) {
@@ -292,7 +292,7 @@ class DiodeConnection extends EventEmitter {
   
       try {
         const decodedMessage = RLP.decode(Uint8Array.from(messageBuffer));
-        // logger.debug(`Decoded message: ${makeReadable(decodedMessage)}`);
+        // logger.debug(() => `Decoded message: ${makeReadable(decodedMessage)}`);
     
         if (Array.isArray(decodedMessage) && decodedMessage.length > 1) {
           const requestIdRaw = decodedMessage[0];
@@ -302,8 +302,8 @@ class DiodeConnection extends EventEmitter {
           const requestId = parseRequestId(requestIdRaw);
     
           // Debug statements
-          logger.debug(`requestIdRaw: ${requestIdRaw}`);
-          logger.debug(`Parsed requestId: ${requestId}`);
+          logger.debug(() => `requestIdRaw: ${requestIdRaw}`);
+          logger.debug(() => `Parsed requestId: ${requestId}`);
     
           if (requestId !== null && this.pendingRequests.has(requestId)) {
             // This is a response to a pending request
@@ -311,14 +311,14 @@ class DiodeConnection extends EventEmitter {
             const responseRaw = responseData[0];
     
             // Debug statements
-            logger.debug(`responseTypeRaw: ${responseTypeRaw}`);
-            logger.debug(`Type of responseTypeRaw: ${typeof responseTypeRaw}`);
+            logger.debug(() => `responseTypeRaw: ${responseTypeRaw}`);
+            logger.debug(() => `Type of responseTypeRaw: ${typeof responseTypeRaw}`);
     
             // Parse responseType
             const responseType = parseResponseType(responseTypeRaw);
     
-            logger.debug(`Received response for requestId: ${requestId}`);
-            logger.debug(`Response Type: '${responseType}'`);
+            logger.debug(() => `Received response for requestId: ${requestId}`);
+            logger.debug(() => `Response Type: '${responseType}'`);
     
             const { resolve, reject } = this.pendingRequests.get(requestId);
             try{
@@ -344,20 +344,20 @@ class DiodeConnection extends EventEmitter {
                 resolve(responseData);
               }
             } catch (error) {
-              logger.error(`Error handling response: ${error}`);
+              logger.error(() => `Error handling response: ${error}`);
             }
             this.pendingRequests.delete(requestId);
           } else {
             // This is an unsolicited message
-            logger.debug(`Received unsolicited message`);
+            logger.debug(() => `Received unsolicited message`);
             this.emit('unsolicited', decodedMessage);
           }
         } else {
           // Invalid message format
-          logger.error(`Invalid message format: ${makeReadable(decodedMessage)}`);
+          logger.error(() => `Invalid message format: ${makeReadable(decodedMessage)}`);
         }
       } catch (error) {
-        logger.error(`Error decoding message: ${error}`);
+        logger.error(() => `Error decoding message: ${error}`);
       }
     }
     
@@ -405,8 +405,8 @@ class DiodeConnection extends EventEmitter {
   
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
-        logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
-        // logger.debug(`Command buffer: ${message.toString('hex')}`);
+        logger.debug(() => `Sending command with requestId ${requestId}: ${commandArray}`);
+        // logger.debug(() => `Command buffer: ${message.toString('hex')}`);
   
         this.socket.write(message);
       }).catch(reject);
@@ -432,10 +432,11 @@ class DiodeConnection extends EventEmitter {
   
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
-        logger.debug(`Sending command with requestId ${requestId}: ${commandArray}`);
-        // logger.debug(`Command buffer: ${message.toString('hex')}`);
+        logger.debug(() => `Sending command with requestId ${requestId}: ${commandArray}`);
+        // logger.debug(() => `Command buffer: ${message.toString('hex')}`);
   
         this.socket.write(message);
+        resolve();
       }).catch(reject);
     });
   }
@@ -452,7 +453,7 @@ class DiodeConnection extends EventEmitter {
 
       return address;
     } catch (error) {
-      logger.error(`Error extracting Ethereum address: ${error}`);
+      logger.error(() => `Error extracting Ethereum address: ${error}`);
       throw error;
     }
   }
@@ -468,14 +469,14 @@ class DiodeConnection extends EventEmitter {
         ? serverCert.pubkey
         : Buffer.from(serverCert.pubkey);
 
-      logger.debug(`Public key Server: ${publicKeyBuffer.toString('hex')}`);
+      logger.debug(() => `Public key Server: ${publicKeyBuffer.toString('hex')}`);
 
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
 
       return address;
     } catch (error) {
-      logger.error(`Error extracting server Ethereum address: ${error}`);
+      logger.error(() => `Error extracting server Ethereum address: ${error}`);
       throw error;
     }
   }
@@ -488,7 +489,7 @@ class DiodeConnection extends EventEmitter {
       const privateKeyBytes = Buffer.from(privateKeyHex, 'hex');
       return privateKeyBytes;
     } catch (error) {
-      logger.error(`Error extracting private key: ${error}`);
+      logger.error(() => `Error extracting private key: ${error}`);
       throw error;
     }
   }
@@ -515,17 +516,17 @@ class DiodeConnection extends EventEmitter {
     // Convert each element in dataToSign to bytes32 and concatenate them
     const encodedData = Buffer.concat(dataToSign.map(item => abi.rawEncode(['bytes32'], [item])));
 
-    logger.debug(`Encoded data: ${encodedData.toString('hex')}`);
+    logger.debug(() => `Encoded data: ${encodedData.toString('hex')}`);
 
-    logger.debug(`Data to sign: ${makeReadable(dataToSign)}`);
+    logger.debug(() => `Data to sign: ${makeReadable(dataToSign)}`);
   
   
     // Sign the data
     const privateKey = this.getPrivateKey();
     const msgHash = ethUtil.keccak256(encodedData);
-    logger.debug(`Message hash: ${msgHash.toString('hex')}`);
+    logger.debug(() => `Message hash: ${msgHash.toString('hex')}`);
     const signature = secp256k1.ecdsaSign(msgHash, privateKey);
-    logger.debug(`Signature: ${signature.signature.toString('hex')}`);
+    logger.debug(() => `Signature: ${signature.signature.toString('hex')}`);
     
     const signatureBuffer = Buffer.concat([
       ethUtil.toBuffer([signature.recid]),
@@ -559,7 +560,7 @@ class DiodeConnection extends EventEmitter {
       localAddress,
       epoch
     );
-    logger.debug(`Signature hex: ${signature.toString('hex')}`);
+    logger.debug(() => `Signature hex: ${signature.toString('hex')}`);
 
   
     // Construct the ticket command
@@ -650,7 +651,7 @@ class DiodeConnection extends EventEmitter {
       
       try {
       if (this.accumulatedBytes > 0 || force) {
-        logger.debug(`Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
+        logger.debug(() => `Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
         const ticketCommand = await this.createTicketCommand();
         await this.sendCommand(ticketCommand);
         
@@ -659,7 +660,7 @@ class DiodeConnection extends EventEmitter {
         this.lastTicketUpdate = Date.now();
       }
       } catch (error) {
-      logger.error(`Error updating ticket: ${error}`);
+      logger.error(() => `Error updating ticket: ${error}`);
       }
     }
     
@@ -687,7 +688,7 @@ class DiodeConnection extends EventEmitter {
       this.ticketUpdateInterval = options.interval;
     }
     
-    logger.info(`Updated ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
+    logger.info(() => `Updated ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
     
     // Reset the timer with new interval
     if (this.socket && !this.socket.destroyed) {

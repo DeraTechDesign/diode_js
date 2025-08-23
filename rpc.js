@@ -25,10 +25,10 @@ class DiodeRPC {
           } else {
             throw new Error('Invalid block number format. response:', makeReadable(responseData));
           }
-          logger.debug(`Block number is: ${blockNumber}`);
+          logger.debug(() => `Block number is: ${blockNumber}`);
           return blockNumber;
         }).catch((error) => {
-          logger.error(`Error during get block peak: ${error}`);
+          logger.error(() => `Error during get block peak: ${error}`);
           return;
         });
       }
@@ -36,7 +36,7 @@ class DiodeRPC {
       return this.connection.sendCommand(['getblockheader', index]).then((responseData) => {
         return responseData[0]; // block_header
       }).catch((error) => {
-        logger.error(`Error during get block header: ${error}`);
+        logger.error(() => `Error during get block header: ${error}`);
         return;
       });
     }
@@ -45,7 +45,7 @@ class DiodeRPC {
       return this.connection.sendCommand(['getblock', index]).then((responseData) => {
         return responseData[0]; // block
       }).catch((error) => {
-        logger.error(`Error during get block: ${error}`);
+        logger.error(() => `Error during get block: ${error}`);
         return;
       });
     }
@@ -64,7 +64,7 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
         }
         }).catch((error) => {
-          logger.error(`Error during ping: ${error}`);
+          logger.error(() => `Error during ping: ${error}`);
           return false;
         })
     }
@@ -92,7 +92,7 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         }).catch((error) => {
-          logger.error(`Error during port open: ${error}`);
+          logger.error(() => `Error during port open: ${error}`);
           return;
         });
       }
@@ -108,7 +108,7 @@ class DiodeRPC {
         try {
           // If data is too large, split it into chunks
           if (data.length > MAX_CHUNK_SIZE) {
-            logger.debug(`Chunking large data of ${data.length} bytes into pieces of max ${MAX_CHUNK_SIZE} bytes`);
+            logger.debug(() => `Chunking large data of ${data.length} bytes into pieces of max ${MAX_CHUNK_SIZE} bytes`);
             let offset = 0;
             
             while (offset < data.length) {
@@ -144,7 +144,7 @@ class DiodeRPC {
             });
           }
         } catch (error) {
-          logger.error(`Error during port send: ${error}`);
+          logger.error(() => `Error during port send: ${error}`);
           throw error; // Rethrow to allow proper error handling upstream
         }
       }
@@ -165,21 +165,21 @@ class DiodeRPC {
             throw new Error(`Unknown status in response: '${status}'`);
           }
         }).catch((error) => {
-          logger.error(`Error during port close: ${error}`);
+          logger.error(() => `Error during port close: ${error}`);
           return;
         });
       }
 
       sendError(sessionId, ref, error) {
         return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId).catch((error) => {
-          logger.error(`Error during send error: ${error}`);
+          logger.error(() => `Error during send error: ${error}`);
           return;
         });
       }
 
       sendResponse(sessionId, ref, response) {
         return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId).catch((error) => {
-          logger.error(`Error during send response: ${error}`);
+          logger.error(() => `Error during send response: ${error}`);
           return;
         });
       }
@@ -187,10 +187,10 @@ class DiodeRPC {
       async getEpoch() {
         const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
         if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
-          logger.debug(`Using cached epoch: ${this.epochCache.epoch}`);
+          logger.debug(() => `Using cached epoch: ${this.epochCache.epoch}`);
           return this.epochCache.epoch;
         }
-        logger.debug(`Fetching new epoch. Expiry: ${this.epochCache.expiry}, Current time: ${currentTime}`);
+        logger.debug(() => `Fetching new epoch. Expiry: ${this.epochCache.expiry}, Current time: ${currentTime}`);
         const blockPeak = await this.getBlockPeak();
         const blockHeader = await this.getBlockHeader(blockPeak);
     
@@ -241,7 +241,7 @@ class DiodeRPC {
         }
         
         // Fallback: if we couldn't find the timestamp or parse it correctly
-        logger.warn('Could not find or parse timestamp in block header, using current time');
+        logger.warn(() => 'Could not find or parse timestamp in block header, using current time');
         return Math.floor(Date.now() / 1000);
       }
   }

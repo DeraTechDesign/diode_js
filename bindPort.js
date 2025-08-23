@@ -9,7 +9,7 @@ const logger = require('./logger');
 // Custom Duplex stream to handle the Diode connection
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
-    super();
+    super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
     this.ref = ref;
     this.rpc = rpc;
     this.destroyed = false;
@@ -114,9 +114,9 @@ class BindPort {
         } else {
           const connectionInfo = this.connection.getConnection(dataRef);
           if (connectionInfo) {
-            logger.debug(`No client socket found for ref: ${dataRef.toString('hex')}, but connection exists for ${connectionInfo.host}:${connectionInfo.port}`);
+            logger.debug(() => `No client socket found for ref: ${dataRef.toString('hex')}, but connection exists for ${connectionInfo.host}:${connectionInfo.port}`);
           } else {
-            logger.warn(`No client socket found for ref: ${dataRef.toString('hex')}`);
+            logger.warn(() => `No client socket found for ref: ${dataRef.toString('hex')}`);
           }
         }
       } else if (messageType === 'portclose') {
@@ -131,31 +131,31 @@ class BindPort {
           }
           clientSocket.end();
           this.connection.deleteClientSocket(dataRef);
-          logger.info(`Port closed for ref: ${dataRef.toString('hex')}`);
+          logger.info(() => `Port closed for ref: ${dataRef.toString('hex')}`);
         }
       } else {
         if (messageType != 'portopen') {
-          logger.warn(`Unknown unsolicited message type: ${messageType}`);
+          logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
       }
     });
     
     // Handle device disconnect
     this.connection.on('end', () => {
-      logger.info('Disconnected from Diode.io server');
+      logger.info(() => 'Disconnected from Diode.io server');
       this.closeAllServers();
     });
 
     // Handle connection errors
     this.connection.on('error', (err) => {
-      logger.error(`Connection error: ${err}`);
+      logger.error(() => `Connection error: ${err}`);
       this.closeAllServers();
     });
   }
 
   addPort(localPort, targetPort, deviceIdHex, protocol = 'tls') {
     if (this.servers.has(localPort)) {
-      logger.warn(`Port ${localPort} is already bound`);
+      logger.warn(() => `Port ${localPort} is already bound`);
       return false;
     }
     
@@ -172,7 +172,7 @@ class BindPort {
   
   removePort(localPort) {
     if (!this.portsConfig[localPort]) {
-      logger.warn(`Port ${localPort} is not configured`);
+      logger.warn(() => `Port ${localPort} is not configured`);
       return false;
     }
     
@@ -180,7 +180,7 @@ class BindPort {
     if (this.servers.has(localPort)) {
       const server = this.servers.get(localPort);
       server.close(() => {
-        logger.info(`Server on port ${localPort} closed`);
+        logger.info(() => `Server on port ${localPort} closed`);
       });
       this.servers.delete(localPort);
     }
@@ -193,7 +193,7 @@ class BindPort {
   closeAllServers() {
     for (const [localPort, server] of this.servers.entries()) {
       server.close();
-      logger.info(`Server on port ${localPort} closed`);
+      logger.info(() => `Server on port ${localPort} closed`);
     }
     this.servers.clear();
   }
@@ -201,7 +201,7 @@ class BindPort {
   bindSinglePort(localPort) {
     const config = this.portsConfig[localPort];
     if (!config) {
-      logger.error(`No configuration found for port ${localPort}`);
+      logger.error(() => `No configuration found for port ${localPort}`);
       return false;
     }
     
@@ -210,14 +210,14 @@ class BindPort {
     
     // Format the target port with protocol prefix for the remote connection
     const formattedTargetPort = `${protocol}:${targetPort}`;
-    logger.info(`Binding local port ${localPort} to remote ${formattedTargetPort}`);
+    logger.info(() => `Binding local port ${localPort} to remote ${formattedTargetPort}`);
     
     // For udp protocol, use udp server
     if (protocol === 'udp') {
       const server = dgram.createSocket('udp4');
       
       server.on('listening', () => {
-        logger.info(`udp server listening on port ${localPort} forwarding to device port ${targetPort}`);
+        logger.info(() => `udp server listening on port ${localPort} forwarding to device port ${targetPort}`);
       });
       
       server.on('message', async (data, rinfo) => {
@@ -229,10 +229,10 @@ class BindPort {
           try {
             ref = await this.rpc.portOpen(deviceId, formattedTargetPort, 'rw');
             if (!ref) {
-              logger.error(`Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
+              logger.error(() => `Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
               return;
             } else {
-              logger.info(`Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for udp client ${clientKey}`);
+              logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for udp client ${clientKey}`);
               if (!server.clientRefs) server.clientRefs = {};
               server.clientRefs[clientKey] = ref;
               
@@ -247,7 +247,7 @@ class BindPort {
               });
             }
           } catch (error) {
-            logger.error(`Error opening port ${formattedTargetPort} on device: ${error}`);
+            logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
             return;
           }
         }
@@ -256,12 +256,12 @@ class BindPort {
         try {
           await this.rpc.portSend(ref, data);
         } catch (error) {
-          logger.error(`Error sending udp data to device: ${error}`);
+          logger.error(() => `Error sending udp data to device: ${error}`);
         }
       });
       
       server.on('error', (err) => {
-        logger.error(`udp Server error: ${err}`);
+        logger.error(() => `udp Server error: ${err}`);
       });
       
       server.bind(localPort);
@@ -269,21 +269,22 @@ class BindPort {
     } else {
       // For TCP and tls protocols, use TCP server locally
       const server = net.createServer(async (clientSocket) => {
-        logger.info(`Client connected to local server on port ${localPort}`);
+        logger.info(() => `Client connected to local server on port ${localPort}`);
+        clientSocket.setNoDelay(true);
 
         // Open a new port on the device for this client
         let ref;
         try {
           ref = await this.rpc.portOpen(deviceId, formattedTargetPort, 'rw');
           if (!ref) {
-            logger.error(`Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
+            logger.error(() => `Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
             clientSocket.destroy();
             return;
           } else {
-            logger.info(`Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
+            logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
           }
         } catch (error) {
-          logger.error(`Error opening port ${formattedTargetPort} on device: ${error}`);
+          logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
           clientSocket.destroy();
           return;
         }
@@ -316,15 +317,16 @@ class BindPort {
               socket: diodeSocket,
               ...tlsOptions
             }, () => {
-              logger.info(`tls connection established to device ${deviceIdHex}`);
+              logger.info(() => `tls connection established to device ${deviceIdHex}`);
             });
+            tlsSocket.setNoDelay(true);
             
             // Pipe data between the client socket and the tls socket
             tlsSocket.pipe(clientSocket).pipe(tlsSocket);
             
             // Handle tls socket errors
             tlsSocket.on('error', (err) => {
-              logger.error(`tls Socket error: ${err}`);
+              logger.error(() => `tls Socket error: ${err}`);
               clientSocket.destroy();
             });
             
@@ -342,7 +344,7 @@ class BindPort {
             this.connection.addClientSocket(ref, socketWrapper);
             
           } catch (error) {
-            logger.error(`Error setting up tls connection: ${error}`);
+            logger.error(() => `Error setting up tls connection: ${error}`);
             clientSocket.destroy();
             return;
           }
@@ -355,7 +357,7 @@ class BindPort {
             try {
               await this.rpc.portSend(ref, data);
             } catch (error) {
-              logger.error(`Error sending data to device: ${error}`);
+              logger.error(() => `Error sending data to device: ${error}`);
               clientSocket.destroy();
             }
           });
@@ -363,28 +365,28 @@ class BindPort {
 
         // Handle client socket closure (common for all protocols)
         clientSocket.on('end', async () => {
-          logger.info('Client disconnected');
+          logger.info(() => 'Client disconnected');
           if (ref && this.connection.hasClientSocket(ref)) {
             try {
               await this.rpc.portClose(ref);
-              logger.info(`Port closed on device for ref: ${ref.toString('hex')}`);
+              logger.info(() => `Port closed on device for ref: ${ref.toString('hex')}`);
               this.connection.deleteClientSocket(ref);
             } catch (error) {
-              logger.error(`Error closing port on device: ${error}`);
+              logger.error(() => `Error closing port on device: ${error}`);
             }
           } else {
-            logger.warn('Ref is invalid or no longer in clientSockets.');
+            logger.warn(() => 'Ref is invalid or no longer in clientSockets.');
           }
         });
 
         // Handle client socket errors
         clientSocket.on('error', (err) => {
-          logger.error(`Client socket error: ${err}`);
+          logger.error(() => `Client socket error: ${err}`);
         });
       });
 
       server.listen(localPort, () => {
-        logger.info(`Local server listening on port ${localPort} forwarding to device ${protocol} port ${targetPort}`);
+        logger.info(() => `Local server listening on port ${localPort} forwarding to device ${protocol} port ${targetPort}`);
       });
       
       this.servers.set(parseInt(localPort), server);

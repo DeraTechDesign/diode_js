@@ -15,11 +15,10 @@ server.on('message',function(msg,info){
 //sending msg
 server.send(msg,info.port,'localhost',function(error){
   if(error){
-    client.close();
+    server.close(); // was client.close();
   }else{
     console.log('Data sent !!!');
   }
-
 });
 
 });

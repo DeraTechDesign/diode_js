@@ -13,7 +13,7 @@ const logger = require('./logger');
 
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
-    super();
+    super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
     this.ref = ref;
     this.rpc = rpc;
   }
@@ -51,9 +51,9 @@ class PublishPort extends EventEmitter {
     
     this.startListening();
     if (this.publishedPorts.size > 0) {
-      logger.info(`Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
+      logger.info(() => `Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
     } else {
-      logger.info("No ports published initially");
+      logger.info(() => "No ports published initially");
     }
   }
 
@@ -69,7 +69,7 @@ class PublishPort extends EventEmitter {
     
     // Add to map
     this.publishedPorts.set(portNum, portConfig);
-    logger.info(`Added published port ${portNum} with mode: ${portConfig.mode}`);
+    logger.info(() => `Added published port ${portNum} with mode: ${portConfig.mode}`);
     
     return true;
   }
@@ -79,7 +79,7 @@ class PublishPort extends EventEmitter {
     const portNum = parseInt(port, 10);
     
     if (!this.publishedPorts.has(portNum)) {
-      logger.warn(`Port ${portNum} is not published`);
+      logger.warn(() => `Port ${portNum} is not published`);
       return false;
     }
     
@@ -90,12 +90,12 @@ class PublishPort extends EventEmitter {
       .filter(conn => conn.port === portNum);
       
     if (activeConnections.length > 0) {
-      logger.warn(`Removing port ${portNum} with ${activeConnections.length} active connections`);
+      logger.warn(() => `Removing port ${portNum} with ${activeConnections.length} active connections`);
       // We could close these connections, but they'll be rejected naturally on next data transfer
     }
     
     this.publishedPorts.delete(portNum);
-    logger.info(`Removed published port ${portNum}`);
+    logger.info(() => `Removed published port ${portNum}`);
     
     return true;
   }
@@ -126,7 +126,7 @@ class PublishPort extends EventEmitter {
   clearPorts() {
     const portCount = this.publishedPorts.size;
     this.publishedPorts.clear();
-    logger.info(`Cleared ${portCount} published ports`);
+    logger.info(() => `Cleared ${portCount} published ports`);
     return portCount;
   }
 
@@ -145,7 +145,7 @@ class PublishPort extends EventEmitter {
         this.handlePortClose(sessionIdRaw, messageContent);
       } else {
         if (messageType != 'data') {
-          logger.warn(`Unknown unsolicited message type: ${messageType}`);
+          logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
       }
     });
@@ -162,7 +162,7 @@ class PublishPort extends EventEmitter {
     const ref = Buffer.from(refRaw);
     const deviceId = `0x${Buffer.from(deviceIdRaw).toString('hex')}`;
 
-    logger.info(`Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
+    logger.info(() => `Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
 
     // Extract protocol and port number from portString
     var protocol = 'tcp';
@@ -180,7 +180,7 @@ class PublishPort extends EventEmitter {
 
     // Check if the port is published
     if (!this.publishedPorts.has(port)) {
-      logger.warn(`Port ${port} is not published. Rejecting request.`);
+      logger.warn(() => `Port ${port} is not published. Rejecting request.`);
       // Send error response
       this.rpc.sendError(sessionId, ref, 'Port is not published');
       return;
@@ -190,11 +190,11 @@ class PublishPort extends EventEmitter {
     const portConfig = this.publishedPorts.get(port);
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
-        logger.warn(`Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
+        logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
         this.rpc.sendError(sessionId, ref, 'Device not whitelisted');
         return;
       }
-      logger.info(`Device ${deviceId} is whitelisted for port ${port}. Accepting request.`);
+      logger.info(() => `Device ${deviceId} is whitelisted for port ${port}. Accepting request.`);
     }
 
     // Handle based on protocol
@@ -205,7 +205,7 @@ class PublishPort extends EventEmitter {
     } else if (protocol === 'udp') {
       this.handleUDPConnection(sessionId, ref, port, deviceId);
     } else {
-      logger.warn(`Unsupported protocol: ${protocol}`);
+      logger.warn(() => `Unsupported protocol: ${protocol}`);
       this.rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`);
     }
   }
@@ -220,14 +220,14 @@ class PublishPort extends EventEmitter {
       });
 
       localSocket.on('end', () => {
-        logger.info(`Local service disconnected`);
+        logger.info(() => `Local service disconnected`);
         // Send portclose message to Diode
         this.rpc.portClose(ref);
         this.connection.deleteConnection(ref);
       });
 
       localSocket.on('error', (err) => {
-        logger.error(`Error with local service: ${err}`);
+        logger.error(() => `Error with local service: ${err}`);
         // Send portclose message to Diode
         this.rpc.portClose(ref);
         this.connection.deleteConnection(ref);
@@ -238,7 +238,8 @@ class PublishPort extends EventEmitter {
   handleTCPConnection(sessionId, ref, port, deviceId) {
     // Create a TCP connection to the local service on the specified port
     const localSocket = net.connect({ port: port }, () => {
-      logger.info(`Connected to local TCP service on port ${port}`);
+      localSocket.setNoDelay(true);
+      logger.info(() => `Connected to local TCP service on port ${port}`);
       // Send success response
       this.rpc.sendResponse(sessionId, ref, 'ok');
     });
@@ -272,10 +273,10 @@ class PublishPort extends EventEmitter {
       isServer: true,
       ...tlsOptions,
     });
-
+    tlsSocket.setNoDelay(true);
     // Connect to the local service (TCP or TLS as needed)
     const localSocket = net.connect({ port: port }, () => {
-      logger.info(`Connected to local TCP service on port ${port}`);
+      logger.info(() => `Connected to local TCP service on port ${port}`);
       // Send success response
       this.rpc.sendResponse(sessionId, ref, 'ok');
     });
@@ -285,7 +286,7 @@ class PublishPort extends EventEmitter {
 
     // Handle errors and cleanup
     tlsSocket.on('error', (err) => {
-      logger.error(`TLS Socket error: ${err}`);
+      logger.error(() => `TLS Socket error: ${err}`);
       this.rpc.portClose(ref);
       this.connection.deleteConnection(ref);
     });
@@ -309,6 +310,16 @@ class PublishPort extends EventEmitter {
     // Create a UDP socket
     const localSocket = dgram.createSocket('udp4');
 
+    // Try larger kernel buffers if available
+    localSocket.on('listening', () => {
+      try {
+        localSocket.setRecvBufferSize(1 << 20); // ~1MB
+        localSocket.setSendBufferSize(1 << 20);
+      } catch (e) {
+        logger.debug(() => `UDP buffer sizing not supported: ${e.message}`);
+      }
+    });
+
     // Store the remote address and port from the Diode client
     const remoteInfo = {port, address: '127.0.0.1'};
 
@@ -324,20 +335,15 @@ class PublishPort extends EventEmitter {
       deviceId
     });
 
-    logger.info(`UDP connection set up on port ${port}`);
+    logger.info(() => `UDP connection set up on port ${port}`);
 
     // Handle messages from the local UDP service
     localSocket.on('message', (msg, rinfo) => {
-      //need to add 4 bytes of data length to the beginning of the message but it's Big Endian
-      const dataLength = Buffer.alloc(4);
-      dataLength.writeUInt32LE(msg.length, 0);
-      const data = Buffer.concat([dataLength, msg]);
-      // Send the data back to the Diode client via portSend
-      this.rpc.portSend(ref, data);
+      this.rpc.portSend(ref, msg);
     });
 
     localSocket.on('error', (err) => {
-      logger.error(`UDP Socket error: ${err}`);
+      logger.error(() => `UDP Socket error: ${err}`);
       this.rpc.portClose(ref);
       this.connection.deleteConnection(ref);
     });
@@ -357,7 +363,7 @@ class PublishPort extends EventEmitter {
       const { socket: localSocket, protocol, remoteInfo, port, deviceId } = connectionInfo;
 
       if (!this.publishedPorts.has(port)) {
-        logger.warn(`Port ${port} is not published. Sending portclose.`);
+        logger.warn(() => `Port ${port} is not published. Sending portclose.`);
         this.rpc.portClose(ref);
         this.connection.deleteConnection(ref);
         return;
@@ -366,7 +372,7 @@ class PublishPort extends EventEmitter {
       const portConfig = this.publishedPorts.get(port);
       if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
         if (!portConfig.whitelist.includes(deviceId)) {
-          logger.warn(`Device ${deviceId} is not whitelisted for port ${port}. Sending portclose.`);
+          logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Sending portclose.`);
           this.rpc.portClose(ref);
           this.connection.deleteConnection(ref);
           return;
@@ -398,9 +404,9 @@ class PublishPort extends EventEmitter {
     } else {
       const clientSocket = this.connection.getClientSocket(ref);
       if (clientSocket) {
-        logger.debug(`No local connection found for ref: ${ref.toString('hex')}, but client socket exists`);
+        logger.debug(() => `No local connection found for ref: ${ref.toString('hex')}, but client socket exists`);
       } else {
-        logger.warn(`No local connection found for ref ${ref.toString('hex')}. Sending portclose.`);
+        logger.warn(() => `No local connection found for ref ${ref.toString('hex')}. Sending portclose.`);
         this.rpc.sendError(sessionId, ref, 'No local connection found');
       }
     }
@@ -411,7 +417,7 @@ class PublishPort extends EventEmitter {
     const sessionId = Buffer.from(sessionIdRaw);
     const ref = Buffer.from(refRaw);
 
-    logger.info(`Received portclose for ref ${ref.toString('hex')}`);
+    logger.info(() => `Received portclose for ref ${ref.toString('hex')}`);
 
     const connectionInfo = this.connection.getConnection(ref);
     if (connectionInfo) {

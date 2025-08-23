@@ -11,20 +11,15 @@
   "dependencies": {
     "@ethereumjs/rlp": "^5.0.2",
     "asn1.js": "^5.4.1",
-    "buffer": "^6.0.3",
-    "crypto": "^1.0.1",
     "dera-logger": "^2.0.0",
-    "dgram": "^1.0.1",
     "dotenv": "^16.4.7",
     "ethereumjs-abi": "^0.6.8",
     "ethereumjs-util": "^7.1.5",
     "ethers": "^6.13.2",
-    "fs": "^0.0.1-security",
     "jsrsasign": "^11.1.0",
-    "net": "^1.0.2",
     "node-fetch": "^2.7.0",
     "rlp": "^3.0.0",
-    "secp256k1": "^5.0.1",
-    "tls": "^0.0.1"
-  }
+    "secp256k1": "^5.0.1"
+  },
+  "engines": { "node": ">=18" }
 }
