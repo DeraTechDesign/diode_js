@@ -6,11 +6,20 @@ const { KEYUTIL } = require("jsrsasign");
 const fs = require('fs');
 var path = require('path');
 
+// Zero-copy view for Uint8Array -> Buffer where possible
+function toBufferView(u8) {
+  if (Buffer.isBuffer(u8)) return u8;
+  if (u8 && u8.buffer && typeof u8.byteOffset === 'number') {
+    return Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+  }
+  return Buffer.from(u8);
+}
+
 function makeReadable(decodedMessage) {
   if (Array.isArray(decodedMessage)) {
     return decodedMessage.map((item) => makeReadable(item));
   } else if (decodedMessage instanceof Uint8Array) {
-    const buffer = Buffer.from(decodedMessage);
+    const buffer = toBufferView(decodedMessage);
     // Try to interpret the Buffer as a UTF-8 string
     const str = buffer.toString('utf8');
     if (/^[\x20-\x7E]+$/.test(str)) {
@@ -42,7 +51,7 @@ function makeReadable(decodedMessage) {
 // Helper functions
 function parseRequestId(requestIdRaw) {
   if (requestIdRaw instanceof Uint8Array || Buffer.isBuffer(requestIdRaw)) {
-    const buffer = Buffer.from(requestIdRaw);
+    const buffer = toBufferView(requestIdRaw);
     return buffer.readUIntBE(0, buffer.length);
   } else if (typeof requestIdRaw === 'number') {
     return requestIdRaw;
@@ -53,10 +62,10 @@ function parseRequestId(requestIdRaw) {
 
 function parseResponseType(responseTypeRaw) {
   if (responseTypeRaw instanceof Uint8Array || Buffer.isBuffer(responseTypeRaw)) {
-    return Buffer.from(responseTypeRaw).toString('utf8');
+    return toBufferView(responseTypeRaw).toString('utf8');
   } else if (Array.isArray(responseTypeRaw)) {
     // Convert each element to Buffer and concatenate
-    const buffers = responseTypeRaw.map((item) => Buffer.from(item));
+    const buffers = responseTypeRaw.map((item) => toBufferView(item));
     const concatenated = Buffer.concat(buffers);
     return concatenated.toString('utf8');
   } else if (typeof responseTypeRaw === 'string') {
@@ -68,7 +77,7 @@ function parseResponseType(responseTypeRaw) {
 
 function parseReason(reasonRaw) {
   if (Buffer.isBuffer(reasonRaw) || reasonRaw instanceof Uint8Array) {
-    return Buffer.from(reasonRaw).toString('utf8');
+    return toBufferView(reasonRaw).toString('utf8');
   } else if (typeof reasonRaw === 'string') {
     return reasonRaw;
   } else {
@@ -175,5 +184,6 @@ module.exports = {
   parseReason, 
   generateCert, 
   loadOrGenerateKeyPair,
-  ensureDirectoryExistence 
+  ensureDirectoryExistence,
+  toBufferView,
 };

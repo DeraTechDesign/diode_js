@@ -1,5 +1,5 @@
 //rpc.js
-const { makeReadable, parseRequestId, parseResponseType, parseReason } = require('./utils');
+const { makeReadable, parseRequestId, parseResponseType, parseReason, toBufferView } = require('./utils');
 const logger = require('./logger');
 
 class DiodeRPC {
@@ -17,7 +17,8 @@ class DiodeRPC {
           const blockNumberRaw = responseData[0];
           let blockNumber;
           if (blockNumberRaw instanceof Uint8Array) {
-            blockNumber = Buffer.from(blockNumberRaw).readUIntBE(0, blockNumberRaw.length);
+            const buf = toBufferView(blockNumberRaw);
+            blockNumber = buf.readUIntBE(0, buf.length);
           } else if (Buffer.isBuffer(blockNumberRaw)) {
             blockNumber = blockNumberRaw.readUIntBE(0, blockNumberRaw.length);
           } else if (typeof blockNumberRaw === 'number') {
@@ -82,7 +83,7 @@ class DiodeRPC {
           if (status === 'ok') {
             let ref = refOrReasonRaw;
             if (Buffer.isBuffer(ref) || ref instanceof Uint8Array) {
-              ref = Buffer.from(ref);
+              ref = toBufferView(ref);
             }
             return ref;
           } else if (status === 'error') {
@@ -209,38 +210,33 @@ class DiodeRPC {
         return epoch;
       }
     
-      parseTimestamp(blockHeader) {        
-        // Search for the timestamp field by name
+      parseTimestamp(blockHeader) {
+        // Search for the timestamp field by name (robust to Buffer/Uint8Array)
         if (Array.isArray(blockHeader)) {
           for (const field of blockHeader) {
-            if (Array.isArray(field) && field.length >= 2 && field[0] === 'timestamp') {
-              const timestampValue = field[1];
-              
-              // Handle different timestamp value types
-              if (typeof timestampValue === 'number') {
-                return timestampValue;
-              } else if (typeof timestampValue === 'string' && timestampValue.startsWith('0x')) {
-                // Handle hex string
-                return parseInt(timestampValue.slice(2), 16);
-              } else if (typeof timestampValue === 'string') {
-                // Handle decimal string
-                return parseInt(timestampValue, 10);
-              } else if (timestampValue instanceof Uint8Array || Buffer.isBuffer(timestampValue)) {
-                // Handle buffer - carefully determine the byte length
-                const buf = Buffer.from(timestampValue);
-                // Use a safe approach to read the value based on buffer length
-                if (buf.length <= 6) {
-                  return buf.readUIntBE(0, buf.length);
-                } else {
-                  // For larger buffers, convert to hex string first
+            if (Array.isArray(field) && field.length >= 2) {
+              const key = typeof field[0] === 'string' ? field[0] : toBufferView(field[0]).toString('utf8');
+              if (key === 'timestamp') {
+                const timestampValue = field[1];
+                // Handle different timestamp value types
+                if (typeof timestampValue === 'number') {
+                  return timestampValue;
+                } else if (typeof timestampValue === 'string' && timestampValue.startsWith('0x')) {
+                  return parseInt(timestampValue.slice(2), 16);
+                } else if (typeof timestampValue === 'string') {
+                  return parseInt(timestampValue, 10);
+                } else if (timestampValue instanceof Uint8Array || Buffer.isBuffer(timestampValue)) {
+                  const buf = toBufferView(timestampValue);
+                  if (buf.length <= 6) {
+                    return buf.readUIntBE(0, buf.length);
+                  }
                   return parseInt(buf.toString('hex'), 16);
                 }
               }
             }
           }
         }
-        
-        // Fallback: if we couldn't find the timestamp or parse it correctly
+        // Fallback
         logger.warn(() => 'Could not find or parse timestamp in block header, using current time');
         return Math.floor(Date.now() / 1000);
       }

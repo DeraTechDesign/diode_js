@@ -8,7 +8,7 @@ const { Buffer } = require('buffer');
 const EventEmitter = require('events');
 const { Duplex } = require('stream');
 const DiodeRPC = require('./rpc');
-const { makeReadable } = require('./utils');
+const { makeReadable, toBufferView } = require('./utils');
 const logger = require('./logger');
 
 class DiodeSocket extends Duplex {
@@ -40,6 +40,7 @@ class PublishPort extends EventEmitter {
     super();
     this.connection = connection;
     this.rpc = new DiodeRPC(connection);
+    this._listening = false; // ensure startListening is idempotent
     
     // Convert publishedPorts to a Map with configurations
     this.publishedPorts = new Map();
@@ -131,24 +132,36 @@ class PublishPort extends EventEmitter {
   }
 
   startListening() {
+    if (this._listening) return this; // idempotent
     // Listen for unsolicited messages from the connection
-    this.connection.on('unsolicited', (message) => {
+    this._onUnsolicited = (message) => {
       const [sessionIdRaw, messageContent] = message;
       const messageTypeRaw = messageContent[0];
-      const messageType = Buffer.from(messageTypeRaw).toString('utf8');
+      const messageType = toBufferView(messageTypeRaw).toString('utf8');
 
       if (messageType === 'portopen') {
         this.handlePortOpen(sessionIdRaw, messageContent);
-      } else if (messageType === 'portsend') {
+      } else if (messageType === 'portsend' || messageType === 'data') {
+        // Accept both synonyms for payload delivery
         this.handlePortSend(sessionIdRaw, messageContent);
       } else if (messageType === 'portclose') {
         this.handlePortClose(sessionIdRaw, messageContent);
       } else {
-        if (messageType != 'data') {
-          logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
-        }
+        logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
       }
-    });
+    };
+    this.connection.on('unsolicited', this._onUnsolicited);
+    this._listening = true;
+    return this;
+  }
+
+  stopListening() {
+    if (!this._listening) return this;
+    if (this._onUnsolicited) {
+      this.connection.off('unsolicited', this._onUnsolicited);
+    }
+    this._listening = false;
+    return this;
   }
 
   handlePortOpen(sessionIdRaw, messageContent) {
@@ -157,10 +170,10 @@ class PublishPort extends EventEmitter {
     const refRaw = messageContent[2];
     const deviceIdRaw = messageContent[3];
 
-    const sessionId = Buffer.from(sessionIdRaw);
+    const sessionId = toBufferView(sessionIdRaw);
     const portString = makeReadable(portStringRaw);
-    const ref = Buffer.from(refRaw);
-    const deviceId = `0x${Buffer.from(deviceIdRaw).toString('hex')}`;
+    const ref = toBufferView(refRaw);
+    const deviceId = `0x${toBufferView(deviceIdRaw).toString('hex')}`;
 
     logger.info(() => `Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
 
@@ -353,9 +366,9 @@ class PublishPort extends EventEmitter {
     const refRaw = messageContent[1];
     const dataRaw = messageContent[2];
 
-    const sessionId = Buffer.from(sessionIdRaw);
-    const ref = Buffer.from(refRaw);
-    const data = Buffer.from(dataRaw)//.slice(4);
+    const sessionId = toBufferView(sessionIdRaw);
+    const ref = toBufferView(refRaw);
+    const data = toBufferView(dataRaw);//.slice(4);
 
     const connectionInfo = this.connection.getConnection(ref);
     // Check if the port is still open and address is still in whitelist
@@ -414,8 +427,8 @@ class PublishPort extends EventEmitter {
 
   handlePortClose(sessionIdRaw, messageContent) {
     const refRaw = messageContent[1];
-    const sessionId = Buffer.from(sessionIdRaw);
-    const ref = Buffer.from(refRaw);
+    const sessionId = toBufferView(sessionIdRaw);
+    const ref = toBufferView(refRaw);
 
     logger.info(() => `Received portclose for ref ${ref.toString('hex')}`);
 

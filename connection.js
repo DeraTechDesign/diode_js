@@ -16,6 +16,15 @@ const path = require('path');
 // Add dotenv for environment variables
 require('dotenv').config();
 
+// Try to use native keccak if available (optional perf boost)
+let nativeKeccak = null;
+try {
+  // eslint-disable-next-line import/no-extraneous-dependencies
+  nativeKeccak = require('keccak');
+} catch (_) {
+  // optional dependency; fallback to ethereumjs-util.keccak256
+}
+
 class DiodeConnection extends EventEmitter {
   constructor(host, port, keyLocation = './db/keys.json') {
     super();
@@ -37,6 +46,7 @@ class DiodeConnection extends EventEmitter {
     this.clientSockets = new Map(); // For BindPort
     this.connections = new Map(); // For PublishPort
     this.certPem = null;
+    this._serverEthAddress = null; // cache after first read
     // Load or generate keypair
     this.keyPair = loadOrGenerateKeyPair(this.keyLocation);
     
@@ -102,6 +112,14 @@ class DiodeConnection extends EventEmitter {
         // Set keep-alive to prevent connection timeout forever
         this.socket.setKeepAlive(true, 1500);
         this.socket.setNoDelay(true);
+        // Cache server address after handshake
+        try {
+          this._serverEthAddress = this.getServerEthereumAddress();
+        } catch (e) {
+          logger.warn(() => `Failed caching server address: ${e}`);
+        }
+        // Start periodic ticket updates now that we are fully connected
+        this._startTicketUpdateTimer();
         // Send the ticketv2 command
         try {
           const ticketCommand = await this.createTicketCommand();
@@ -122,10 +140,7 @@ class DiodeConnection extends EventEmitter {
         }
       });
 
-      // Start the periodic ticket update timer after successful connection
-      this.socket.on('connect', () => {
-        this._startTicketUpdateTimer();
-      });
+      // No-op: rely on secure handshake callback above for timers/caching
 
       this.socket.on('error', (err) => {
         logger.error(() => `Connection error: ${err}`);
@@ -291,7 +306,8 @@ class DiodeConnection extends EventEmitter {
       offset += 2 + length;
   
       try {
-        const decodedMessage = RLP.decode(Uint8Array.from(messageBuffer));
+        // Avoid copying: pass Buffer directly to RLP.decode
+        const decodedMessage = RLP.decode(messageBuffer);
         // logger.debug(() => `Decoded message: ${makeReadable(decodedMessage)}`);
     
         if (Array.isArray(decodedMessage) && decodedMessage.length > 1) {
@@ -392,17 +408,17 @@ class DiodeConnection extends EventEmitter {
         const requestId = this._getNextRequestId();
         // Build the message as [requestId, [commandArray]]
         const commandWithId = [requestId, commandArray];
-  
+
         // Store the promise callbacks to resolve/reject later
         this.pendingRequests.set(requestId, { resolve, reject });
-  
+
         const commandBuffer = RLP.encode(commandWithId);
-        const byteLength = Buffer.byteLength(commandBuffer);
-  
+        const byteLength = commandBuffer.length; // Buffer/Uint8Array length is bytes
+
         // Create a 2-byte length buffer
         const lengthBuffer = Buffer.alloc(2);
         lengthBuffer.writeUInt16BE(byteLength, 0);
-  
+
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
         logger.debug(() => `Sending command with requestId ${requestId}: ${commandArray}`);
@@ -419,17 +435,17 @@ class DiodeConnection extends EventEmitter {
         const requestId = sessionId;
         // Build the message as [requestId, [commandArray]]
         const commandWithId = [requestId, commandArray];
-  
+
         // Store the promise callbacks to resolve/reject later
         this.pendingRequests.set(requestId, { resolve, reject });
-  
+
         const commandBuffer = RLP.encode(commandWithId);
-        const byteLength = Buffer.byteLength(commandBuffer);
-  
+        const byteLength = commandBuffer.length; // Buffer/Uint8Array length is bytes
+
         // Create a 2-byte length buffer
         const lengthBuffer = Buffer.alloc(2);
         lengthBuffer.writeUInt16BE(byteLength, 0);
-  
+
         const message = Buffer.concat([lengthBuffer, commandBuffer]);
   
         logger.debug(() => `Sending command with requestId ${requestId}: ${commandArray}`);
@@ -460,6 +476,9 @@ class DiodeConnection extends EventEmitter {
   
   getServerEthereumAddress() {
     try {
+      if (this._serverEthAddress) {
+        return this._serverEthAddress;
+      }
       const serverCert = this.socket.getPeerCertificate(true);
       if (!serverCert.raw) {
         throw new Error('Failed to get server certificate.');
@@ -473,8 +492,8 @@ class DiodeConnection extends EventEmitter {
 
       const addressBuffer = ethUtil.pubToAddress(publicKeyBuffer, true);
       const address = '0x' + addressBuffer.toString('hex');
-
-      return address;
+      this._serverEthAddress = address;
+      return this._serverEthAddress;
     } catch (error) {
       logger.error(() => `Error extracting server Ethereum address: ${error}`);
       throw error;
@@ -495,7 +514,6 @@ class DiodeConnection extends EventEmitter {
   }
 
   async createTicketSignature(serverIdBuffer, totalConnections, totalBytes, localAddress, epoch) { 
-    this.getEthereumAddress()
     const chainId = 1284;
     const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
   
@@ -513,8 +531,8 @@ class DiodeConnection extends EventEmitter {
       ethUtil.setLengthLeft(localAddressHash, 32),
     ];
 
-    // Convert each element in dataToSign to bytes32 and concatenate them
-    const encodedData = Buffer.concat(dataToSign.map(item => abi.rawEncode(['bytes32'], [item])));
+    // Elements are already bytes32; concatenate directly to avoid ABI overhead
+    const encodedData = Buffer.concat(dataToSign);
 
     logger.debug(() => `Encoded data: ${encodedData.toString('hex')}`);
 
@@ -523,13 +541,15 @@ class DiodeConnection extends EventEmitter {
   
     // Sign the data
     const privateKey = this.getPrivateKey();
-    const msgHash = ethUtil.keccak256(encodedData);
+    const msgHash = nativeKeccak
+      ? nativeKeccak('keccak256').update(encodedData).digest()
+      : ethUtil.keccak256(encodedData);
     logger.debug(() => `Message hash: ${msgHash.toString('hex')}`);
     const signature = secp256k1.ecdsaSign(msgHash, privateKey);
     logger.debug(() => `Signature: ${signature.signature.toString('hex')}`);
     
     const signatureBuffer = Buffer.concat([
-      ethUtil.toBuffer([signature.recid]),
+      Buffer.from([signature.recid]),
       signature.signature
     ]);
 

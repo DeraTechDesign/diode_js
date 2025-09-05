@@ -2,6 +2,7 @@ const net = require('net');
 const tls = require('tls');
 const dgram = require('dgram');
 const { Buffer } = require('buffer');
+const { toBufferView } = require('./utils');
 const { Duplex } = require('stream');
 const DiodeRPC = require('./rpc');
 const logger = require('./logger');
@@ -92,14 +93,14 @@ class BindPort {
     this.connection.on('unsolicited', (message) => {
       const [messageIdRaw, messageContent] = message;
       const messageTypeRaw = messageContent[0];
-      const messageType = Buffer.from(messageTypeRaw).toString('utf8');
+      const messageType = toBufferView(messageTypeRaw).toString('utf8');
 
       if (messageType === 'data' || messageType === 'portsend') {
         const refRaw = messageContent[1];
         const dataRaw = messageContent[2];
 
-        const dataRef = Buffer.from(refRaw);
-        const data = Buffer.from(dataRaw);
+        const dataRef = toBufferView(refRaw);
+        const data = toBufferView(dataRaw);
 
         // Find the associated client socket from connection
         const clientSocket = this.connection.getClientSocket(dataRef);
@@ -121,7 +122,7 @@ class BindPort {
         }
       } else if (messageType === 'portclose') {
         const refRaw = messageContent[1];
-        const dataRef = Buffer.from(refRaw);
+        const dataRef = toBufferView(refRaw);
 
         // Close the associated client socket
         const clientSocket = this.connection.getClientSocket(dataRef);
