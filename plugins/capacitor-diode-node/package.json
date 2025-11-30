@@ -1,0 +1,48 @@
+{
+  "name": "@diodejs/capacitor-diode-node",
+  "version": "0.1.0",
+  "description": "Capacitor plugin that runs the Diode client inside NodeJS Mobile",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "nodejs-assets",
+    "android"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf dist",
+    "lint": "eslint 'src/**/*.{ts,tsx}'"
+  },
+  "keywords": [
+    "capacitor",
+    "diode",
+    "nodejs-mobile"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@capacitor/core": "^6.1.2",
+    "nodejs-mobile-cordova": "^0.3.5",
+    "tslib": "^2.6.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "rimraf": "^5.0.5",
+    "eslint": "^8.57.0",
+    "@typescript-eslint/parser": "^7.0.2",
+    "@typescript-eslint/eslint-plugin": "^7.0.2"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^6.0.0"
+  },
+  "capacitor": {
+    "ios": {
+      "src": "ios"
+    },
+    "android": {
+      "src": "android"
+    }
+  }
+}

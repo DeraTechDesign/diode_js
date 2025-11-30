@@ -202,6 +202,36 @@ async function main() {
 main();
 ```
 
+## Capacitor Plugin & Mobile Controller App
+
+To interact with Diode from a native shell we now ship a Capacitor plugin that wraps the NodeJS Mobile runtime and a reference React UI:
+
+### Plugin
+
+- Source: `plugins/capacitor-diode-node`
+- Provides a pure JS Capacitor plugin (`DiodeNode`) that proxies every call to the NodeJS Mobile runtime so that TLS/secp256k1 work through OpenSSL.
+- Ships the NodeJS worker entry point at `nodejs-assets/nodejs-project/main.js` which consumes this library.
+- Minimal Android sources were added so Capacitor registers the plugin, but every action is handled in JS.
+
+### React + Capacitor App
+
+The sample UI lives in `apps/diode-capacitor-app` and exposes the plugin through a small control panel (connect/bind/publish). Key commands:
+
+```bash
+cd apps/diode-capacitor-app
+npm install
+npm run sync:node         # installs diodejs in the embedded NodeJS project
+npm run build             # compiles the React app
+npm run sync:android      # build + cap sync + mirrors public -> www + native libs
+cd android && ./gradlew assembleDebug
+```
+
+`npm run sync:android` is the safest way to avoid the classic “www folder not found” Gradle error. It copies the CRA build output into both `android/app/src/main/assets/public` **and** `www`, mirrors the NodeJS assets, and also unpacks the `nodejs-mobile-cordova` native blobs into `android/app/libs/cdvnodejsmobile` and `android/capacitor-cordova-android-plugins/libs/cdvnodejsmobile`.
+
+If you need to refresh only the Cordova bridge assets later, run `npm run sync:www`. This decompresses the bundled `libnode.so.gz` files so CMake can link against them without additional tooling.
+
+A default `android/local.properties` is checked in pointing to `C:\Users\omer\AppData\Local\Android\Sdk`; update it if your SDK lives elsewhere.
+
 ## Reference
 
 ### Classes and Methods

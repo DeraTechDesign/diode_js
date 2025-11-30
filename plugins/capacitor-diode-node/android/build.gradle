@@ -1,0 +1,27 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'com.diode.capacitornode'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 22
+        targetSdk 35
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+
+    sourceSets {
+        main {
+            java.srcDir 'src/main/java'
+            manifest.srcFile 'src/main/AndroidManifest.xml'
+            res.srcDir 'src/main/res'
+            assets.srcDir 'src/main/assets'
+        }
+    }
+}
+
+dependencies {
+    implementation project(':capacitor-android')
+}

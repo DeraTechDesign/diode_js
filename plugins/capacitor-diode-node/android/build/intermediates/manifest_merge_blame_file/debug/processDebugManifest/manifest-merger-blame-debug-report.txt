@@ -1,0 +1,10 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.diode.capacitornode" >
+4
+5    <uses-sdk android:minSdkVersion="22" />
+6
+7    <application />
+7-->C:\Users\omer\Documents\diode_client_js\plugins\capacitor-diode-node\android\src\main\AndroidManifest.xml:5:5-20
+8
+9</manifest>

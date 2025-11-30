@@ -1,0 +1,9 @@
+{
+  "name": "@diodejs/node-runtime",
+  "version": "0.1.0",
+  "main": "main.js",
+  "license": "ISC",
+  "dependencies": {
+    "diodejs": "file:../../../../diodejs-0.3.0.tgz"
+  }
+}
