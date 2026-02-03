@@ -5,6 +5,7 @@ const { Buffer } = require('buffer');
 const { toBufferView } = require('./utils');
 const { Duplex } = require('stream');
 const DiodeRPC = require('./rpc');
+const nativeCrypto = require('./nativeCrypto');
 const logger = require('./logger');
 
 // Custom Duplex stream to handle the Diode connection
@@ -83,6 +84,7 @@ class BindPort {
     this.servers = new Map(); // Track server instances by localPort
     this._rpcByConnection = new Map();
     this.rpc = this._isManager() ? null : this._getRpcFor(this.connection);
+    this.handshakeTimeoutMs = parseInt(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10) || 10000;
     
     // Set up listener for unsolicited messages once
     this._setupMessageListener();
@@ -125,6 +127,106 @@ class BindPort {
       return this.connection.getConnectionForDevice(deviceId);
     }
     return this.connection;
+  }
+
+  async _openTlsHandshakeChannel(connection, rpc, ref) {
+    const diodeSocket = new DiodeSocket(ref, rpc);
+    const certPem = connection.getDeviceCertificate();
+    if (!certPem) {
+      throw new Error('No device certificate available');
+    }
+
+    const tlsOptions = {
+      cert: certPem,
+      key: certPem,
+      rejectUnauthorized: false,
+      ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384',
+      ecdhCurve: 'secp256k1',
+      minVersion: 'TLSv1.2',
+      maxVersion: 'TLSv1.2',
+    };
+
+    const tlsSocket = tls.connect({
+      socket: diodeSocket,
+      ...tlsOptions
+    });
+    tlsSocket.setNoDelay(true);
+
+    const socketWrapper = {
+      diodeSocket,
+      tlsSocket,
+      end: () => {
+        try { tlsSocket.end(); } catch {}
+        try { diodeSocket._destroy(null, () => {}); } catch {}
+      }
+    };
+
+    connection.addClientSocket(ref, socketWrapper);
+
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('TLS handshake timeout')), this.handshakeTimeoutMs);
+      tlsSocket.once('secureConnect', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      tlsSocket.once('error', (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    return { tlsSocket, socketWrapper };
+  }
+
+  async _performNativeHandshake(connection, rpc, deviceId, targetPort, physicalPort) {
+    const handshakePort = `tls:${targetPort}#hs`;
+    const ref = await rpc.portOpen(deviceId, handshakePort, 'rw');
+    if (!ref) {
+      throw new Error('Handshake portopen failed');
+    }
+
+    let tlsSocket;
+    try {
+      ({ tlsSocket } = await this._openTlsHandshakeChannel(connection, rpc, ref));
+
+      const localDeviceId = connection.getEthereumAddress().toLowerCase();
+      const remoteDeviceId = `0x${Buffer.from(deviceId).toString('hex')}`.toLowerCase();
+      const { message, privKey, nonce } = nativeCrypto.createHandshakeMessage({
+        role: 'bind',
+        deviceId: localDeviceId,
+        physicalPort,
+        privateKey: connection.getPrivateKey()
+      });
+
+      nativeCrypto.writeHandshakeMessage(tlsSocket, message);
+
+      const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
+      const verification = nativeCrypto.verifyHandshakeMessage(peerMessage, {
+        expectedRole: 'publish',
+        expectedDeviceId: remoteDeviceId,
+        expectedPhysicalPort: physicalPort
+      });
+      if (!verification.ok) {
+        throw new Error(`Handshake verification failed: ${verification.reason}`);
+      }
+
+      const session = nativeCrypto.deriveSessionKeys({
+        role: 'bind',
+        localDeviceId,
+        remoteDeviceId,
+        localEphPriv: privKey,
+        remoteEphPub: verification.ephPub,
+        localNonce: nonce,
+        remoteNonce: verification.nonce,
+        physicalPort,
+      });
+
+      return session;
+    } finally {
+      try { if (tlsSocket) tlsSocket.end(); } catch {}
+      try { await rpc.portClose(ref); } catch {}
+      try { connection.deleteClientSocket(ref); } catch {}
+    }
   }
   
   _setupMessageListener() {
@@ -299,8 +401,10 @@ class BindPort {
 
               const relaySocket = dgram.createSocket('udp4');
               relaySocket.on('message', (msg) => {
-                // Forward data back to local client
-                server.send(msg, rinfo.port, rinfo.address);
+                if (!relayInfo || !relayInfo.session) return;
+                const plaintext = nativeCrypto.parseUdpPacket(relayInfo.session, msg);
+                if (!plaintext) return;
+                server.send(plaintext, rinfo.port, rinfo.address);
               });
               relaySocket.on('error', (err) => {
                 logger.error(() => `udp relay socket error: ${err}`);
@@ -314,6 +418,8 @@ class BindPort {
                 physicalPort,
                 relayHost: connection.getServerRelayHost(),
                 connection,
+                session: null,
+                handshakePromise: null,
                 client: { address: rinfo.address, port: rinfo.port }
               };
               server.nativeRelays[clientKey] = relayInfo;
@@ -324,9 +430,37 @@ class BindPort {
             }
           }
 
-          // Send data to the server relay port
+          if (!relayInfo.handshakePromise) {
+            const rpc = this._getRpcFor(relayInfo.connection);
+            relayInfo.handshakePromise = this._performNativeHandshake(
+              relayInfo.connection,
+              rpc,
+              deviceId,
+              targetPort,
+              relayInfo.physicalPort
+            ).then((session) => {
+              relayInfo.session = session;
+              return session;
+            }).catch((error) => {
+              logger.error(() => `Native UDP handshake failed: ${error}`);
+              try { relayInfo.socket.close(); } catch {}
+              delete server.nativeRelays[clientKey];
+              throw error;
+            });
+          }
+
           try {
-            relayInfo.socket.send(data, relayInfo.physicalPort, relayInfo.relayHost);
+            await relayInfo.handshakePromise;
+          } catch (_) {
+            return;
+          }
+
+          if (!relayInfo.session) return;
+
+          // Send encrypted data to the server relay port
+          try {
+            const packet = nativeCrypto.createUdpPacket(relayInfo.session, data);
+            relayInfo.socket.send(packet, relayInfo.physicalPort, relayInfo.relayHost);
           } catch (error) {
             logger.error(() => `Error sending udp data to relay: ${error}`);
           }
@@ -439,16 +573,69 @@ class BindPort {
             return;
           }
 
+          let session;
+          try {
+            session = await this._performNativeHandshake(connection, rpc, deviceId, targetPort, physicalPort);
+          } catch (error) {
+            logger.error(() => `Native TCP handshake failed: ${error}`);
+            clientSocket.destroy();
+            return;
+          }
+
           const relayHost = connection.getServerRelayHost();
           const relaySocket = net.connect({ host: relayHost, port: physicalPort }, () => {
             logger.info(() => `Connected to relay ${relayHost}:${physicalPort} for ${formattedTargetPort}`);
           });
           relaySocket.setNoDelay(true);
 
+          let relayReady = false;
+          const pendingChunks = [];
+
           const cleanup = () => {
             if (!clientSocket.destroyed) clientSocket.destroy();
             if (!relaySocket.destroyed) relaySocket.destroy();
           };
+
+          relaySocket.on('connect', () => {
+            relayReady = true;
+            while (pendingChunks.length > 0) {
+              const chunk = pendingChunks.shift();
+              try {
+                const frame = nativeCrypto.createTcpFrame(session, chunk);
+                relaySocket.write(frame);
+              } catch (error) {
+                logger.error(() => `Error sending TCP frame: ${error}`);
+                cleanup();
+                break;
+              }
+            }
+          });
+
+          relaySocket.on('data', (data) => {
+            try {
+              const messages = nativeCrypto.consumeTcpFrames(session, data);
+              for (const msg of messages) {
+                clientSocket.write(msg);
+              }
+            } catch (error) {
+              logger.error(() => `TCP decrypt error: ${error}`);
+              cleanup();
+            }
+          });
+
+          clientSocket.on('data', (data) => {
+            if (!relayReady) {
+              pendingChunks.push(data);
+              return;
+            }
+            try {
+              const frame = nativeCrypto.createTcpFrame(session, data);
+              relaySocket.write(frame);
+            } catch (error) {
+              logger.error(() => `Error sending TCP frame: ${error}`);
+              cleanup();
+            }
+          });
 
           relaySocket.on('error', (err) => {
             logger.error(() => `Relay socket error: ${err}`);
@@ -461,7 +648,6 @@ class BindPort {
           clientSocket.on('end', cleanup);
           relaySocket.on('end', cleanup);
 
-          clientSocket.pipe(relaySocket).pipe(clientSocket);
           return;
         }
 

@@ -45,8 +45,6 @@ function startUdpEcho(port) {
 }
 
 async function main() {
-  const host = 'us2.prenet.diode.io';
-  const port = 41046;
   const keyLocation = './db/keys.json';
 
   const tcpServer = startTcpEcho(8089);

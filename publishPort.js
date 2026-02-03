@@ -9,7 +9,34 @@ const EventEmitter = require('events');
 const { Duplex } = require('stream');
 const DiodeRPC = require('./rpc');
 const { makeReadable, parseUInt, toBufferView } = require('./utils');
+const nativeCrypto = require('./nativeCrypto');
 const logger = require('./logger');
+const secp256k1 = require('secp256k1');
+const ethUtil = require('ethereumjs-util');
+
+function normalizeDeviceId(raw) {
+  if (!raw) return '';
+  let buf = toBufferView(raw);
+  if (buf.length === 20) {
+    return `0x${buf.toString('hex')}`;
+  }
+  if (buf.length === 32) {
+    return `0x${buf.slice(12).toString('hex')}`;
+  }
+  if (buf.length === 33 || buf.length === 65) {
+    try {
+      const uncompressed = buf.length === 33 ? secp256k1.publicKeyConvert(buf, false) : buf;
+      const addr = ethUtil.pubToAddress(uncompressed, true);
+      return `0x${addr.toString('hex')}`;
+    } catch (_) {
+      // fallback below
+    }
+  }
+  if (buf.length > 20) {
+    return `0x${buf.slice(buf.length - 20).toString('hex')}`;
+  }
+  return '';
+}
 
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
@@ -42,6 +69,8 @@ class PublishPort extends EventEmitter {
     this._rpcByConnection = new Map();
     this.rpc = this._isManager() ? null : this._getRpcFor(connection);
     this._listening = false; // ensure startListening is idempotent
+    this.nativeSessions = new Map();
+    this.handshakeTimeoutMs = parseInt(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10) || 10000;
     
     // Convert publishedPorts to a Map with configurations
     this.publishedPorts = new Map();
@@ -211,9 +240,11 @@ class PublishPort extends EventEmitter {
     const sessionId = toBufferView(sessionIdRaw);
     const portString = makeReadable(portStringRaw);
     const ref = toBufferView(refRaw);
-    const deviceId = `0x${toBufferView(deviceIdRaw).toString('hex')}`;
+    const deviceId = normalizeDeviceId(deviceIdRaw);
 
     logger.info(() => `Received portopen request for portString ${portString} with ref ${ref.toString('hex')} from device ${deviceId}`);
+
+    const isHandshake = typeof portString === 'string' && portString.includes('#hs');
 
     // Extract protocol and port number from portString
     var protocol = 'tcp';
@@ -252,13 +283,118 @@ class PublishPort extends EventEmitter {
     if (protocol === 'tcp') {
       this.handleTCPConnection(sessionId, ref, port, deviceId, connection);
     } else if (protocol === 'tls') {
-      this.handleTLSConnection(sessionId, ref, port, deviceId, connection);
+      if (isHandshake) {
+        this.handleTLSHandshake(sessionId, ref, port, deviceId, connection);
+      } else {
+        this.handleTLSConnection(sessionId, ref, port, deviceId, connection);
+      }
     } else if (protocol === 'udp') {
       this.handleUDPConnection(sessionId, ref, port, deviceId, connection);
     } else {
       logger.warn(() => `Unsupported protocol: ${protocol}`);
       rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`);
     }
+  }
+
+  handleTLSHandshake(sessionId, ref, port, deviceId, connection) {
+    const rpc = this._getRpcFor(connection);
+    rpc.sendResponse(sessionId, ref, 'ok');
+
+    const diodeSocket = new DiodeSocket(ref, rpc);
+    const certPem = connection.getDeviceCertificate();
+    if (!certPem) {
+      logger.error(() => 'No device certificate available for TLS handshake');
+      return;
+    }
+
+    const tlsOptions = {
+      cert: certPem,
+      key: certPem,
+      rejectUnauthorized: false,
+      ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384',
+      ecdhCurve: 'secp256k1',
+      minVersion: 'TLSv1.2',
+      maxVersion: 'TLSv1.2',
+    };
+
+    const tlsSocket = new tls.TLSSocket(diodeSocket, {
+      isServer: true,
+      ...tlsOptions,
+    });
+    tlsSocket.setNoDelay(true);
+
+    connection.addConnection(ref, {
+      diodeSocket,
+      tlsSocket,
+      protocol: 'tls',
+      port,
+      deviceId,
+      handshake: true,
+    });
+
+    (async () => {
+      let session = null;
+      try {
+        const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
+        session = this.nativeSessions.get(Number(peerMessage.physicalPort));
+        if (!session) {
+          throw new Error(`No native session for physical port ${peerMessage.physicalPort}`);
+        }
+
+        const verification = nativeCrypto.verifyHandshakeMessage(peerMessage, {
+          expectedRole: 'bind',
+          expectedDeviceId: session.deviceId,
+          expectedPhysicalPort: session.physicalPort,
+        });
+        if (!verification.ok) {
+          throw new Error(`Handshake verification failed: ${verification.reason}`);
+        }
+
+        const localDeviceId = connection.getEthereumAddress().toLowerCase();
+        const { message, privKey, nonce } = nativeCrypto.createHandshakeMessage({
+          role: 'publish',
+          deviceId: localDeviceId,
+          physicalPort: session.physicalPort,
+          privateKey: connection.getPrivateKey()
+        });
+
+        nativeCrypto.writeHandshakeMessage(tlsSocket, message);
+
+        session.session = nativeCrypto.deriveSessionKeys({
+          role: 'publish',
+          localDeviceId,
+          remoteDeviceId: verification.deviceId,
+          localEphPriv: privKey,
+          remoteEphPub: verification.ephPub,
+          localNonce: nonce,
+          remoteNonce: verification.nonce,
+          physicalPort: session.physicalPort,
+        });
+        session.ready = true;
+        if (session.timer) {
+          clearTimeout(session.timer);
+          session.timer = null;
+        }
+
+        if (session.localSocket && typeof session.localSocket.resume === 'function') {
+          session.localSocket.resume();
+        }
+
+        if (session.protocol === 'udp' && session.relaySocket && session.session) {
+          const probe = nativeCrypto.createUdpPacket(session.session, Buffer.alloc(0));
+          session.relaySocket.send(probe);
+        }
+      } catch (error) {
+        logger.error(() => `TLS handshake failed: ${error}`);
+        if (session) {
+          session.error = error;
+        }
+      } finally {
+        try { tlsSocket.end(); } catch {}
+        try { rpc.portClose(ref); } catch {}
+        try { connection.deleteConnection(ref); } catch {}
+      }
+    })();
   }
 
   handlePortOpen2(sessionIdRaw, messageContent, connection) {
@@ -274,7 +410,7 @@ class PublishPort extends EventEmitter {
     const physicalPort = parseUInt(physicalPortRaw);
     const physicalPortRef = Number.isFinite(physicalPort) ? physicalPort : physicalPortRaw;
     const flags = flagsRaw ? makeReadable(flagsRaw) : '';
-    const deviceId = sourceDeviceRaw ? `0x${toBufferView(sourceDeviceRaw).toString('hex')}` : '';
+    const deviceId = normalizeDeviceId(sourceDeviceRaw);
 
     logger.info(() => `Received portopen2 request for ${portName} on relay port ${physicalPort} from device ${deviceId}`);
 
@@ -329,15 +465,69 @@ class PublishPort extends EventEmitter {
       return;
     }
 
+    const existing = this.nativeSessions.get(physicalPort);
+    if (existing) {
+      this._cleanupNativeSession(existing);
+    }
+
+    const session = {
+      physicalPort,
+      port,
+      protocol,
+      deviceId: deviceId.toLowerCase(),
+      connection,
+      ready: false,
+      session: null,
+      relaySocket: null,
+      localSocket: null,
+      timer: null,
+    };
+    session.timer = setTimeout(() => {
+      if (!session.ready) {
+        logger.warn(() => `Handshake timeout for native session on physical port ${physicalPort}`);
+        this._cleanupNativeSession(session);
+      }
+    }, Math.max(15000, this.handshakeTimeoutMs * 2));
+
+    this.nativeSessions.set(physicalPort, session);
+
     if (protocol === 'udp') {
-      this.handleNativeUDPRelay(sessionId, physicalPortRef, physicalPort, port, deviceId, connection);
+      this.handleNativeUDPRelay(sessionId, physicalPortRef, session, connection);
     } else {
-      this.handleNativeTCPRelay(sessionId, physicalPortRef, physicalPort, port, deviceId, connection);
+      this.handleNativeTCPRelay(sessionId, physicalPortRef, session, connection);
     }
   }
 
-  handleNativeTCPRelay(sessionId, physicalPortRef, physicalPort, port, deviceId, connection) {
+  _cleanupNativeSession(session) {
+    if (!session) return;
+    if (session.timer) {
+      clearTimeout(session.timer);
+      session.timer = null;
+    }
+    if (session.relaySocket) {
+      try {
+        if (typeof session.relaySocket.close === 'function') {
+          session.relaySocket.close();
+        } else {
+          session.relaySocket.destroy();
+        }
+      } catch (_) {}
+    }
+    if (session.localSocket) {
+      try {
+        if (typeof session.localSocket.close === 'function') {
+          session.localSocket.close();
+        } else {
+          session.localSocket.destroy();
+        }
+      } catch (_) {}
+    }
+    this.nativeSessions.delete(session.physicalPort);
+  }
+
+  handleNativeTCPRelay(sessionId, physicalPortRef, session, connection) {
     const rpc = this._getRpcFor(connection);
+    const { physicalPort, port, deviceId } = session;
     let responded = false;
     const sendOk = () => {
       if (responded) return;
@@ -357,6 +547,10 @@ class PublishPort extends EventEmitter {
     const localSocket = net.connect({ port }, () => {
       localSocket.setNoDelay(true);
     });
+    localSocket.pause();
+
+    session.relaySocket = relaySocket;
+    session.localSocket = localSocket;
 
     let relayReady = false;
     let localReady = false;
@@ -378,6 +572,7 @@ class PublishPort extends EventEmitter {
     const cleanup = () => {
       if (!relaySocket.destroyed) relaySocket.destroy();
       if (!localSocket.destroyed) localSocket.destroy();
+      this._cleanupNativeSession(session);
     };
 
     relaySocket.on('error', (err) => {
@@ -394,11 +589,34 @@ class PublishPort extends EventEmitter {
     relaySocket.on('end', cleanup);
     localSocket.on('end', cleanup);
 
-    relaySocket.pipe(localSocket).pipe(relaySocket);
+    relaySocket.on('data', (data) => {
+      if (!session.ready || !session.session) return;
+      try {
+        const messages = nativeCrypto.consumeTcpFrames(session.session, data);
+        for (const msg of messages) {
+          localSocket.write(msg);
+        }
+      } catch (error) {
+        logger.error(() => `TCP decrypt error (${deviceId}): ${error}`);
+        cleanup();
+      }
+    });
+
+    localSocket.on('data', (data) => {
+      if (!session.ready || !session.session) return;
+      try {
+        const frame = nativeCrypto.createTcpFrame(session.session, data);
+        relaySocket.write(frame);
+      } catch (error) {
+        logger.error(() => `TCP encrypt error (${deviceId}): ${error}`);
+        cleanup();
+      }
+    });
   }
 
-  handleNativeUDPRelay(sessionId, physicalPortRef, physicalPort, port, deviceId, connection) {
+  handleNativeUDPRelay(sessionId, physicalPortRef, session, connection) {
     const rpc = this._getRpcFor(connection);
+    const { physicalPort, port, deviceId } = session;
     let responded = false;
     const sendOk = () => {
       if (responded) return;
@@ -423,10 +641,15 @@ class PublishPort extends EventEmitter {
     };
 
     relaySocket.on('message', (msg) => {
-      localSocket.send(msg);
+      if (!session.ready || !session.session) return;
+      const plaintext = nativeCrypto.parseUdpPacket(session.session, msg);
+      if (!plaintext) return;
+      localSocket.send(plaintext);
     });
     localSocket.on('message', (msg) => {
-      relaySocket.send(msg);
+      if (!session.ready || !session.session) return;
+      const packet = nativeCrypto.createUdpPacket(session.session, msg);
+      relaySocket.send(packet);
     });
 
     relaySocket.on('error', (err) => {
@@ -434,29 +657,28 @@ class PublishPort extends EventEmitter {
       sendError('Relay UDP error');
       try { relaySocket.close(); } catch {}
       try { localSocket.close(); } catch {}
+      this._cleanupNativeSession(session);
     });
     localSocket.on('error', (err) => {
       logger.error(() => `Local UDP service error (${deviceId}): ${err}`);
       sendError('Local UDP error');
       try { relaySocket.close(); } catch {}
       try { localSocket.close(); } catch {}
+      this._cleanupNativeSession(session);
     });
 
     const relayHost = connection.getServerRelayHost();
     relaySocket.connect(physicalPort, relayHost, () => {
       relayReady = true;
-      try {
-        // Send a small probe to register the relay mapping on the server
-        relaySocket.send(Buffer.from([0]));
-      } catch (error) {
-        logger.debug(() => `UDP relay probe failed: ${error.message || error}`);
-      }
       maybeReady();
     });
     localSocket.connect(port, '127.0.0.1', () => {
       localReady = true;
       maybeReady();
     });
+
+    session.relaySocket = relaySocket;
+    session.localSocket = localSocket;
   }
 
   setupLocalSocketHandlers(localSocket, ref, protocol, rpc, connection) {

@@ -1,11 +1,9 @@
 const { DiodeClientManager, BindPort } = require('../index');
 
 async function main() {
-    const host = 'us2.prenet.diode.io';
-    const port = 41046;
     const keyLocation = './db/keys.json';
   
-    const client = new DiodeClientManager({ host, port, keyLocation });
+    const client = new DiodeClientManager({ keyLocation });
     await client.connect();
   
     const portForward = new BindPort(client, {

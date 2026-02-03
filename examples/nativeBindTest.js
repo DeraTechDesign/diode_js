@@ -17,11 +17,9 @@ function printPublicKey(connection) {
 }
 
 async function main() {
-  const host = 'us2.prenet.diode.io';
-  const port = 41046;
   const keyLocation = './db/keys2.json';
 
-  const deviceIdHex = '0x4fdabf24e3ab9d2431e92016d50005f95117929d'; // Replace with actual device
+  const deviceIdHex = process.env.DIODE_TARGET_DEVICE || process.argv[2] || '0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c'; // Replace with actual device
 
   const client = new DiodeClientManager({keyLocation });
   await client.connect();

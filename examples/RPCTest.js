@@ -2,11 +2,9 @@ const { DiodeClientManager, DiodeRPC } = require('../index');
 const { makeReadable } = require('../utils');
 
 async function main() {
-  const host = 'us2.prenet.diode.io';
-  const port = 41046;
   const keyLocation = './db/keys.json';
 
-  const client = new DiodeClientManager({ host, port, keyLocation });
+  const client = new DiodeClientManager({ keyLocation });
   await client.connect();
   const [connection] = client.getConnections();
   if (!connection) {
