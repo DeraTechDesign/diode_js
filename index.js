@@ -1,5 +1,6 @@
 // index.js
 const DiodeConnection = require('./connection');
+const DiodeClientManager = require('./clientManager');
 const DiodeRPC = require('./rpc');
 const BindPort = require('./bindPort');
 const PublishPort = require('./publishPort');
@@ -11,4 +12,4 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   try { logger.error(() => `Uncaught exception: ${err.stack || err.message}`); } catch {}
 });
-module.exports = { DiodeConnection, DiodeRPC, BindPort , PublishPort, makeReadable, logger };
+module.exports = { DiodeConnection, DiodeClientManager, DiodeRPC, BindPort , PublishPort, makeReadable, logger };

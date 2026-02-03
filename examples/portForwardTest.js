@@ -1,14 +1,14 @@
-const { DiodeConnection, BindPort } = require('../index');
+const { DiodeClientManager, BindPort } = require('../index');
 
 async function main() {
     const host = 'us2.prenet.diode.io';
     const port = 41046;
     const keyLocation = './db/keys.json';
   
-    const connection = new DiodeConnection(host, port, keyLocation);
-    await connection.connect();
+    const client = new DiodeClientManager({ host, port, keyLocation });
+    await client.connect();
   
-    const portForward = new BindPort(connection, {
+    const portForward = new BindPort(client, {
         3003: { targetPort: 8080, deviceIdHex: "0xca1e71d8105a598810578fb6042fa8cbc1e7f039", protocol: "tcp" },
         3004: { targetPort: 8081, deviceIdHex: "5365baf29cb7ab58de588dfc448913cb609283e2", protocol: "tls" }
       });

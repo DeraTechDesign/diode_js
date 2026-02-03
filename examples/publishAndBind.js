@@ -1,19 +1,17 @@
-const DiodeConnection = require('../connection')
-const PublishPort = require('../publishPort')
-const BindPort = require('../bindPort')
+const { DiodeClientManager, PublishPort, BindPort } = require('../index')
 
 const host = 'us2.prenet.diode.io';
 const port = 41046;
 const keyLocation = './db/keys.json';
 
-const connection = new DiodeConnection(host, port, keyLocation);
+const client = new DiodeClientManager({ host, port, keyLocation });
 
 async function main() {
-    await connection.connect();
+    await client.connect();
     const publishedPorts = [8080]; // Ports you want to publish
-    const publishPort = new PublishPort(connection, publishedPorts);
+    const publishPort = new PublishPort(client, publishedPorts);
 
-    const portForward = new BindPort(connection, 3002, 8080, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    const portForward = new BindPort(client, 3002, 8080, "5365baf29cb7ab58de588dfc448913cb609283e2");
     portForward.bind();
 
 }
