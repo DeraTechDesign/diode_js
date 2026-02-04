@@ -85,6 +85,28 @@ function parseReason(reasonRaw) {
   }
 }
 
+function parseUInt(valueRaw) {
+  if (valueRaw === null || valueRaw === undefined) {
+    return null;
+  }
+  if (typeof valueRaw === 'number') {
+    return valueRaw;
+  }
+  if (typeof valueRaw === 'string') {
+    if (valueRaw.startsWith('0x')) {
+      return parseInt(valueRaw.slice(2), 16);
+    }
+    const parsed = Number(valueRaw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  if (Buffer.isBuffer(valueRaw) || valueRaw instanceof Uint8Array) {
+    const buffer = toBufferView(valueRaw);
+    if (buffer.length === 0) return 0;
+    return buffer.readUIntBE(0, buffer.length);
+  }
+  return null;
+}
+
 function generateCert(privateKeyObj, publicKeyObj) {
   // Generate a certificate valid for 1 month
   function formatDate(date) {
@@ -182,6 +204,7 @@ module.exports = {
   parseRequestId, 
   parseResponseType, 
   parseReason, 
+  parseUInt,
   generateCert, 
   loadOrGenerateKeyPair,
   ensureDirectoryExistence,

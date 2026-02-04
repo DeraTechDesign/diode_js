@@ -1,6 +1,85 @@
 //rpc.js
-const { makeReadable, parseRequestId, parseResponseType, parseReason, toBufferView } = require('./utils');
+const { makeReadable, parseRequestId, parseResponseType, parseReason, parseUInt, toBufferView } = require('./utils');
 const logger = require('./logger');
+
+function decodeToken(value) {
+    if (typeof value === 'string') return value;
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+      return toBufferView(value).toString('utf8');
+    }
+    return '';
+}
+
+function normalizeAddressParam(value) {
+    if (!value) return value;
+    if (Buffer.isBuffer(value)) return value;
+    if (value instanceof Uint8Array) return toBufferView(value);
+    if (typeof value === 'string') {
+      const hex = value.toLowerCase().startsWith('0x') ? value.slice(2) : value;
+      if (!hex) return Buffer.alloc(0);
+      return Buffer.from(hex, 'hex');
+    }
+    return value;
+}
+
+function parseDeviceTicketObject(obj) {
+    if (!Array.isArray(obj) || obj.length < 2) {
+      return null;
+    }
+    const objectType = decodeToken(obj[0]);
+    if (objectType !== 'ticket' && objectType !== 'ticketv2') {
+      return null;
+    }
+    const serverIdRaw = obj[1];
+    let serverId = null;
+    if (Buffer.isBuffer(serverIdRaw) || serverIdRaw instanceof Uint8Array) {
+      serverId = toBufferView(serverIdRaw);
+    } else if (typeof serverIdRaw === 'string') {
+      const hex = serverIdRaw.toLowerCase().startsWith('0x') ? serverIdRaw.slice(2) : serverIdRaw;
+      if (hex && /^[0-9a-f]+$/.test(hex)) {
+        serverId = Buffer.from(hex, 'hex');
+      }
+    }
+    const serverIdHex = serverId ? `0x${serverId.toString('hex')}` : '';
+
+    const ticket = {
+      objectType,
+      serverId,
+      serverIdHex,
+    };
+
+    if (objectType === 'ticketv2') {
+      ticket.chainId = parseUInt(obj[2]);
+      ticket.epoch = parseUInt(obj[3]);
+    } else {
+      ticket.blockNumber = parseUInt(obj[2]);
+    }
+
+    return ticket;
+}
+
+function parseServerObject(obj) {
+    if (!Array.isArray(obj) || obj.length < 4) {
+      return null;
+    }
+    const type = decodeToken(obj[0]);
+    if (type !== 'server') {
+      return null;
+    }
+
+    const hostRaw = obj[1];
+    const host = (Buffer.isBuffer(hostRaw) || hostRaw instanceof Uint8Array)
+      ? toBufferView(hostRaw).toString('utf8')
+      : (typeof hostRaw === 'string' ? hostRaw : '');
+    const edgePort = parseUInt(obj[2]);
+    const serverPort = parseUInt(obj[3]);
+
+    return {
+      host,
+      edgePort,
+      serverPort,
+    };
+}
 
 class DiodeRPC {
     constructor(connection) {
@@ -50,6 +129,30 @@ class DiodeRPC {
         return;
       });
     }
+
+    getObject(deviceId) {
+      const normalized = normalizeAddressParam(deviceId);
+      return this.connection.sendCommand(['getobject', normalized]).then((responseData) => {
+        const obj = responseData[0];
+        const parsed = parseDeviceTicketObject(obj);
+        return parsed || obj;
+      }).catch((error) => {
+        logger.error(() => `Error during get object: ${error}`);
+        return;
+      });
+    }
+
+    getNode(nodeId) {
+      const normalized = normalizeAddressParam(nodeId);
+      return this.connection.sendCommand(['getnode', normalized]).then((responseData) => {
+        const obj = responseData[0];
+        const parsed = parseServerObject(obj);
+        return parsed || obj;
+      }).catch((error) => {
+        logger.error(() => `Error during get node: ${error}`);
+        return;
+      });
+    }
   
     ping() {
       return this.connection.sendCommand(['ping']).then((responseData) => {
@@ -94,6 +197,27 @@ class DiodeRPC {
           }
         }).catch((error) => {
           logger.error(() => `Error during port open: ${error}`);
+          return;
+        });
+      }
+
+      portOpen2(deviceId, port, flags = 'rw') {
+        return this.connection.sendCommand(['portopen2', deviceId, port, flags]).then((responseData) => {
+          // responseData is [status, physicalPortOrReason]
+          const [statusRaw, portOrReasonRaw] = responseData;
+          const status = parseResponseType(statusRaw);
+  
+          if (status === 'ok') {
+            const physicalPort = parseUInt(portOrReasonRaw);
+            return physicalPort !== null ? physicalPort : portOrReasonRaw;
+          } else if (status === 'error') {
+            const reason = parseReason(portOrReasonRaw);
+            throw new Error(reason);
+          } else {
+            throw new Error(`Unknown status in response: '${status}'`);
+          }
+        }).catch((error) => {
+          logger.error(() => `Error during port open2: ${error}`);
           return;
         });
       }

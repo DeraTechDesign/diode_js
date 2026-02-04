@@ -3,7 +3,7 @@ const tls = require('tls');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
-const { makeReadable, parseRequestId, parseResponseType, parseReason, generateCert, ensureDirectoryExistence, loadOrGenerateKeyPair } = require('./utils');
+const { makeReadable, parseRequestId, parseResponseType, parseReason, parseUInt, generateCert, ensureDirectoryExistence, loadOrGenerateKeyPair, toBufferView } = require('./utils');
 const { Buffer } = require('buffer'); // Import Buffer
 const asn1 = require('asn1.js');
 const secp256k1 = require('secp256k1');
@@ -47,6 +47,7 @@ class DiodeConnection extends EventEmitter {
     this.connections = new Map(); // For PublishPort
     this.certPem = null;
     this._serverEthAddress = null; // cache after first read
+    this.localAddressProvider = null;
     // Load or generate keypair
     this.keyPair = loadOrGenerateKeyPair(this.keyLocation);
     
@@ -82,6 +83,12 @@ class DiodeConnection extends EventEmitter {
     
     // Log the ticket batching settings
     logger.info(() => `Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
+
+    // Handle server ticket requests on the API socket
+    this._onUnsolicited = (message) => {
+      this._handleUnsolicitedMessage(message);
+    };
+    this.on('unsolicited', this._onUnsolicited);
   }
 
   connect() {
@@ -106,17 +113,18 @@ class DiodeConnection extends EventEmitter {
       };
 
       this.socket = tls.connect(this.port, this.host, options, async () => {
-        logger.info(() => 'Connected to Diode.io server');
+        const relayHost = this.getServerRelayHost();
+        const relayPort = (this.socket && this.socket.remotePort) ? this.socket.remotePort : this.port;
+        logger.info(() => `Connected to Diode relay ${relayHost}:${relayPort}`);
         // Reset retry counter on successful connection
         this.retryCount = 0;
         // Set keep-alive to prevent connection timeout forever
         this.socket.setKeepAlive(true, 1500);
         this.socket.setNoDelay(true);
         // Cache server address after handshake
-        try {
-          this._serverEthAddress = this.getServerEthereumAddress();
-        } catch (e) {
-          logger.warn(() => `Failed caching server address: ${e}`);
+        const cachedServerAddress = await this._waitForServerEthereumAddress();
+        if (cachedServerAddress) {
+          this._serverEthAddress = cachedServerAddress;
         }
         // Start periodic ticket updates now that we are fully connected
         this._startTicketUpdateTimer();
@@ -269,6 +277,12 @@ class DiodeConnection extends EventEmitter {
     return this;
   }
 
+  // Optional provider for LocalAddr ticket hint (Buffer or string)
+  setLocalAddressProvider(provider) {
+    this.localAddressProvider = typeof provider === 'function' ? provider : null;
+    return this;
+  }
+
   // Update close method to prevent reconnection when intentionally closing
   close() {
     if (this.ticketUpdateTimer) {
@@ -382,6 +396,34 @@ class DiodeConnection extends EventEmitter {
     this.receiveBuffer = this.receiveBuffer.slice(offset);
   }
 
+  _handleUnsolicitedMessage(message) {
+    if (!Array.isArray(message) || message.length < 2) return;
+    const messageContent = message[1];
+    if (!Array.isArray(messageContent) || messageContent.length < 1) return;
+
+    const messageTypeRaw = messageContent[0];
+    const messageType = toBufferView(messageTypeRaw).toString('utf8');
+
+    if (messageType === 'ticket_request') {
+      const deviceUsageRaw = messageContent[1];
+      const deviceUsage = parseUInt(deviceUsageRaw);
+      if (typeof deviceUsage === 'number' && deviceUsage > this.totalBytes) {
+        this.totalBytes = deviceUsage;
+      }
+
+      // Send a fresh ticket promptly to avoid disconnect
+      this.createTicketCommand()
+        .then((ticketCommand) => this.sendCommand(ticketCommand))
+        .then(() => {
+          this.accumulatedBytes = 0;
+          this.lastTicketUpdate = Date.now();
+        })
+        .catch((error) => {
+          logger.error(() => `Error handling ticket_request: ${error}`);
+        });
+    }
+  }
+
   fixResponse(response) {
     /* response is : 
     [
@@ -474,14 +516,18 @@ class DiodeConnection extends EventEmitter {
     }
   }
   
-  getServerEthereumAddress() {
+  getServerEthereumAddress(quiet = false) {
     try {
       if (this._serverEthAddress) {
         return this._serverEthAddress;
       }
       const serverCert = this.socket.getPeerCertificate(true);
       if (!serverCert.raw) {
-        throw new Error('Failed to get server certificate.');
+        const err = new Error('Failed to get server certificate.');
+        if (!quiet) {
+          throw err;
+        }
+        return null;
       }
 
       const publicKeyBuffer = Buffer.isBuffer(serverCert.pubkey)
@@ -495,9 +541,40 @@ class DiodeConnection extends EventEmitter {
       this._serverEthAddress = address;
       return this._serverEthAddress;
     } catch (error) {
-      logger.error(() => `Error extracting server Ethereum address: ${error}`);
-      throw error;
+      if (!quiet) {
+        logger.error(() => `Error extracting server Ethereum address: ${error}`);
+        throw error;
+      }
+      return null;
     }
+  }
+
+  getServerRelayHost() {
+    if (this.socket && this.socket.remoteAddress) {
+      const address = this.socket.remoteAddress;
+      if (address.startsWith('::ffff:')) {
+        return address.slice(7);
+      }
+      if (address.includes(':')) {
+        return this.host;
+      }
+      return address;
+    }
+    return this.host;
+  }
+
+  async _waitForServerEthereumAddress(options = {}) {
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 2000;
+    const intervalMs = Number.isFinite(options.intervalMs) ? options.intervalMs : 50;
+    const start = Date.now();
+    let address = this.getServerEthereumAddress(true);
+    if (address) return address;
+    while (Date.now() - start < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      address = this.getServerEthereumAddress(true);
+      if (address) return address;
+    }
+    return null;
   }
 
   // Method to extract private key bytes from keyPair
@@ -517,8 +594,10 @@ class DiodeConnection extends EventEmitter {
     const chainId = 1284;
     const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
   
-    // Hash of localAddress (empty string)
-    const localAddressHash = crypto.createHash('sha256').update(Buffer.from(localAddress, 'utf8')).digest();
+    const localAddressBytes = Buffer.isBuffer(localAddress) || localAddress instanceof Uint8Array
+      ? toBufferView(localAddress)
+      : Buffer.from(localAddress || '', 'utf8');
+    const localAddressHash = crypto.createHash('sha256').update(localAddressBytes).digest();
   
     // Data to sign
     const dataToSign = [
@@ -559,7 +638,18 @@ class DiodeConnection extends EventEmitter {
   async createTicketCommand() {
     const chainId = 1284;
     const fleetContract = ethUtil.toBuffer('0x6000000000000000000000000000000000000000')
-    const localAddress = 'test2'; // Always empty string
+    let localAddress = '';
+    if (typeof this.localAddressProvider === 'function') {
+      try {
+        localAddress = this.localAddressProvider();
+      } catch (error) {
+        logger.warn(() => `Failed to get local address hint: ${error}`);
+        localAddress = '';
+      }
+    }
+    if (localAddress === null || localAddress === undefined) {
+      localAddress = '';
+    }
   
     // Increment totalConnections
     this.totalConnections += 1;
@@ -569,7 +659,10 @@ class DiodeConnection extends EventEmitter {
     const totalBytes = this.totalBytes;
   
     // Get server Ethereum address as Buffer
-    const serverIdBuffer = this.getServerEthereumAddress();
+    const serverIdBuffer = await this._waitForServerEthereumAddress();
+    if (!serverIdBuffer) {
+      throw new Error('Failed to get server certificate.');
+    }
 
     // Get epoch
     const epoch = await this.RPC.getEpoch();

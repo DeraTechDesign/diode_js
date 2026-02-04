@@ -1,14 +1,16 @@
-const { DiodeConnection, DiodeRPC } = require('../index');
+const { DiodeClientManager, DiodeRPC } = require('../index');
 const { makeReadable } = require('../utils');
 
 async function main() {
-  const host = 'us2.prenet.diode.io';
-  const port = 41046;
   const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, keyLocation);
-  await connection.connect();
-  const rpc = connection.RPC;
+  const client = new DiodeClientManager({ keyLocation });
+  await client.connect();
+  const [connection] = client.getConnections();
+  if (!connection) {
+    throw new Error('No relay connection available');
+  }
+  const rpc = connection.RPC || new DiodeRPC(connection);
 
   try {
     const address = connection.getEthereumAddress();
@@ -22,7 +24,7 @@ async function main() {
   } catch (error) {
     console.error('RPC Error:', error);
   } finally {
-    connection.close();
+    client.close();
   }
 }
 

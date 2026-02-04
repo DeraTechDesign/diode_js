@@ -1,17 +1,15 @@
 // example.js
 
-const { DiodeConnection, PublishPort } = require('../index');
+const { DiodeClientManager, PublishPort } = require('../index');
 
 async function startPublishing() {
-  const host = 'us2.prenet.diode.io';
-  const port = 41046;
   const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, keyLocation);
-  await connection.connect();
+  const client = new DiodeClientManager({ keyLocation });
+  await client.connect();
 
   // Create a PublishPort instance with initial ports
-  const publishPort = new PublishPort(connection, {
+  const publishPort = new PublishPort(client, {
     3000: { mode: 'public' },
     8080: { 
       mode: 'private',

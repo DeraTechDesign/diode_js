@@ -50,6 +50,36 @@ connection.setReconnectOptions({
 });
 ```
 
+### Multi-Relay Connections (Recommended)
+
+You can connect to multiple Diode relays and automatically route binds to the relay where the target device is connected.
+
+```javascript
+const { DiodeClientManager, BindPort } = require('diodejs');
+
+async function main() {
+  // Connect to default relay pool (pre-net defaults)
+  const client = new DiodeClientManager({ keyLocation: './db/keys.json' });
+  await client.connect();
+
+  const bind = new BindPort(client, {
+    3003: { targetPort: 8080, deviceIdHex: '0x...', protocol: 'tcp' }
+  });
+  bind.bind();
+}
+```
+
+If you provide a host, only that relay is used initially (similar to `-diodeaddrs`):
+
+```javascript
+const client = new DiodeClientManager({
+  host: 'us2.prenet.diode.io',
+  port: 41046,
+  keyLocation: './db/keys.json'
+});
+await client.connect();
+```
+
 ### Test RPC
 
 Here's a quick example to get you started with RPC functions using `DiodeRPC` Class
@@ -133,7 +163,8 @@ async function main() {
       3003: { 
         targetPort: 443, 
         deviceIdHex: "0x5365baf29cb7ab58de588dfc448913cb609283e2",
-        protocol: "tcp" // Can be "tls", "tcp", or "udp"
+        protocol: "tcp", // Can be "tls", "tcp", or "udp"
+        transport: "native" // Optional - "api" (default) or "native" for portopen2 (tcp/udp only)
       }
     };
     
@@ -235,6 +266,21 @@ main();
   - `reconnected`: Emitted when reconnection is successful
   - `reconnect_failed`: Emitted when all reconnection attempts have failed
 
+#### `DiodeClientManager`
+
+- **Constructor**: `new DiodeClientManager(options)`
+  - `options.host` (string, optional): Single relay host (with or without port). If provided, only this relay is used initially.
+  - `options.port` (number, optional): Port to use when `options.host` has no port. Defaults to `41046`.
+  - `options.hosts` (string[] or comma-separated string, optional): Explicit relay list.
+  - `options.keyLocation` (string, optional): Key storage path (default: `./db/keys.json`).
+  - `options.deviceCacheTtlMs` (number, optional): Cache TTL for device relay resolution (default: `30000`).
+
+- **Methods**:
+  - `connect()`: Connects to the initial relay pool. Returns a promise.
+  - `getConnectionForDevice(deviceId)`: Resolves and returns a relay connection for the device. Returns a promise.
+  - `getConnections()`: Returns a list of active connections.
+  - `close()`: Closes all managed connections.
+
 #### `DiodeRPC`
 
 - **Constructor**: `new DiodeRPC(connection)`
@@ -244,8 +290,11 @@ main();
   - `getBlockPeak()`: Retrieves the current block peak. Returns a promise.
   - `getBlockHeader(index)`: Retrieves the block header for a given index. Returns a promise.
   - `getBlock(index)`: Retrieves the block for a given index. Returns a promise.
+  - `getObject(deviceId)`: Retrieves a device ticket object. Returns a promise.
+  - `getNode(nodeId)`: Retrieves relay node information. Returns a promise.
   - `ping()`: Sends a ping command. Returns a promise.
   - `portOpen(deviceId, port, flags)`: Opens a port on the device. Returns a promise.
+  - `portOpen2(deviceId, port, flags)`: Opens a native relay port on the device (TCP/UDP). Returns the server relay port.
   - `portSend(ref, data)`: Sends data to the device. Returns a promise.
   - `portClose(ref)`: Closes a port on the device. Returns a promise.
   - `sendError(sessionId, ref, error)`: Sends an error response. Returns a promise.
@@ -259,23 +308,25 @@ main();
   
   Legacy Constructor:
   - `new BindPort(connection, localPort, targetPort, deviceIdHex)`
-    - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+    - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
     - `localPort` (number): The local port to bind.
     - `targetPort` (number): The target port on the device.
     - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
   
   New Constructor:
   - `new BindPort(connection, portsConfig)`
-    - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+    - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
     - `portsConfig` (object): A configuration object where keys are local ports and values are objects with:
       - `targetPort` (number): The target port on the device.
       - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
       - `protocol` (string, optional): The protocol to use ("tls", "tcp", or "udp"). Defaults to "tls".
+      - `transport` (string, optional): The relay transport to use ("api" or "native"). Defaults to "api". Native uses `portopen2` and supports TCP/UDP only.
 
 - **Methods**:
   - `bind()`: Binds all configured local ports to their target ports on the devices.
-  - `addPort(localPort, targetPort, deviceIdHex, protocol)`: Adds a new port binding configuration.
+  - `addPort(localPort, targetPort, deviceIdHex, protocol, transport)`: Adds a new port binding configuration.
     - `protocol` (string, optional): The protocol to use. Can be "tls", "tcp", or "udp". Defaults to "tls".
+    - `transport` (string, optional): The relay transport to use ("api" or "native"). Defaults to "api".
   - `removePort(localPort)`: Removes a port binding configuration.
   - `bindSinglePort(localPort)`: Binds a single local port to its target.
   - `closeAllServers()`: Closes all active server instances.
@@ -283,7 +334,7 @@ main();
 #### `PublishPort`
 
 - **Constructor**: `new PublishPort(connection, publishedPorts, _certPath)`
-  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+  - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
   - `publishedPorts` (array|object): Either:
     - An array of ports to publish (all public mode)
     - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'] } }`
