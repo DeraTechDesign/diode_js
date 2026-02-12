@@ -38,16 +38,30 @@ DIODE_TICKET_BYTES_THRESHOLD=512000
 DIODE_TICKET_UPDATE_INTERVAL=30000
 ```
 
-These settings can also be configured programmatically:
+These settings can also be configured programmatically on the relay connections managed by `DiodeClientManager`:
 ```javascript
-connection.setReconnectOptions({
-  maxRetries: 10,
-  retryDelay: 2000,
-  maxRetryDelay: 20000,
-  autoReconnect: true,
-  ticketBytesThreshold: 512000,
-  ticketUpdateInterval: 30000
-});
+const { DiodeClientManager } = require('diodejs');
+
+async function main() {
+  const client = new DiodeClientManager({ keyLocation: './db/keys.json' });
+  await client.connect();
+
+  for (const connection of client.getConnections()) {
+    connection.setReconnectOptions({
+      maxRetries: 10,
+      retryDelay: 2000,
+      maxRetryDelay: 20000,
+      autoReconnect: true
+    });
+
+    connection.setTicketBatchingOptions({
+      threshold: 512000,
+      interval: 30000
+    });
+  }
+}
+
+main();
 ```
 
 ### Multi-Relay Connections (Recommended)
@@ -85,25 +99,35 @@ await client.connect();
 Here's a quick example to get you started with RPC functions using `DiodeRPC` Class
 
 ```javascript
-const { DiodeConnection, DiodeRPC, makeReadable } = require('diodejs');
+const { DiodeClientManager, DiodeRPC, makeReadable } = require('diodejs');
 
 async function main() {
   const host = 'eu2.prenet.diode.io';
   const port = 41046;
   const keyLocation = './db/keys.json'; // Optional, defaults to './db/keys.json'
 
-  const connection = new DiodeConnection(host, port, keyLocation);
-  
+  const client = new DiodeClientManager({ host, port, keyLocation });
+  await client.connect();
+
+  const connection = client.getConnections()[0];
+  if (!connection) {
+    throw new Error('No relay connection available');
+  }
+
   // Configure reconnection (optional - overrides environment variables)
   connection.setReconnectOptions({
     maxRetries: Infinity, // Unlimited reconnection attempts
     retryDelay: 1000,     // Initial delay of 1 second
     maxRetryDelay: 30000, // Maximum delay of 30 seconds
-    autoReconnect: true,  // Automatically reconnect on disconnection
-    ticketBytesThreshold: 512000, // Bytes threshold for ticket updates
-    ticketUpdateInterval: 30000   // Time interval for ticket updates
+    autoReconnect: true   // Automatically reconnect on disconnection
   });
-  
+
+  // Configure ticket batching (optional - overrides environment variables)
+  connection.setTicketBatchingOptions({
+    threshold: 512000, // Bytes threshold for ticket updates
+    interval: 30000    // Time interval for ticket updates
+  });
+
   // Listen for reconnection events (optional)
   connection.on('reconnecting', (info) => {
     console.log(`Reconnecting... Attempt #${info.attempt} in ${info.delay}ms`);
@@ -114,8 +138,6 @@ async function main() {
   connection.on('reconnect_failed', () => {
     console.log('Failed to reconnect after maximum attempts');
   });
-  
-  await connection.connect();
 
   const rpc = new DiodeRPC(connection);
 
@@ -130,7 +152,7 @@ async function main() {
   } catch (error) {
     console.error('RPC Error:', error);
   } finally {
-    connection.close();
+    client.close();
   }
 }
 
@@ -143,15 +165,15 @@ Here's a quick example to get you started with port forwarding using the `BindPo
 
 #### Port Binding
 ```javascript
-const { DiodeConnection, BindPort } = require('diodejs');
+const { DiodeClientManager, BindPort } = require('diodejs');
 
 async function main() {
     const host = 'eu2.prenet.diode.io';
     const port = 41046;
     const keyLocation = './db/keys.json';
   
-    const connection = new DiodeConnection(host, port, keyLocation);
-    await connection.connect();
+    const client = new DiodeClientManager({ host, port, keyLocation });
+    await client.connect();
   
     // Multiple or single port binding with configuration object
     const portsConfig = {
@@ -168,7 +190,7 @@ async function main() {
       }
     };
     
-    const portForward = new BindPort(connection, portsConfig);
+    const portForward = new BindPort(client, portsConfig);
     portForward.bind();
     
     // You can also dynamically add ports with protocol specification
@@ -181,18 +203,18 @@ main();
 
 #### Single Port Binding (Legacy)
 ```javascript
-const { DiodeConnection, BindPort } = require('diodejs');
+const { DiodeClientManager, BindPort } = require('diodejs');
 
 async function main() {
     const host = 'eu2.prenet.diode.io';
     const port = 41046;
     const keyLocation = './db/keys.json';
   
-    const connection = new DiodeConnection(host, port, keyLocation);
-    await connection.connect();
+    const client = new DiodeClientManager({ host, port, keyLocation });
+    await client.connect();
   
     // Legacy method - single port binding (defaults to TLS protocol)
-    const portForward = new BindPort(connection, 3002, 80, "5365baf29cb7ab58de588dfc448913cb609283e2");
+    const portForward = new BindPort(client, 3002, 80, "5365baf29cb7ab58de588dfc448913cb609283e2");
     portForward.bind();
 }
 
@@ -204,15 +226,15 @@ main();
 Here's a quick example to get you started with publishing ports using the `PublishPort` class:
 
 ```javascript
-const { DiodeConnection, PublishPort } = require('diodejs');
+const { DiodeClientManager, PublishPort } = require('diodejs');
 
 async function main() {
   const host = 'us2.prenet.diode.io';
   const port = 41046;
   const keyLocation = './db/keys.json';
 
-  const connection = new DiodeConnection(host, port, keyLocation);
-  await connection.connect();
+  const client = new DiodeClientManager({ host, port, keyLocation });
+  await client.connect();
 
   // Option 1: Simple array of ports (all public)
   const publishedPorts = [8080, 3000]; 
@@ -227,7 +249,7 @@ async function main() {
   };
   
   // certPath parameter is maintained for backward compatibility but not required
-  const publishPort = new PublishPort(connection, publishedPortsWithConfig);
+  const publishPort = new PublishPort(client, publishedPortsWithConfig);
 }
 
 main();
@@ -236,35 +258,6 @@ main();
 ## Reference
 
 ### Classes and Methods
-
-#### `DiodeConnection`
-
-- **Constructor**: `new DiodeConnection(host, port, keyLocation)`
-  - `host` (string): The host address of the Diode server.
-  - `port` (number): The port number of the Diode server.
-  - `keyLocation` (string)(default: './db/keys.json'): The path to the key storage file. If the file doesn't exist, keys are generated automatically.
-
-- **Methods**:
-  - `connect()`: Connects to the Diode server. Returns a promise.
-  - `sendCommand(commandArray)`: Sends a command to the Diode server. Returns a promise.
-  - `sendCommandWithSessionId(commandArray, sessionId)`: Sends a command with a session ID. Returns a promise.
-  - `getEthereumAddress()`: Returns the Ethereum address derived from the device keys.
-  - `getServerEthereumAddress()`: Returns the Ethereum address of the server.
-  - `createTicketCommand()`: Creates a ticket command for authentication. Returns a promise.
-  - `close()`: Closes the connection to the Diode server.
-  - `getDeviceCertificate()`: Returns the generated certificate PEM.
-  - `setReconnectOptions(options)`: Configures reconnection behavior with the following options:
-    - `maxRetries` (number): Maximum reconnection attempts (default: Infinity)
-    - `retryDelay` (number): Initial delay between retries in ms (default: 1000)
-    - `maxRetryDelay` (number): Maximum delay between retries in ms (default: 30000)
-    - `autoReconnect` (boolean): Whether to automatically reconnect on disconnection (default: true)
-    - `ticketBytesThreshold` (number): Bytes threshold for ticket updates (default: 512000)
-    - `ticketUpdateInterval` (number): Time interval for ticket updates in ms (default: 30000)
-
-- **Events**:
-  - `reconnecting`: Emitted when a reconnection attempt is about to start, with `attempt` and `delay` information
-  - `reconnected`: Emitted when reconnection is successful
-  - `reconnect_failed`: Emitted when all reconnection attempts have failed
 
 #### `DiodeClientManager`
 
@@ -281,10 +274,12 @@ main();
   - `getConnections()`: Returns a list of active connections.
   - `close()`: Closes all managed connections.
 
+Connections returned by `getConnections()` or `getConnectionForDevice()` emit `reconnecting`, `reconnected`, and `reconnect_failed` events, and support `setReconnectOptions(...)` and `setTicketBatchingOptions({ threshold, interval })`.
+
 #### `DiodeRPC`
 
 - **Constructor**: `new DiodeRPC(connection)`
-  - `connection` (DiodeConnection): An instance of `DiodeConnection`.
+  - `connection` (object): A relay connection from `DiodeClientManager.getConnections()` or `DiodeClientManager.getConnectionForDevice()`.
 
 - **Methods**:
   - `getBlockPeak()`: Retrieves the current block peak. Returns a promise.
@@ -308,14 +303,14 @@ main();
   
   Legacy Constructor:
   - `new BindPort(connection, localPort, targetPort, deviceIdHex)`
-    - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
+    - `connection` (DiodeClientManager): An instance of `DiodeClientManager`.
     - `localPort` (number): The local port to bind.
     - `targetPort` (number): The target port on the device.
     - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
   
   New Constructor:
   - `new BindPort(connection, portsConfig)`
-    - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
+    - `connection` (DiodeClientManager): An instance of `DiodeClientManager`.
     - `portsConfig` (object): A configuration object where keys are local ports and values are objects with:
       - `targetPort` (number): The target port on the device.
       - `deviceIdHex` (string): The device ID in hexadecimal format (with or without '0x' prefix).
@@ -334,7 +329,7 @@ main();
 #### `PublishPort`
 
 - **Constructor**: `new PublishPort(connection, publishedPorts, _certPath)`
-  - `connection` (DiodeConnection|DiodeClientManager): An instance of `DiodeConnection` or `DiodeClientManager`.
+  - `connection` (DiodeClientManager): An instance of `DiodeClientManager`.
   - `publishedPorts` (array|object): Either:
     - An array of ports to publish (all public mode)
     - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'] } }`
