@@ -1,0 +1,557 @@
+{
+  "generatedAt": "2026-03-06T13:43:50.937Z",
+  "baselineCommit": "a2a3ee05661e5e838a3d8db865f6f0c84e762f92",
+  "tempRoot": "C:\\Users\\4ever\\AppData\\Local\\Temp\\diode-relay-bench-3EImW8",
+  "providerFile": null,
+  "providerCandidatesLoaded": 0,
+  "networkDiscoveryMode": "snapshot",
+  "networkDiscoverySnapshot": "C:\\Users\\4ever\\Documents\\GitHub\\diode_js\\reports\\dio-network-snapshot.json",
+  "summary": {
+    "oldAvgConnectMs": 2174.04,
+    "currentAvgConnectMs": 4679.16,
+    "oldAvgSelectedPingMs": 187.09,
+    "currentAvgSelectedPingMs": 27.64,
+    "oldAvgBestConnectedPingMs": 13.88,
+    "currentAvgBestConnectedPingMs": 27.64,
+    "oldAvgGapToBestMs": 173.22,
+    "currentAvgGapToBestMs": 0,
+    "oldAvgDeviceResolutionMs": 192.07,
+    "currentAvgDeviceResolutionMs": 149.08
+  },
+  "trials": [
+    {
+      "phase": "cold",
+      "old": {
+        "ok": true,
+        "connectMs": 2373.4743,
+        "startupConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "warmedConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "selectedHost": "as2.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "as1.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 185.70230000000024,
+        "bestConnectedHost": "eu1.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 13.826000000000022,
+        "gapToBestMs": 171.8763000000002,
+        "pingStats": {
+          "as1.prenet.diode.io:41046": {
+            "samplesMs": [
+              268.9998999999998,
+              271.54320000000007,
+              288.0479999999998
+            ],
+            "avgMs": 276.1970333333332,
+            "minMs": 268.9998999999998,
+            "maxMs": 288.0479999999998
+          },
+          "as2.prenet.diode.io:41046": {
+            "samplesMs": [
+              181.57700000000023,
+              187.0012000000006,
+              188.52869999999984
+            ],
+            "avgMs": 185.70230000000024,
+            "minMs": 181.57700000000023,
+            "maxMs": 188.52869999999984
+          },
+          "us1.prenet.diode.io:41046": {
+            "samplesMs": [
+              186.08759999999984,
+              318.4843000000001,
+              203.90400000000045
+            ],
+            "avgMs": 236.15863333333346,
+            "minMs": 186.08759999999984,
+            "maxMs": 318.4843000000001
+          },
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              114.70010000000002,
+              114.8146999999999,
+              114.57470000000012
+            ],
+            "avgMs": 114.69650000000001,
+            "minMs": 114.57470000000012,
+            "maxMs": 114.8146999999999
+          },
+          "eu1.prenet.diode.io:41046": {
+            "samplesMs": [
+              12.728500000000167,
+              16.840000000000146,
+              11.909499999999753
+            ],
+            "avgMs": 13.826000000000022,
+            "minMs": 11.909499999999753,
+            "maxMs": 16.840000000000146
+          },
+          "eu2.prenet.diode.io:41046": {
+            "samplesMs": [
+              19.33929999999964,
+              16.319300000000112,
+              45.802999999999884
+            ],
+            "avgMs": 27.153866666666545,
+            "minMs": 16.319300000000112,
+            "maxMs": 45.802999999999884
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 198.6206000000002
+        },
+        "networkDiscoveryStats": null
+      },
+      "current": {
+        "ok": true,
+        "connectMs": 4398.4625,
+        "startupConnections": [
+          "us2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "warmedConnections": [
+          "us2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "selectedHost": "eu2.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "eu2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 45.33423333333303,
+        "bestConnectedHost": "eu2.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 45.33423333333303,
+        "gapToBestMs": 0,
+        "pingStats": {
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              116.90220000000045,
+              140.1243999999988,
+              121.9339
+            ],
+            "avgMs": 126.32016666666641,
+            "minMs": 116.90220000000045,
+            "maxMs": 140.1243999999988
+          },
+          "eu2.prenet.diode.io:41046": {
+            "samplesMs": [
+              25.830999999998312,
+              83.47150000000147,
+              26.700199999999313
+            ],
+            "avgMs": 45.33423333333303,
+            "minMs": 25.830999999998312,
+            "maxMs": 83.47150000000147
+          },
+          "144.126.157.138:41046": {
+            "samplesMs": [
+              136.97400000000016,
+              122.40800000000127,
+              133.6808000000001
+            ],
+            "avgMs": 131.02093333333383,
+            "minMs": 122.40800000000127,
+            "maxMs": 136.97400000000016
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 396.59089999999924
+        },
+        "networkDiscoveryStats": {
+          "loadedCount": 2,
+          "usableCount": 2,
+          "filteredCount": 0,
+          "startupProbeCount": 2
+        }
+      }
+    },
+    {
+      "phase": "warm-1",
+      "old": {
+        "ok": true,
+        "connectMs": 1968.586299999999,
+        "startupConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "warmedConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "selectedHost": "as2.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "as1.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 188.89086666666603,
+        "bestConnectedHost": "eu1.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 15.757599999999607,
+        "gapToBestMs": 173.13326666666643,
+        "pingStats": {
+          "as1.prenet.diode.io:41046": {
+            "samplesMs": [
+              250.55559999999969,
+              258.1193000000021,
+              256.5037000000011
+            ],
+            "avgMs": 255.05953333333431,
+            "minMs": 250.55559999999969,
+            "maxMs": 258.1193000000021
+          },
+          "as2.prenet.diode.io:41046": {
+            "samplesMs": [
+              181.6925999999985,
+              198.91009999999733,
+              186.06990000000224
+            ],
+            "avgMs": 188.89086666666603,
+            "minMs": 181.6925999999985,
+            "maxMs": 198.91009999999733
+          },
+          "us1.prenet.diode.io:41046": {
+            "samplesMs": [
+              145.68399999999747,
+              144.67280000000028,
+              145.48210000000108
+            ],
+            "avgMs": 145.27963333333295,
+            "minMs": 144.67280000000028,
+            "maxMs": 145.68399999999747
+          },
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              126.07579999999871,
+              109.96600000000035,
+              112.73779999999897
+            ],
+            "avgMs": 116.25986666666601,
+            "minMs": 109.96600000000035,
+            "maxMs": 126.07579999999871
+          },
+          "eu1.prenet.diode.io:41046": {
+            "samplesMs": [
+              15.473799999999756,
+              18.69919999999911,
+              13.09979999999996
+            ],
+            "avgMs": 15.757599999999607,
+            "minMs": 13.09979999999996,
+            "maxMs": 18.69919999999911
+          },
+          "eu2.prenet.diode.io:41046": {
+            "samplesMs": [
+              43.41840000000229,
+              16.45509999999922,
+              22.955300000001444
+            ],
+            "avgMs": 27.609600000000984,
+            "minMs": 16.45509999999922,
+            "maxMs": 43.41840000000229
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 186.71600000000035
+        },
+        "networkDiscoveryStats": null
+      },
+      "current": {
+        "ok": true,
+        "connectMs": 4748.18,
+        "startupConnections": [
+          "eu1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "warmedConnections": [
+          "eu1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "selectedHost": "eu1.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 11.867166666668103,
+        "bestConnectedHost": "eu1.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 11.867166666668103,
+        "gapToBestMs": 0,
+        "pingStats": {
+          "eu1.prenet.diode.io:41046": {
+            "samplesMs": [
+              14.18380000000252,
+              11.186600000000908,
+              10.231100000000879
+            ],
+            "avgMs": 11.867166666668103,
+            "minMs": 10.231100000000879,
+            "maxMs": 14.18380000000252
+          },
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              114.05100000000311,
+              113.24259999999776,
+              117.58909999999742
+            ],
+            "avgMs": 114.96089999999943,
+            "minMs": 113.24259999999776,
+            "maxMs": 117.58909999999742
+          },
+          "144.126.157.138:41046": {
+            "samplesMs": [
+              107.21080000000075,
+              148.42529999999897,
+              108.57499999999709
+            ],
+            "avgMs": 121.40369999999893,
+            "minMs": 107.21080000000075,
+            "maxMs": 148.42529999999897
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 25.77520000000004
+        },
+        "networkDiscoveryStats": {
+          "loadedCount": 2,
+          "usableCount": 2,
+          "filteredCount": 0,
+          "startupProbeCount": 2
+        }
+      }
+    },
+    {
+      "phase": "warm-2",
+      "old": {
+        "ok": true,
+        "connectMs": 2180.0699000000022,
+        "startupConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "warmedConnections": [
+          "as1.prenet.diode.io:41046",
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046"
+        ],
+        "selectedHost": "as2.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "as2.prenet.diode.io:41046",
+          "us1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu2.prenet.diode.io:41046",
+          "as1.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 186.6905000000006,
+        "bestConnectedHost": "eu1.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 12.044833333333372,
+        "gapToBestMs": 174.64566666666724,
+        "pingStats": {
+          "as1.prenet.diode.io:41046": {
+            "samplesMs": [
+              271.16820000000007,
+              261.64760000000024,
+              263.16259999999966
+            ],
+            "avgMs": 265.3261333333333,
+            "minMs": 261.64760000000024,
+            "maxMs": 271.16820000000007
+          },
+          "as2.prenet.diode.io:41046": {
+            "samplesMs": [
+              184.47130000000107,
+              189.26440000000002,
+              186.33580000000075
+            ],
+            "avgMs": 186.6905000000006,
+            "minMs": 184.47130000000107,
+            "maxMs": 189.26440000000002
+          },
+          "us1.prenet.diode.io:41046": {
+            "samplesMs": [
+              147.31129999999757,
+              153.13070000000153,
+              194.96539999999732
+            ],
+            "avgMs": 165.1357999999988,
+            "minMs": 147.31129999999757,
+            "maxMs": 194.96539999999732
+          },
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              110.43549999999959,
+              114.34350000000268,
+              105.29110000000219
+            ],
+            "avgMs": 110.02336666666815,
+            "minMs": 105.29110000000219,
+            "maxMs": 114.34350000000268
+          },
+          "eu1.prenet.diode.io:41046": {
+            "samplesMs": [
+              16.47269999999844,
+              9.544000000001688,
+              10.117799999999988
+            ],
+            "avgMs": 12.044833333333372,
+            "minMs": 9.544000000001688,
+            "maxMs": 16.47269999999844
+          },
+          "eu2.prenet.diode.io:41046": {
+            "samplesMs": [
+              24.979699999996228,
+              27.80859999999666,
+              71.06710000000021
+            ],
+            "avgMs": 41.28513333333103,
+            "minMs": 24.979699999996228,
+            "maxMs": 71.06710000000021
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 190.8744000000006
+        },
+        "networkDiscoveryStats": null
+      },
+      "current": {
+        "ok": true,
+        "connectMs": 4890.843800000002,
+        "startupConnections": [
+          "eu1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "warmedConnections": [
+          "eu1.prenet.diode.io:41046",
+          "us2.prenet.diode.io:41046",
+          "144.126.157.138:41046"
+        ],
+        "selectedHost": "eu1.prenet.diode.io:41046",
+        "selectedSource": "seed",
+        "selectionSequence": [
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046",
+          "eu1.prenet.diode.io:41046"
+        ],
+        "selectedPingAvgMs": 25.714699999999237,
+        "bestConnectedHost": "eu1.prenet.diode.io:41046",
+        "bestConnectedPingAvgMs": 25.714699999999237,
+        "gapToBestMs": 0,
+        "pingStats": {
+          "eu1.prenet.diode.io:41046": {
+            "samplesMs": [
+              37.5454000000027,
+              22.425499999997555,
+              17.17319999999745
+            ],
+            "avgMs": 25.714699999999237,
+            "minMs": 17.17319999999745,
+            "maxMs": 37.5454000000027
+          },
+          "us2.prenet.diode.io:41046": {
+            "samplesMs": [
+              118.2635999999984,
+              117.1646000000037,
+              115.95479999999952
+            ],
+            "avgMs": 117.12766666666721,
+            "minMs": 115.95479999999952,
+            "maxMs": 118.2635999999984
+          },
+          "144.126.157.138:41046": {
+            "samplesMs": [
+              117.1137000000017,
+              114.78629999999976,
+              115.39199999999983
+            ],
+            "avgMs": 115.76400000000042,
+            "minMs": 114.78629999999976,
+            "maxMs": 117.1137000000017
+          }
+        },
+        "deviceResolution": {
+          "deviceId": "0x4632c04cf8c44a586554951e7de03ca2bd3e8f1c",
+          "hostKey": "us2.prenet.diode.io:41046",
+          "source": "seed",
+          "resolutionMs": 24.87090000000171
+        },
+        "networkDiscoveryStats": {
+          "loadedCount": 2,
+          "usableCount": 2,
+          "filteredCount": 0,
+          "startupProbeCount": 2
+        }
+      }
+    }
+  ]
+}

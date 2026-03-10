@@ -1,0 +1,11 @@
+[
+  {
+    "host": "144.126.157.138",
+    "port": 41046,
+    "priority": 1,
+    "region": "us",
+    "metadata": {
+      "label": "sample-target-relay"
+    }
+  }
+]

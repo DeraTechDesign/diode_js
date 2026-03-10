@@ -68,6 +68,10 @@ main();
 
 You can connect to multiple Diode relays and automatically route binds to the relay where the target device is connected.
 
+`DiodeClientManager` now ranks relays by observed latency. On startup it probes the required candidate set, persists relay scores to disk, and prefers the lowest-latency connected relay for control-plane RPC calls. It does not ping the full network at startup.
+
+When neither `host` nor `hosts` is specified, the manager starts from the default seed pool, any discovery-provider candidates, built-in `dio_network` candidates, and previously successful non-provider relays saved in `relay-scores.json`. Without live network discovery it probes all default seeds once. When live network discovery returns usable relays, startup resolves from a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues measuring the remaining seeds in the background while keeping region diversity in the warm set. If you pass `host` or `hosts`, startup stays constrained to those configured relays unless you explicitly opt into using the discovery provider alongside them.
+
 ```javascript
 const { DiodeClientManager, BindPort } = require('diodejs');
 
@@ -82,6 +86,66 @@ async function main() {
   bind.bind();
 }
 ```
+
+You can tune relay selection if needed:
+
+```javascript
+const client = new DiodeClientManager({
+  keyLocation: './db/keys.json',
+  relaySelection: {
+    startupConcurrency: 2,
+    minReadyConnections: 2,
+    probeTimeoutMs: 1200,
+    warmConnectionBudget: 3,
+    probeAllInitialCandidates: true,
+    continueProbingUntestedSeeds: true,
+    regionDiverseSeedOrdering: true,
+    discoveryProviderTimeoutMs: 1500,
+    backgroundProbeIntervalMs: 300000,
+    slowRelayThresholdMs: 250,
+    slowDeviceRetryTtlMs: 5000,
+    scoreCachePath: './db/relay-scores.json'
+  }
+});
+```
+
+Routing note: the initiating client can prefer a better local relay, but it cannot override the relay encoded in the remote device ticket. Best results come when both clients use the manager's relay ranking so each side reconnects toward a closer relay over time.
+
+Discovery note: startup discovery sources are now `configured/seed`, `discoveryProvider`, built-in live `dio_network` discovery, cached non-provider/non-network relays, and target-on-demand relay resolution from `getNode(serverId)`. Provider and network membership are not cached independently; only RTT/history is persisted in `relay-scores.json`.
+
+Example discovery provider:
+
+```javascript
+const fs = require('fs/promises');
+
+const client = new DiodeClientManager({
+  keyLocation: './db/keys.json',
+  relaySelection: {
+    discoveryProvider: async () => {
+      const data = JSON.parse(await fs.readFile('./relays.json', 'utf8'));
+      return data;
+    },
+    networkDiscovery: {
+      endpoint: 'wss://prenet.diode.io:8443/ws',
+      startupProbeCount: 2,
+      backgroundBatchSize: 12
+    }
+  }
+});
+```
+
+`discoveryProvider(context)` may return either relay strings such as `'relay.example.com:41046'` or objects like `{ host, port, priority, region, metadata }`. The callback receives a read-only `context` object with:
+
+- `defaultPort`
+- `keyLocation`
+- `explicitHost`
+- `explicitHosts`
+- `initialHosts`
+- `knownRelayScores`
+
+`knownRelayScores` contains the manager's current score snapshot for previously seen relays. Provider membership itself is not cached across runs; only relay score history is persisted.
+
+Built-in network discovery uses the Diode JSON-RPC websocket endpoint and requests `dio_network`. It is enabled by default only when neither `host` nor `hosts` is set. Only connected `server` nodes are considered, and private/unroutable addresses are filtered unless `includePrivateAddresses` is enabled. When discovery succeeds, startup keeps the seed safety baseline by probing one seed per region before adding the configured discovery sample, instead of blocking on every seed before ready.
 
 If you provide a host, only that relay is used initially (similar to `-diodeaddrs`):
 
@@ -267,9 +331,41 @@ main();
   - `options.hosts` (string[] or comma-separated string, optional): Explicit relay list.
   - `options.keyLocation` (string, optional): Key storage path (default: `./db/keys.json`).
   - `options.deviceCacheTtlMs` (number, optional): Cache TTL for device relay resolution (default: `30000`).
+  - `options.relaySelection` (object, optional): Relay ranking and probing options.
+    - `enabled` (boolean, optional): Enables smart relay ranking. Defaults to `true`.
+    - `startupConcurrency` (number, optional): Parallel startup probe limit. Defaults to `2`.
+    - `minReadyConnections` (number, optional): Minimum target connection count for the startup probe set. Defaults to `2`.
+    - `probeTimeoutMs` (number, optional): Ping timeout for relay probes. Defaults to `1200`.
+    - `warmConnectionBudget` (number, optional): Maximum number of idle control relays to keep after startup coverage completes. Defaults to `3`.
+    - `probeAllInitialCandidates` (boolean, optional): Probes all initial configured/default candidates once before final startup ranking is trusted. Defaults to `true`.
+    - `continueProbingUntestedSeeds` (boolean, optional): Continues probing untested candidates after startup coverage completes. Defaults to `true`.
+    - `regionDiverseSeedOrdering` (boolean, optional): Interleaves seed regions during first-pass probing and warm retention. Defaults to `true`.
+    - `discoveryProvider` (function, optional): Async or sync callback that returns extra relay candidates as strings or `{ host, port, priority, region, metadata }` objects. The callback receives `{ defaultPort, keyLocation, explicitHost, explicitHosts, initialHosts, knownRelayScores }`.
+    - `discoveryProviderTimeoutMs` (number, optional): Timeout for `discoveryProvider` results. Defaults to `1500`.
+    - `useProviderWithExplicitHost` (boolean, optional): Allows provider candidates when `options.host` is set. Defaults to `false`.
+    - `useProviderWithExplicitHosts` (boolean, optional): Allows provider candidates when `options.hosts` is set. Defaults to `false`.
+    - `networkDiscovery` (object, optional): Built-in live directory discovery via the JSON-RPC websocket endpoint.
+      - `enabled` (boolean, optional): Enables live network discovery when no explicit `host` or `hosts` is configured. Defaults to `true` in default mode.
+      - `endpoint` (string, optional): Directory endpoint. Defaults to `wss://prenet.diode.io:8443/ws`.
+      - `method` (string, optional): JSON-RPC method name. Defaults to `dio_network`.
+      - `timeoutMs` (number, optional): Timeout for the discovery websocket request. Defaults to `1500`.
+      - `startupProbeCount` (number, optional): Number of discovered network relays added to the startup coverage probe set. Defaults to `2`.
+      - `backgroundBatchSize` (number, optional): Number of additional discovered relays measured in the background queue per run. Defaults to `12`.
+      - `includePrivateAddresses` (boolean, optional): Allows private or unroutable discovery results to be used. Defaults to `false`.
+    - `backgroundProbeIntervalMs` (number, optional): Minimum interval before background refresh probes are retried for a relay. Defaults to `300000`.
+    - `slowRelayThresholdMs` (number, optional): RTT threshold used to shorten target relay cache entries. Defaults to `250`.
+    - `slowDeviceRetryTtlMs` (number, optional): TTL used for slow target relays. Defaults to `5000`.
+    - `deviceRelayReconciliation` (object, optional): Bounded fallback that re-resolves a device through alternate connected control relays when the initially resolved target relay is much slower than the current control relay baseline.
+      - `enabled` (boolean, optional): Enables reconciliation. Defaults to `true`.
+      - `maxControlRelays` (number, optional): Maximum number of alternate connected control relays queried per reconciliation attempt. Defaults to `2`.
+      - `timeoutMs` (number, optional): Per-control-relay timeout for reconciliation lookups. Defaults to `probeTimeoutMs`.
+      - `minLatencyDeltaMs` (number, optional): Minimum RTT gap between the target relay and the control relay baseline before reconciliation triggers. Defaults to `150`.
+      - `slowdownFactor` (number, optional): Minimum multiple by which the target relay RTT must exceed the control relay baseline before reconciliation triggers. Defaults to `4`.
+    - `scoreCachePath` (string|null, optional): Relay score cache file. Defaults to `./db/relay-scores.json` next to `keyLocation`. Set to `null` to disable persistence.
 
 - **Methods**:
-  - `connect()`: Connects to the initial relay pool. Returns a promise.
+  - `connect()`: Probes the required initial relays, merges provider and optional `dio_network` candidates, ranks the successful relays by latency, trims the warm relay set, and returns a promise. In live network discovery mode this starts from a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues probing the remaining seeds in the background.
+  - `getNearestConnection()`: Returns the preferred connected relay. With relay selection enabled, this is the lowest-latency scored relay.
   - `getConnectionForDevice(deviceId)`: Resolves and returns a relay connection for the device. Returns a promise.
   - `getConnections()`: Returns a list of active connections.
   - `close()`: Closes all managed connections.
