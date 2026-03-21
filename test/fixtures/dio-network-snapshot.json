@@ -1,0 +1,82 @@
+[
+  {
+    "last_seen": "0x69aac815",
+    "retries": "0x00",
+    "last_error": "0x00",
+    "node_id": "0x7e4cd38d266902444dc9c8f7c0aa716a32497d0b",
+    "node": [
+      "server",
+      "144.126.157.138",
+      "0xa056",
+      "0xc76f",
+      "1.9.3",
+      [["name", "pause_chalk@diode-us2b"]]
+    ],
+    "connected": true
+  },
+  {
+    "last_seen": "0x69aac815",
+    "retries": "0x00",
+    "last_error": null,
+    "node_id": "0x3edd3d61a0f9b85a3adac02dfb97c7d48eaf5462",
+    "node": [
+      "server",
+      "192.168.100.4",
+      "0xa056",
+      "0xc76f",
+      "1.4.2",
+      [["name", "private_node"]]
+    ],
+    "connected": true
+  },
+  {
+    "last_seen": "0x69aac815",
+    "retries": "0x01",
+    "last_error": "0x69a69d52",
+    "node_id": "0x1350d3b501d6842ed881b59de4b95b27372bfae8",
+    "node": [
+      "server",
+      "194.233.80.251",
+      "0xa056",
+      "0xc76f",
+      "1.9.3",
+      [["name", "fringe_quiz@diode-as2b"]]
+    ],
+    "connected": true
+  },
+  {
+    "last_seen": "0x69aac815",
+    "retries": "0x00",
+    "last_error": "0x00",
+    "node_id": "0x1111111111111111111111111111111111111111",
+    "node": [
+      "client",
+      "1.2.3.4",
+      "0xa056",
+      "0xc76f",
+      "1.9.3",
+      [["name", "wrong_type"]]
+    ],
+    "connected": true
+  },
+  {
+    "last_seen": "0x69aac815",
+    "retries": "0x00",
+    "last_error": "0x00",
+    "node_id": "0x2222222222222222222222222222222222222222",
+    "node": [
+      "server",
+      "34.129.36.236",
+      "0xa056",
+      "0xc76f",
+      "1.9.3",
+      [["name", "public-alt"]]
+    ],
+    "connected": false
+  },
+  {
+    "node_id": "0x3333333333333333333333333333333333333333",
+    "node": ["server", "", "0xa056", "0xc76f", "1.9.3", []],
+    "connected": true
+  }
+]

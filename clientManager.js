@@ -1,6 +1,10 @@
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
 const EventEmitter = require('events');
 const DiodeConnection = require('./connection');
 const DiodeRPC = require('./rpc');
+const { fetchNetworkDirectory } = require('./networkDiscoveryClient');
 const logger = require('./logger');
 
 const DEFAULT_DIODE_ADDRS = [
@@ -11,6 +15,15 @@ const DEFAULT_DIODE_ADDRS = [
   'eu1.prenet.diode.io:41046',
   'eu2.prenet.diode.io:41046',
 ];
+
+const RELAY_SCORE_CACHE_VERSION = 2;
+const RELAY_SCORE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const RELAY_SCORE_FRESH_MS = 60 * 1000;
+const RELAY_SCORE_FAILURE_COOLDOWN_MS = 30 * 1000;
+const RELAY_SCORE_EWMA_WEIGHT = 0.3;
+const RELAY_SCORE_FLUSH_DEBOUNCE_MS = 500;
+const DEFAULT_NETWORK_DISCOVERY_ENDPOINT = 'wss://prenet.diode.io:8443/ws';
+const DEFAULT_NETWORK_DISCOVERY_METHOD = 'dio_network';
 
 function splitHostPort(input, defaultPort) {
   if (!input || typeof input !== 'string') {
@@ -55,6 +68,11 @@ function joinHostPort(host, port) {
   return `${host}:${port}`;
 }
 
+function normalizeHostKey(hostEntry, defaultPort) {
+  const { host, port } = splitHostPort(hostEntry, defaultPort);
+  return host ? joinHostPort(host, port) : '';
+}
+
 function normalizeAddress(address) {
   if (!address) return null;
   if (Buffer.isBuffer(address)) return address;
@@ -82,6 +100,46 @@ function isConnected(connection) {
   return connection && connection.socket && !connection.socket.destroyed;
 }
 
+function parseBoolean(value, defaultValue) {
+  return typeof value === 'boolean' ? value : defaultValue;
+}
+
+function parsePositiveInteger(value, defaultValue, { allowZero = false } = {}) {
+  if (!Number.isFinite(value)) {
+    return defaultValue;
+  }
+  const normalized = Math.floor(value);
+  if (allowZero ? normalized >= 0 : normalized > 0) {
+    return normalized;
+  }
+  return defaultValue;
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const normalizedConcurrency = Math.max(1, Math.min(concurrency || 1, items.length || 1));
+  const results = new Array(items.length);
+  let index = 0;
+
+  async function consume() {
+    while (true) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) {
+        return;
+      }
+      try {
+        const value = await worker(items[current], current);
+        results[current] = { status: 'fulfilled', value };
+      } catch (error) {
+        results[current] = { status: 'rejected', reason: error };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: normalizedConcurrency }, () => consume()));
+  return results;
+}
+
 class DiodeClientManager extends EventEmitter {
   constructor(options = {}) {
     super();
@@ -92,15 +150,112 @@ class DiodeClientManager extends EventEmitter {
       ? options.deviceCacheTtlMs
       : 30000;
 
+    this._hasExplicitHost = typeof options.host === 'string' && !!options.host.trim();
+    this._hasExplicitHosts = !this._hasExplicitHost && (
+      Array.isArray(options.hosts)
+      || (typeof options.hosts === 'string' && !!options.hosts.trim())
+    );
+
+    this.relaySelection = this._buildRelaySelectionOptions(options.relaySelection);
+    this.scoreCachePath = this._resolveRelayScoreCachePath(this.relaySelection.scoreCachePath);
+    this.discoveryState = { networkCursor: 0 };
+
     this.connections = [];
     this.connectionByHost = new Map();
     this.serverIdToConnection = new Map();
     this.pendingConnections = new Map();
+    this.pendingProbes = new Map();
     this.deviceRelayCache = new Map();
+    this.relayScores = new Map();
     this._rpcByConnection = new Map();
+    this._candidateMetadataByHost = new Map();
     this._rrIndex = 0;
+    this._relayScoreFlushTimer = null;
+    this._backgroundWarmupPromise = null;
+    this._lastProbeStartedAt = new Map();
+    this._startupCoverageComplete = false;
+    this._lastNetworkDiscoveryStats = null;
+    this._lastDeviceResolutionTrace = null;
 
     this.initialHosts = this._buildInitialHosts(options);
+    this._loadRelayScores();
+  }
+
+  _buildRelaySelectionOptions(options = {}) {
+    const relaySelection = options && typeof options === 'object' ? options : {};
+    const legacyWarmConnections = parsePositiveInteger(relaySelection.desiredWarmConnections, NaN);
+    return {
+      enabled: parseBoolean(relaySelection.enabled, true),
+      startupConcurrency: parsePositiveInteger(relaySelection.startupConcurrency, 2),
+      minReadyConnections: parsePositiveInteger(relaySelection.minReadyConnections, 2),
+      probeTimeoutMs: parsePositiveInteger(relaySelection.probeTimeoutMs, 1200),
+      warmConnectionBudget: parsePositiveInteger(
+        relaySelection.warmConnectionBudget,
+        Number.isFinite(legacyWarmConnections) ? legacyWarmConnections : 3,
+      ),
+      probeAllInitialCandidates: parseBoolean(relaySelection.probeAllInitialCandidates, true),
+      continueProbingUntestedSeeds: parseBoolean(relaySelection.continueProbingUntestedSeeds, true),
+      regionDiverseSeedOrdering: parseBoolean(relaySelection.regionDiverseSeedOrdering, true),
+      discoveryProvider: typeof relaySelection.discoveryProvider === 'function'
+        ? relaySelection.discoveryProvider
+        : null,
+      discoveryProviderTimeoutMs: parsePositiveInteger(relaySelection.discoveryProviderTimeoutMs, 1500),
+      useProviderWithExplicitHost: parseBoolean(relaySelection.useProviderWithExplicitHost, false),
+      useProviderWithExplicitHosts: parseBoolean(relaySelection.useProviderWithExplicitHosts, false),
+      backgroundProbeIntervalMs: parsePositiveInteger(relaySelection.backgroundProbeIntervalMs, 300000),
+      slowRelayThresholdMs: parsePositiveInteger(relaySelection.slowRelayThresholdMs, 250),
+      slowDeviceRetryTtlMs: parsePositiveInteger(relaySelection.slowDeviceRetryTtlMs, 5000),
+      deviceRelayReconciliation: this._buildDeviceRelayReconciliationOptions(
+        relaySelection.deviceRelayReconciliation,
+        parsePositiveInteger(relaySelection.probeTimeoutMs, 1200),
+      ),
+      networkDiscovery: this._buildNetworkDiscoveryOptions(relaySelection.networkDiscovery),
+      scoreCachePath: Object.prototype.hasOwnProperty.call(relaySelection, 'scoreCachePath')
+        ? relaySelection.scoreCachePath
+        : undefined,
+    };
+  }
+
+  _buildDeviceRelayReconciliationOptions(options = {}, probeTimeoutMs = 1200) {
+    const reconciliation = options && typeof options === 'object' ? options : {};
+    return {
+      enabled: parseBoolean(reconciliation.enabled, true),
+      maxControlRelays: parsePositiveInteger(reconciliation.maxControlRelays, 2, { allowZero: true }),
+      timeoutMs: parsePositiveInteger(reconciliation.timeoutMs, probeTimeoutMs),
+      minLatencyDeltaMs: parsePositiveInteger(reconciliation.minLatencyDeltaMs, 150, { allowZero: true }),
+      slowdownFactor: Number.isFinite(reconciliation.slowdownFactor) && reconciliation.slowdownFactor > 0
+        ? reconciliation.slowdownFactor
+        : 4,
+    };
+  }
+
+  _buildNetworkDiscoveryOptions(options = {}) {
+    const networkDiscovery = options && typeof options === 'object' ? options : {};
+    const enabledDefault = !this._hasExplicitHost && !this._hasExplicitHosts;
+    return {
+      enabled: parseBoolean(networkDiscovery.enabled, enabledDefault),
+      endpoint: typeof networkDiscovery.endpoint === 'string' && networkDiscovery.endpoint.trim()
+        ? networkDiscovery.endpoint.trim()
+        : DEFAULT_NETWORK_DISCOVERY_ENDPOINT,
+      method: typeof networkDiscovery.method === 'string' && networkDiscovery.method.trim()
+        ? networkDiscovery.method.trim()
+        : DEFAULT_NETWORK_DISCOVERY_METHOD,
+      timeoutMs: parsePositiveInteger(networkDiscovery.timeoutMs, 1500),
+      startupProbeCount: parsePositiveInteger(networkDiscovery.startupProbeCount, 2, { allowZero: true }),
+      backgroundBatchSize: parsePositiveInteger(networkDiscovery.backgroundBatchSize, 12, { allowZero: true }),
+      includePrivateAddresses: parseBoolean(networkDiscovery.includePrivateAddresses, false),
+    };
+  }
+
+  _resolveRelayScoreCachePath(scoreCachePath) {
+    if (scoreCachePath === null) {
+      return null;
+    }
+    if (typeof scoreCachePath === 'string' && scoreCachePath.trim()) {
+      return scoreCachePath;
+    }
+    const keyDir = path.dirname(this.keyLocation);
+    return path.join(keyDir, 'relay-scores.json');
   }
 
   _buildInitialHosts(options) {
@@ -123,10 +278,8 @@ class DiodeClientManager extends EventEmitter {
     const seen = new Set();
     const normalized = [];
     for (const entry of hosts) {
-      if (!entry) continue;
-      const { host, port } = splitHostPort(entry, this.defaultPort);
-      if (!host) continue;
-      const key = joinHostPort(host, port);
+      const key = normalizeHostKey(entry, this.defaultPort);
+      if (!key) continue;
       const lower = key.toLowerCase();
       if (!seen.has(lower)) {
         seen.add(lower);
@@ -134,6 +287,734 @@ class DiodeClientManager extends EventEmitter {
       }
     }
     return normalized;
+  }
+
+  _loadRelayScores() {
+    this.relayScores.clear();
+    this.discoveryState = { networkCursor: 0 };
+    if (!this.scoreCachePath) {
+      return;
+    }
+
+    try {
+      if (!fs.existsSync(this.scoreCachePath)) {
+        return;
+      }
+      const raw = fs.readFileSync(this.scoreCachePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (!parsed || ![1, RELAY_SCORE_CACHE_VERSION].includes(parsed.version) || typeof parsed.relays !== 'object') {
+        return;
+      }
+
+      this._loadDiscoveryState(parsed.discoveryState);
+
+      const now = Date.now();
+      for (const [hostEntry, record] of Object.entries(parsed.relays)) {
+        const hostKey = normalizeHostKey(hostEntry, this.defaultPort);
+        if (!hostKey || !record || typeof record !== 'object') {
+          continue;
+        }
+
+        const lastTouched = Math.max(
+          Number(record.lastSuccessAt) || 0,
+          Number(record.lastFailureAt) || 0,
+        );
+        if (lastTouched && now - lastTouched > RELAY_SCORE_MAX_AGE_MS) {
+          continue;
+        }
+
+        this.relayScores.set(hostKey, {
+          hostKey,
+          ewmaLatencyMs: Number.isFinite(record.ewmaLatencyMs) ? record.ewmaLatencyMs : null,
+          lastProbeLatencyMs: Number.isFinite(record.lastProbeLatencyMs) ? record.lastProbeLatencyMs : null,
+          successCount: parsePositiveInteger(record.successCount, 0, { allowZero: true }),
+          failureCount: parsePositiveInteger(record.failureCount, 0, { allowZero: true }),
+          lastSuccessAt: parsePositiveInteger(record.lastSuccessAt, 0, { allowZero: true }),
+          lastFailureAt: parsePositiveInteger(record.lastFailureAt, 0, { allowZero: true }),
+          cooldownUntil: parsePositiveInteger(record.cooldownUntil, 0, { allowZero: true }),
+          discoveredFrom: typeof record.discoveredFrom === 'string' ? record.discoveredFrom : 'seed',
+        });
+      }
+    } catch (error) {
+      logger.warn(() => `Failed to load relay scores from ${this.scoreCachePath}: ${error}`);
+      this.relayScores.clear();
+    }
+  }
+
+  _loadDiscoveryState(discoveryState) {
+    const networkCursor = discoveryState && Number.isFinite(discoveryState.networkCursor)
+      ? Math.max(0, Math.floor(discoveryState.networkCursor))
+      : 0;
+    this.discoveryState = { networkCursor };
+  }
+
+  _scheduleRelayScoreFlush() {
+    if (!this.scoreCachePath) {
+      return;
+    }
+    if (this._relayScoreFlushTimer) {
+      clearTimeout(this._relayScoreFlushTimer);
+    }
+    this._relayScoreFlushTimer = setTimeout(() => {
+      this._relayScoreFlushTimer = null;
+      this._flushRelayScores();
+    }, RELAY_SCORE_FLUSH_DEBOUNCE_MS);
+  }
+
+  _flushRelayScores() {
+    if (!this.scoreCachePath) {
+      return;
+    }
+
+    const now = Date.now();
+    const relays = {};
+    for (const [hostKey, score] of this.relayScores.entries()) {
+      const lastTouched = Math.max(score.lastSuccessAt || 0, score.lastFailureAt || 0);
+      if (lastTouched && now - lastTouched > RELAY_SCORE_MAX_AGE_MS) {
+        this.relayScores.delete(hostKey);
+        continue;
+      }
+      relays[hostKey] = {
+        ewmaLatencyMs: Number.isFinite(score.ewmaLatencyMs) ? score.ewmaLatencyMs : null,
+        lastProbeLatencyMs: Number.isFinite(score.lastProbeLatencyMs) ? score.lastProbeLatencyMs : null,
+        successCount: score.successCount || 0,
+        failureCount: score.failureCount || 0,
+        lastSuccessAt: score.lastSuccessAt || 0,
+        lastFailureAt: score.lastFailureAt || 0,
+        cooldownUntil: score.cooldownUntil || 0,
+        discoveredFrom: score.discoveredFrom || 'seed',
+      };
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(this.scoreCachePath), { recursive: true });
+      fs.writeFileSync(this.scoreCachePath, JSON.stringify({
+        version: RELAY_SCORE_CACHE_VERSION,
+        updatedAt: now,
+        discoveryState: this.discoveryState,
+        relays,
+      }, null, 2), 'utf8');
+    } catch (error) {
+      logger.warn(() => `Failed to write relay scores to ${this.scoreCachePath}: ${error}`);
+    }
+  }
+
+  _getRegionKey(hostKey) {
+    const host = splitHostPort(hostKey, this.defaultPort).host.toLowerCase();
+    if (host.startsWith('as')) return 'as';
+    if (host.startsWith('us')) return 'us';
+    if (host.startsWith('eu')) return 'eu';
+    return 'other';
+  }
+
+  _getCandidateRegion(hostKey) {
+    const metadata = this._candidateMetadataByHost.get(hostKey);
+    if (metadata && metadata.region) {
+      return metadata.region;
+    }
+    return this._getRegionKey(hostKey);
+  }
+
+  _getCandidatePriority(hostKey) {
+    const metadata = this._candidateMetadataByHost.get(hostKey);
+    if (metadata && Number.isFinite(metadata.priority)) {
+      return metadata.priority;
+    }
+    return 100;
+  }
+
+  _setCandidateMetadata(hostKey, options = {}) {
+    const existing = this._candidateMetadataByHost.get(hostKey) || {};
+    const next = { ...existing };
+    if (Number.isFinite(options.priority)) {
+      next.priority = options.priority;
+    }
+    if (typeof options.region === 'string' && options.region.trim()) {
+      next.region = options.region.trim().toLowerCase();
+    }
+    if (options.metadata && typeof options.metadata === 'object' && !Array.isArray(options.metadata)) {
+      next.metadata = options.metadata;
+    }
+    ['nodeIdHex', 'lastSeenAt', 'retries', 'lastError', 'version', 'name', 'selectedPort', 'edgePort', 'serverPort', 'connected'].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(options, key)) {
+        next[key] = options[key];
+      }
+    });
+    if (Object.keys(next).length > 0) {
+      this._candidateMetadataByHost.set(hostKey, next);
+    }
+  }
+
+  _createCandidate(hostKey, source, index, options = {}) {
+    this._setCandidateMetadata(hostKey, options);
+    const score = this.relayScores.get(hostKey);
+    return {
+      hostKey,
+      source,
+      index,
+      hasBeenTested: !!(score && ((score.successCount || 0) > 0 || (score.failureCount || 0) > 0)),
+      ewmaLatencyMs: score && Number.isFinite(score.ewmaLatencyMs) ? score.ewmaLatencyMs : null,
+      inCooldown: !!(score && score.cooldownUntil && score.cooldownUntil > Date.now()),
+      cooldownUntil: score && score.cooldownUntil ? score.cooldownUntil : 0,
+      lastSuccessAt: score && score.lastSuccessAt ? score.lastSuccessAt : 0,
+      discoveredFrom: score && score.discoveredFrom ? score.discoveredFrom : source,
+      priority: Number.isFinite(options.priority) ? options.priority : this._getCandidatePriority(hostKey),
+      region: options.region || this._getCandidateRegion(hostKey),
+      metadata: options.metadata || (this._candidateMetadataByHost.get(hostKey)?.metadata || null),
+      scoreFresh: this._isRelayScoreFresh(score),
+      nodeIdHex: options.nodeIdHex || this._candidateMetadataByHost.get(hostKey)?.nodeIdHex || '',
+      lastSeenAt: Number.isFinite(options.lastSeenAt) ? options.lastSeenAt : (this._candidateMetadataByHost.get(hostKey)?.lastSeenAt || 0),
+      retries: Number.isFinite(options.retries) ? options.retries : (this._candidateMetadataByHost.get(hostKey)?.retries || 0),
+      lastError: Object.prototype.hasOwnProperty.call(options, 'lastError')
+        ? options.lastError
+        : (this._candidateMetadataByHost.get(hostKey)?.lastError ?? null),
+      version: options.version || this._candidateMetadataByHost.get(hostKey)?.version || '',
+      name: options.name || this._candidateMetadataByHost.get(hostKey)?.name || '',
+      selectedPort: Number.isFinite(options.selectedPort)
+        ? options.selectedPort
+        : (this._candidateMetadataByHost.get(hostKey)?.selectedPort || 0),
+    };
+  }
+
+  _orderCandidatesByRegion(candidates) {
+    const groups = new Map();
+    for (const candidate of candidates) {
+      const region = this._getRegionKey(candidate.hostKey);
+      if (!groups.has(region)) {
+        groups.set(region, []);
+      }
+      groups.get(region).push(candidate);
+    }
+
+    const priority = ['as', 'us', 'eu', 'other'];
+    const ordered = [];
+    let hasMore = true;
+    while (hasMore) {
+      hasMore = false;
+      for (const region of priority) {
+        const queue = groups.get(region);
+        if (queue && queue.length > 0) {
+          ordered.push(queue.shift());
+          hasMore = true;
+        }
+      }
+    }
+    return ordered;
+  }
+
+  _getInitialCoverageCandidates(candidates) {
+    const requiredCandidates = candidates.filter((candidate) => candidate.source === 'seed' || candidate.source === 'configured');
+    if (!this.relaySelection.regionDiverseSeedOrdering || this._hasExplicitHost || this._hasExplicitHosts) {
+      return requiredCandidates;
+    }
+    return this._orderCandidatesByRegion(requiredCandidates);
+  }
+
+  _getStartupSeedBootstrapCandidates(candidates) {
+    const orderedRequiredCandidates = this._getInitialCoverageCandidates(candidates);
+    if (this._hasExplicitHost || this._hasExplicitHosts || !this.relaySelection.networkDiscovery.enabled) {
+      return orderedRequiredCandidates;
+    }
+
+    const selected = [];
+    const seenRegions = new Set();
+    for (const candidate of orderedRequiredCandidates) {
+      const region = candidate.region || this._getRegionKey(candidate.hostKey) || 'other';
+      if (seenRegions.has(region)) {
+        continue;
+      }
+      seenRegions.add(region);
+      selected.push(candidate);
+    }
+
+    return selected.length > 0 ? selected : orderedRequiredCandidates;
+  }
+
+  _getSourcePrecedence(source) {
+    switch (source) {
+      case 'configured': return 0;
+      case 'seed': return 1;
+      case 'provider': return 2;
+      case 'network': return 3;
+      case 'target': return 4;
+      case 'cache': return 5;
+      default: return 6;
+    }
+  }
+
+  _parseHexInt(value) {
+    if (Number.isFinite(value)) {
+      return Math.floor(value);
+    }
+    if (typeof value === 'string') {
+      if (/^0x[0-9a-f]+$/i.test(value)) {
+        return parseInt(value, 16);
+      }
+      if (/^\d+$/.test(value)) {
+        return parseInt(value, 10);
+      }
+    }
+    return 0;
+  }
+
+  _filterDiscoveryAddress(host) {
+    if (typeof host !== 'string' || !host.trim()) {
+      return false;
+    }
+
+    const normalized = host.trim().toLowerCase();
+    if (normalized === 'localhost') {
+      return false;
+    }
+
+    const ipVersion = net.isIP(normalized);
+    if (!ipVersion) {
+      return true;
+    }
+    if (this.relaySelection.networkDiscovery.includePrivateAddresses) {
+      return true;
+    }
+    if (ipVersion === 6) {
+      if (normalized === '::1') return false;
+      if (normalized.startsWith('fc') || normalized.startsWith('fd')) return false;
+      if (normalized.startsWith('fe80:')) return false;
+      return true;
+    }
+
+    const octets = normalized.split('.').map((part) => parseInt(part, 10));
+    if (octets.length !== 4 || octets.some((part) => !Number.isFinite(part))) {
+      return false;
+    }
+    if (octets[0] === 0 || octets[0] === 10 || octets[0] === 127) return false;
+    if (octets[0] === 169 && octets[1] === 254) return false;
+    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) return false;
+    if (octets[0] === 192 && octets[1] === 168) return false;
+    if (octets[0] >= 224) return false;
+    if (octets[0] === 255) return false;
+    return true;
+  }
+
+  _getKnownRelayScoreSnapshot() {
+    return Array.from(this.relayScores.values()).map((score) => ({
+      hostKey: score.hostKey,
+      ewmaLatencyMs: Number.isFinite(score.ewmaLatencyMs) ? score.ewmaLatencyMs : null,
+      successCount: score.successCount || 0,
+      failureCount: score.failureCount || 0,
+      lastSuccessAt: score.lastSuccessAt || 0,
+      discoveredFrom: score.discoveredFrom || 'seed',
+    }));
+  }
+
+  async _callDiscoveryProviderWithTimeout() {
+    const provider = this.relaySelection.discoveryProvider;
+    if (typeof provider !== 'function') {
+      return [];
+    }
+    const context = Object.freeze({
+      defaultPort: this.defaultPort,
+      keyLocation: this.keyLocation,
+      explicitHost: this._hasExplicitHost,
+      explicitHosts: this._hasExplicitHosts,
+      initialHosts: this.initialHosts.slice(),
+      knownRelayScores: this._getKnownRelayScoreSnapshot(),
+    });
+
+    const timeoutMs = this.relaySelection.discoveryProviderTimeoutMs;
+    return Promise.race([
+      Promise.resolve().then(() => provider(context)),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`Discovery provider timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  }
+
+  _normalizeDiscoveryCandidate(entry, index) {
+    if (typeof entry === 'string') {
+      const hostKey = normalizeHostKey(entry, this.defaultPort);
+      if (!hostKey) return null;
+      return this._createCandidate(hostKey, 'provider', index, {
+        priority: 100,
+        region: this._getRegionKey(hostKey),
+        metadata: null,
+      });
+    }
+
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return null;
+    }
+
+    const hostKey = normalizeHostKey(
+      entry.port !== undefined ? joinHostPort(entry.host, entry.port) : entry.host,
+      this.defaultPort,
+    );
+    if (!hostKey) {
+      return null;
+    }
+
+    return this._createCandidate(hostKey, 'provider', index, {
+      priority: Number.isFinite(entry.priority) ? entry.priority : 100,
+      region: typeof entry.region === 'string' ? entry.region : this._getRegionKey(hostKey),
+      metadata: entry.metadata && typeof entry.metadata === 'object' && !Array.isArray(entry.metadata)
+        ? entry.metadata
+        : null,
+    });
+  }
+
+  async _loadDiscoveryProviderCandidates() {
+    if (!this.relaySelection.enabled) {
+      return [];
+    }
+    if (this._hasExplicitHost && !this.relaySelection.useProviderWithExplicitHost) {
+      return [];
+    }
+    if (this._hasExplicitHosts && !this.relaySelection.useProviderWithExplicitHosts) {
+      return [];
+    }
+    if (typeof this.relaySelection.discoveryProvider !== 'function') {
+      return [];
+    }
+
+    try {
+      const provided = await this._callDiscoveryProviderWithTimeout();
+      if (!Array.isArray(provided)) {
+        logger.warn(() => 'Discovery provider returned a non-array result. Ignoring provider candidates.');
+        return [];
+      }
+
+      let invalidCount = 0;
+      const normalized = [];
+      provided.forEach((entry, index) => {
+        const candidate = this._normalizeDiscoveryCandidate(entry, index);
+        if (!candidate) {
+          invalidCount += 1;
+          return;
+        }
+        normalized.push(candidate);
+      });
+      if (invalidCount > 0) {
+        logger.warn(() => `Ignored ${invalidCount} invalid discovery provider candidates`);
+      }
+      return normalized;
+    } catch (error) {
+      logger.warn(() => `Discovery provider failed: ${error}`);
+      return [];
+    }
+  }
+
+  async _fetchNetworkDiscoveryNodes() {
+    return fetchNetworkDirectory({
+      endpoint: this.relaySelection.networkDiscovery.endpoint,
+      method: this.relaySelection.networkDiscovery.method,
+      timeoutMs: this.relaySelection.networkDiscovery.timeoutMs,
+    });
+  }
+
+  _normalizeNetworkNode(entry, index) {
+    if (!entry || typeof entry !== 'object' || !entry.connected) {
+      return null;
+    }
+    if (!Array.isArray(entry.node) || entry.node[0] !== 'server') {
+      return null;
+    }
+
+    const host = typeof entry.node[1] === 'string' ? entry.node[1].trim() : '';
+    if (!this._filterDiscoveryAddress(host)) {
+      return null;
+    }
+
+    const edgePort = this._parseHexInt(entry.node[2]);
+    const serverPort = this._parseHexInt(entry.node[3]);
+    const selectedPort = edgePort || serverPort;
+    if (!selectedPort) {
+      return null;
+    }
+
+    let name = '';
+    const metadataEntries = Array.isArray(entry.node[5]) ? entry.node[5] : [];
+    for (const metaEntry of metadataEntries) {
+      if (Array.isArray(metaEntry) && metaEntry[0] === 'name') {
+        name = typeof metaEntry[1] === 'string' ? metaEntry[1] : '';
+        break;
+      }
+    }
+
+    const hostKey = normalizeHostKey(joinHostPort(host, selectedPort), this.defaultPort);
+    if (!hostKey) {
+      return null;
+    }
+
+    return this._createCandidate(hostKey, 'network', index, {
+      priority: 100,
+      region: this._getRegionKey(hostKey),
+      metadata: { name },
+      nodeIdHex: normalizeServerIdHex(entry.node_id),
+      lastSeenAt: this._parseHexInt(entry.last_seen),
+      retries: this._parseHexInt(entry.retries),
+      lastError: entry.last_error ?? null,
+      version: typeof entry.node[4] === 'string' ? entry.node[4] : '',
+      name,
+      selectedPort,
+      edgePort,
+      serverPort,
+      connected: !!entry.connected,
+    });
+  }
+
+  async _loadNetworkDiscoveryCandidates() {
+    if (!this.relaySelection.enabled || !this.relaySelection.networkDiscovery.enabled) {
+      this._lastNetworkDiscoveryStats = {
+        loadedCount: 0,
+        usableCount: 0,
+        filteredCount: 0,
+        startupProbeCount: 0,
+      };
+      return [];
+    }
+    if (this._hasExplicitHost || this._hasExplicitHosts) {
+      this._lastNetworkDiscoveryStats = {
+        loadedCount: 0,
+        usableCount: 0,
+        filteredCount: 0,
+        startupProbeCount: 0,
+      };
+      return [];
+    }
+
+    try {
+      const discovered = await Promise.race([
+        Promise.resolve().then(() => this._fetchNetworkDiscoveryNodes()),
+        new Promise((_, reject) => {
+          setTimeout(
+            () => reject(new Error(`Network discovery timed out after ${this.relaySelection.networkDiscovery.timeoutMs}ms`)),
+            this.relaySelection.networkDiscovery.timeoutMs,
+          );
+        }),
+      ]);
+      if (!Array.isArray(discovered)) {
+        logger.warn(() => 'Network discovery returned a non-array result. Ignoring discovered nodes.');
+        return [];
+      }
+
+      let invalidCount = 0;
+      const normalized = [];
+      discovered.forEach((entry, index) => {
+        const candidate = this._normalizeNetworkNode(entry, index);
+        if (!candidate) {
+          invalidCount += 1;
+          return;
+        }
+        normalized.push(candidate);
+      });
+      if (invalidCount > 0) {
+        logger.warn(() => `Ignored ${invalidCount} invalid network discovery nodes`);
+      }
+      this._lastNetworkDiscoveryStats = {
+        loadedCount: discovered.length,
+        usableCount: normalized.length,
+        filteredCount: invalidCount,
+        startupProbeCount: 0,
+      };
+      return normalized;
+    } catch (error) {
+      this._lastNetworkDiscoveryStats = {
+        loadedCount: 0,
+        usableCount: 0,
+        filteredCount: 0,
+        startupProbeCount: 0,
+      };
+      logger.warn(() => `Network discovery failed: ${error}`);
+      return [];
+    }
+  }
+
+  _mergeStartupCandidateLists(initialCandidates, providerCandidates, networkCandidates, cachedCandidates) {
+    const merged = [];
+    const byHost = new Map();
+    const pushCandidate = (candidate) => {
+      const lower = candidate.hostKey.toLowerCase();
+      if (!byHost.has(lower)) {
+        const normalized = { ...candidate, index: merged.length };
+        byHost.set(lower, normalized);
+        merged.push(normalized);
+        return;
+      }
+
+      const existing = byHost.get(lower);
+      if (this._getSourcePrecedence(candidate.source) < this._getSourcePrecedence(existing.source)) {
+        const replacement = { ...candidate, index: existing.index };
+        merged[existing.index] = replacement;
+        byHost.set(lower, replacement);
+      }
+    };
+
+    initialCandidates.forEach(pushCandidate);
+    providerCandidates.forEach(pushCandidate);
+    networkCandidates.forEach(pushCandidate);
+    cachedCandidates.forEach(pushCandidate);
+    return merged;
+  }
+
+  async _buildStartupCandidates() {
+    const initialSource = this._hasExplicitHost || this._hasExplicitHosts ? 'configured' : 'seed';
+    const initialCandidates = this.initialHosts.map((hostKey, index) => (
+      this._createCandidate(hostKey, initialSource, index)
+    ));
+
+    const [providerCandidates, networkCandidates] = await Promise.all([
+      this._loadDiscoveryProviderCandidates(),
+      this._loadNetworkDiscoveryCandidates(),
+    ]);
+    const cachedCandidates = [];
+    if (!this._hasExplicitHost && !this._hasExplicitHosts) {
+      for (const [hostKey, score] of this.relayScores.entries()) {
+        if ((score.successCount || 0) <= 0) {
+          continue;
+        }
+        if (score.discoveredFrom === 'provider' || score.discoveredFrom === 'network') {
+          continue;
+        }
+        const source = score.discoveredFrom === 'target' ? 'target' : 'cache';
+        cachedCandidates.push(this._createCandidate(hostKey, source, cachedCandidates.length));
+      }
+    }
+
+    return this._mergeStartupCandidateLists(initialCandidates, providerCandidates, networkCandidates, cachedCandidates);
+  }
+
+  _advanceNetworkCursor(totalCandidates, consumedCount) {
+    if (!Number.isFinite(totalCandidates) || totalCandidates <= 0 || !Number.isFinite(consumedCount) || consumedCount <= 0) {
+      return;
+    }
+    this.discoveryState.networkCursor = (this.discoveryState.networkCursor + consumedCount) % totalCandidates;
+    this._scheduleRelayScoreFlush();
+  }
+
+  _selectStartupNetworkCandidates(candidates) {
+    const startupProbeCount = this.relaySelection.networkDiscovery.startupProbeCount;
+    if (!startupProbeCount) {
+      return [];
+    }
+
+    const networkCandidates = candidates.filter((candidate) => candidate.source === 'network');
+    if (networkCandidates.length === 0) {
+      return [];
+    }
+
+    const freshScored = networkCandidates
+      .filter((candidate) => candidate.hasBeenTested && !candidate.inCooldown && candidate.scoreFresh && candidate.ewmaLatencyMs !== null)
+      .sort((left, right) => left.ewmaLatencyMs - right.ewmaLatencyMs);
+    const staleScored = networkCandidates
+      .filter((candidate) => candidate.hasBeenTested && !candidate.inCooldown && !candidate.scoreFresh && candidate.ewmaLatencyMs !== null)
+      .sort((left, right) => left.ewmaLatencyMs - right.ewmaLatencyMs);
+    const cooldown = networkCandidates
+      .filter((candidate) => candidate.inCooldown)
+      .sort((left, right) => (left.cooldownUntil || 0) - (right.cooldownUntil || 0));
+
+    const compareUntestedNetwork = (left, right) => {
+      if (left.retries !== right.retries) return left.retries - right.retries;
+      const leftHasError = left.lastError !== null && left.lastError !== '0x00' && left.lastError !== 0;
+      const rightHasError = right.lastError !== null && right.lastError !== '0x00' && right.lastError !== 0;
+      if (leftHasError !== rightHasError) return leftHasError ? 1 : -1;
+      if (left.lastSeenAt !== right.lastSeenAt) return right.lastSeenAt - left.lastSeenAt;
+      return left.hostKey.localeCompare(right.hostKey);
+    };
+
+    const untested = networkCandidates
+      .filter((candidate) => !candidate.hasBeenTested && !candidate.inCooldown)
+      .sort(compareUntestedNetwork);
+
+    const prioritizedUntested = untested.length > 0
+      ? untested.slice(this.discoveryState.networkCursor % untested.length).concat(untested.slice(0, this.discoveryState.networkCursor % untested.length))
+      : [];
+
+    const selected = [];
+    const seen = new Set();
+    let consumedUntestedCount = 0;
+    const pushCandidate = (candidate) => {
+      if (!candidate || seen.has(candidate.hostKey) || selected.length >= startupProbeCount) {
+        return;
+      }
+      seen.add(candidate.hostKey);
+      selected.push(candidate);
+      if (!candidate.hasBeenTested) {
+        consumedUntestedCount += 1;
+      }
+    };
+
+    freshScored.forEach(pushCandidate);
+    prioritizedUntested.forEach(pushCandidate);
+    staleScored.forEach(pushCandidate);
+    cooldown.forEach(pushCandidate);
+
+    if (this._lastNetworkDiscoveryStats) {
+      this._lastNetworkDiscoveryStats.startupProbeCount = selected.length;
+    }
+    this._advanceNetworkCursor(untested.length, Math.min(consumedUntestedCount, untested.length));
+    return selected;
+  }
+
+  _selectBackgroundNetworkCandidates(candidates) {
+    const batchSize = this.relaySelection.networkDiscovery.backgroundBatchSize;
+    if (!batchSize) {
+      return [];
+    }
+    return candidates
+      .filter((candidate) => candidate.source === 'network')
+      .slice(0, batchSize);
+  }
+
+  _rankRelayCandidates(candidates) {
+    const normalizedCandidates = candidates.map((candidate, index) => {
+      if (typeof candidate === 'string') {
+        return this._createCandidate(candidate, 'cache', index);
+      }
+      return {
+        ...candidate,
+        index,
+      };
+    });
+
+    return normalizedCandidates
+      .slice()
+      .sort((left, right) => {
+        const getGroup = (candidate) => {
+          if (candidate.inCooldown) return 5;
+          const requiredUntested = (candidate.source === 'seed' || candidate.source === 'configured') && !candidate.hasBeenTested;
+          if (requiredUntested) return 0;
+          if (candidate.hasBeenTested && candidate.ewmaLatencyMs !== null) return 1;
+          if (candidate.source === 'network' && !candidate.hasBeenTested) return 2;
+          if (candidate.source === 'provider' && !candidate.hasBeenTested) return 3;
+          return 4;
+        };
+
+        const leftGroup = getGroup(left);
+        const rightGroup = getGroup(right);
+        if (leftGroup !== rightGroup) {
+          return leftGroup - rightGroup;
+        }
+
+        if (leftGroup === 2) {
+          if (left.retries !== right.retries) return left.retries - right.retries;
+          const leftHasError = left.lastError !== null && left.lastError !== '0x00' && left.lastError !== 0;
+          const rightHasError = right.lastError !== null && right.lastError !== '0x00' && right.lastError !== 0;
+          if (leftHasError !== rightHasError) return leftHasError ? 1 : -1;
+          if (left.lastSeenAt !== right.lastSeenAt) return right.lastSeenAt - left.lastSeenAt;
+        }
+        if (leftGroup === 3 && left.priority !== right.priority) {
+          return left.priority - right.priority;
+        }
+        if (leftGroup === 1 && left.ewmaLatencyMs !== right.ewmaLatencyMs) {
+          return left.ewmaLatencyMs - right.ewmaLatencyMs;
+        }
+        if (left.lastSuccessAt !== right.lastSuccessAt) {
+          return right.lastSuccessAt - left.lastSuccessAt;
+        }
+        if (left.source !== right.source) {
+          return this._getSourcePrecedence(left.source) - this._getSourcePrecedence(right.source);
+        }
+        return left.index - right.index;
+      })
+      .map((entry) => entry);
   }
 
   _getRpcFor(connection) {
@@ -149,17 +1030,92 @@ class DiodeClientManager extends EventEmitter {
   _updateServerIdMapping(connection) {
     if (!connection) return;
     try {
-      const serverId = connection.getServerEthereumAddress(true);
+      const serverId = normalizeServerIdHex(connection.getServerEthereumAddress(true));
       if (serverId) {
-        this.serverIdToConnection.set(serverId.toLowerCase(), connection);
+        connection._managerServerIdHex = serverId;
+        const existing = this.serverIdToConnection.get(serverId);
+        if (existing && existing !== connection && isConnected(existing)) {
+          const preferred = this._rankConnectedConnections(
+            [existing, connection].filter((candidate) => isConnected(candidate))
+          )[0];
+          this.serverIdToConnection.set(serverId, preferred || connection);
+          return;
+        }
+        this.serverIdToConnection.set(serverId, connection);
       }
     } catch (error) {
       logger.debug(() => `Failed to map server ID for ${connection.host}:${connection.port}: ${error}`);
     }
   }
 
+  _refreshServerIdMapping(serverIdHex) {
+    if (!serverIdHex) {
+      return;
+    }
+
+    const matches = this._connectedConnections().filter((connection) => {
+      try {
+        const mappedServerId = connection._managerServerIdHex
+          || normalizeServerIdHex(connection.getServerEthereumAddress(true));
+        if (mappedServerId) {
+          connection._managerServerIdHex = mappedServerId;
+        }
+        return mappedServerId === serverIdHex;
+      } catch (_) {
+        return false;
+      }
+    });
+
+    if (matches.length === 0) {
+      this.serverIdToConnection.delete(serverIdHex);
+      return;
+    }
+
+    this.serverIdToConnection.set(
+      serverIdHex,
+      this._rankConnectedConnections(matches)[0] || matches[0],
+    );
+  }
+
+  _rankConnectedConnections(connected, options = {}) {
+    const { queueRefresh = false } = options;
+    return connected
+      .map((connection, index) => {
+        const hostKey = connection._managerHostKey || normalizeHostKey(joinHostPort(connection.host, connection.port), this.defaultPort);
+        const score = this.relayScores.get(hostKey);
+        const hasScore = !!(score && Number.isFinite(score.ewmaLatencyMs));
+        const fresh = this._isRelayScoreFresh(score);
+        if (queueRefresh && hasScore && !fresh) {
+          this._queueBackgroundProbe(connection, hostKey);
+        }
+        return {
+          connection,
+          index,
+          hasScore,
+          fresh,
+          latency: hasScore ? score.ewmaLatencyMs : Number.POSITIVE_INFINITY,
+          connectedAt: connection._managerConnectedAt || Number.MAX_SAFE_INTEGER,
+        };
+      })
+      .sort((left, right) => {
+        const leftGroup = left.hasScore ? (left.fresh ? 0 : 1) : 2;
+        const rightGroup = right.hasScore ? (right.fresh ? 0 : 1) : 2;
+        if (leftGroup !== rightGroup) {
+          return leftGroup - rightGroup;
+        }
+        if (left.latency !== right.latency) {
+          return left.latency - right.latency;
+        }
+        if (left.connectedAt !== right.connectedAt) {
+          return left.connectedAt - right.connectedAt;
+        }
+        return left.index - right.index;
+      })
+      .map((entry) => entry.connection);
+  }
+
   _localAddressHintFor(connection) {
-    const connected = this._connectedConnections();
+    const connected = this._rankConnectedConnections(this._connectedConnections());
     if (connected.length === 0) {
       return Buffer.alloc(0);
     }
@@ -210,6 +1166,9 @@ class DiodeClientManager extends EventEmitter {
     });
     connection.on('reconnected', () => {
       this._updateServerIdMapping(connection);
+      if (this.relaySelection.enabled) {
+        this._queueBackgroundProbe(connection, hostKey);
+      }
       this.emit('reconnected', connection);
     });
     connection.on('reconnecting', (info) => {
@@ -226,23 +1185,97 @@ class DiodeClientManager extends EventEmitter {
       this.connectionByHost.delete(hostKey);
     }
     this.connections = this.connections.filter((item) => item !== connection);
+    const removedServerIds = new Set();
     for (const [serverId, conn] of this.serverIdToConnection.entries()) {
       if (conn === connection) {
         this.serverIdToConnection.delete(serverId);
+        removedServerIds.add(serverId);
       }
     }
+    if (connection._managerServerIdHex) {
+      removedServerIds.add(connection._managerServerIdHex);
+    }
+    removedServerIds.forEach((serverId) => this._refreshServerIdMapping(serverId));
     this._rpcByConnection.delete(connection);
   }
 
+  _closeManagedConnection(connection) {
+    if (!connection) return;
+    const hostKey = connection._managerHostKey || '';
+    this._unregisterConnection(connection, hostKey);
+    try {
+      connection.close();
+    } catch (_) {}
+  }
+
+  _isProtectedHost(hostKey) {
+    if (!hostKey) {
+      return false;
+    }
+    const score = this.relayScores.get(hostKey);
+    if (score && score.discoveredFrom === 'target') {
+      return true;
+    }
+    for (const cached of this.deviceRelayCache.values()) {
+      const ttlMs = Number.isFinite(cached.ttlMs) ? cached.ttlMs : this.deviceCacheTtlMs;
+      if (ttlMs > 0 && Date.now() - cached.ts < ttlMs && cached.hostKey === hostKey) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _pruneIdleConnections() {
+    if (!this.relaySelection.enabled || !this._startupCoverageComplete) {
+      return;
+    }
+    const warmBudget = Math.max(1, this.relaySelection.warmConnectionBudget);
+    const ranked = this._rankConnectedConnections(this._connectedConnections());
+    const keepHosts = new Set();
+
+    if (this.relaySelection.regionDiverseSeedOrdering) {
+      const seenRegions = new Set();
+      for (const connection of ranked) {
+        if (keepHosts.size >= warmBudget) break;
+        const hostKey = connection._managerHostKey || '';
+        const region = this._getCandidateRegion(hostKey);
+        if (seenRegions.has(region)) continue;
+        seenRegions.add(region);
+        keepHosts.add(hostKey);
+      }
+    }
+
+    for (const connection of ranked) {
+      if (keepHosts.size >= warmBudget) break;
+      keepHosts.add(connection._managerHostKey);
+    }
+
+    for (const connection of ranked) {
+      const hostKey = connection._managerHostKey || '';
+      if (!hostKey) continue;
+      if (keepHosts.has(hostKey) || this._isProtectedHost(hostKey)) {
+        continue;
+      }
+      this._closeManagedConnection(connection);
+    }
+  }
+
   async _ensureConnection(hostEntry) {
-    const { host, port } = splitHostPort(hostEntry, this.defaultPort);
-    const hostKey = joinHostPort(host, port);
+    const hostKey = normalizeHostKey(hostEntry, this.defaultPort);
+    const { host, port } = splitHostPort(hostKey, this.defaultPort);
     if (!host) {
       throw new Error(`Invalid host entry: ${hostEntry}`);
     }
 
     if (this.connectionByHost.has(hostKey)) {
-      return this.connectionByHost.get(hostKey);
+      const existing = this.connectionByHost.get(hostKey);
+      if (isConnected(existing)) {
+        return existing;
+      }
+      if (existing && typeof existing._ensureConnected === 'function') {
+        await existing._ensureConnected();
+      }
+      return existing;
     }
 
     if (this.pendingConnections.has(hostKey)) {
@@ -254,6 +1287,7 @@ class DiodeClientManager extends EventEmitter {
 
     const promise = connection.connect()
       .then(() => {
+        connection._managerConnectedAt = connection._managerConnectedAt || Date.now();
         this._updateServerIdMapping(connection);
         this.emit('connected', connection);
         return connection;
@@ -270,6 +1304,207 @@ class DiodeClientManager extends EventEmitter {
     return promise;
   }
 
+  async _probeConnection(connection, hostKey, discoveredFrom, startedAt = Date.now()) {
+    const timeoutMs = this.relaySelection.probeTimeoutMs;
+    const pingPromise = Promise.resolve()
+      .then(() => this._getRpcFor(connection).ping())
+      .then((result) => {
+        if (!result) {
+          throw new Error(`Relay probe failed for ${hostKey}`);
+        }
+      });
+
+    await Promise.race([
+      pingPromise,
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`Relay probe timed out for ${hostKey}`)), timeoutMs);
+      }),
+    ]);
+
+    const latencyMs = Math.max(1, Date.now() - startedAt);
+    this._recordRelayProbeSuccess(hostKey, latencyMs, discoveredFrom);
+    return connection;
+  }
+
+  async _probeHost(hostEntry, discoveredFrom = 'seed') {
+    const hostKey = normalizeHostKey(hostEntry, this.defaultPort);
+    if (!hostKey) {
+      throw new Error(`Invalid host entry: ${hostEntry}`);
+    }
+    if (this.pendingProbes.has(hostKey)) {
+      return this.pendingProbes.get(hostKey);
+    }
+
+    const startedAt = Date.now();
+    this._lastProbeStartedAt.set(hostKey, startedAt);
+    const probePromise = (async () => {
+      try {
+        const connection = await Promise.race([
+          this._ensureConnection(hostKey),
+          new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`Relay connection timed out for ${hostKey}`)), this.relaySelection.probeTimeoutMs);
+          }),
+        ]);
+        const probedConnection = await this._probeConnection(connection, hostKey, discoveredFrom, startedAt);
+        this._pruneIdleConnections();
+        return probedConnection;
+      } catch (error) {
+        if (String(error && error.message ? error.message : error).includes('Relay connection timed out')) {
+          const stalledConnection = this.connectionByHost.get(hostKey);
+          if (stalledConnection && !isConnected(stalledConnection)) {
+            this._closeManagedConnection(stalledConnection);
+          }
+        }
+        this._recordRelayProbeFailure(hostKey, error);
+        throw error;
+      } finally {
+        this.pendingProbes.delete(hostKey);
+      }
+    })();
+
+    this.pendingProbes.set(hostKey, probePromise);
+    return probePromise;
+  }
+
+  _recordRelayProbeSuccess(hostKey, latencyMs, discoveredFrom) {
+    const now = Date.now();
+    const previous = this.relayScores.get(hostKey) || {
+      hostKey,
+      ewmaLatencyMs: null,
+      lastProbeLatencyMs: null,
+      successCount: 0,
+      failureCount: 0,
+      lastSuccessAt: 0,
+      lastFailureAt: 0,
+      cooldownUntil: 0,
+      discoveredFrom: discoveredFrom || 'seed',
+    };
+
+    const previousLatency = Number.isFinite(previous.ewmaLatencyMs) ? previous.ewmaLatencyMs : null;
+    const ewmaLatencyMs = previousLatency === null
+      ? latencyMs
+      : (RELAY_SCORE_EWMA_WEIGHT * latencyMs) + ((1 - RELAY_SCORE_EWMA_WEIGHT) * previousLatency);
+
+    this.relayScores.set(hostKey, {
+      hostKey,
+      ewmaLatencyMs,
+      lastProbeLatencyMs: latencyMs,
+      successCount: (previous.successCount || 0) + 1,
+      failureCount: previous.failureCount || 0,
+      lastSuccessAt: now,
+      lastFailureAt: previous.lastFailureAt || 0,
+      cooldownUntil: 0,
+      discoveredFrom: discoveredFrom || previous.discoveredFrom || 'seed',
+    });
+    this._scheduleRelayScoreFlush();
+  }
+
+  _recordRelayProbeFailure(hostKey, error) {
+    const now = Date.now();
+    const previous = this.relayScores.get(hostKey) || {
+      hostKey,
+      ewmaLatencyMs: null,
+      lastProbeLatencyMs: null,
+      successCount: 0,
+      failureCount: 0,
+      lastSuccessAt: 0,
+      lastFailureAt: 0,
+      cooldownUntil: 0,
+      discoveredFrom: 'seed',
+    };
+
+    this.relayScores.set(hostKey, {
+      hostKey,
+      ewmaLatencyMs: Number.isFinite(previous.ewmaLatencyMs) ? previous.ewmaLatencyMs : null,
+      lastProbeLatencyMs: previous.lastProbeLatencyMs || null,
+      successCount: previous.successCount || 0,
+      failureCount: (previous.failureCount || 0) + 1,
+      lastSuccessAt: previous.lastSuccessAt || 0,
+      lastFailureAt: now,
+      cooldownUntil: now + RELAY_SCORE_FAILURE_COOLDOWN_MS,
+      discoveredFrom: previous.discoveredFrom || 'seed',
+    });
+    this._scheduleRelayScoreFlush();
+
+    if (error) {
+      logger.debug(() => `Relay probe failed for ${hostKey}: ${error}`);
+    }
+  }
+
+  _selectPreferredConnectedConnection() {
+    const connected = this._connectedConnections();
+    if (connected.length === 0) {
+      return null;
+    }
+    return this._rankConnectedConnections(connected, { queueRefresh: true })[0] || null;
+  }
+
+  _isRelayScoreFresh(score) {
+    return !!(score
+      && Number.isFinite(score.ewmaLatencyMs)
+      && score.lastSuccessAt
+      && (Date.now() - score.lastSuccessAt) <= RELAY_SCORE_FRESH_MS);
+  }
+
+  _queueBackgroundProbe(connection, hostKey) {
+    if (!this.relaySelection.enabled || !connection || !hostKey || !isConnected(connection)) {
+      return;
+    }
+    if (this.pendingProbes.has(hostKey)) {
+      return;
+    }
+    const lastProbeStartedAt = this._lastProbeStartedAt.get(hostKey) || 0;
+    if (Date.now() - lastProbeStartedAt < this.relaySelection.backgroundProbeIntervalMs) {
+      return;
+    }
+
+    void this._probeHost(hostKey, this.relayScores.get(hostKey)?.discoveredFrom || 'seed')
+      .catch((error) => {
+        this._recordRelayProbeFailure(hostKey, error);
+      });
+  }
+
+  _getDeviceCacheEntry(deviceIdHex) {
+    if (this.deviceCacheTtlMs <= 0) {
+      return null;
+    }
+    const cached = this.deviceRelayCache.get(deviceIdHex);
+    if (!cached) {
+      return null;
+    }
+    const ttlMs = Number.isFinite(cached.ttlMs) ? cached.ttlMs : this.deviceCacheTtlMs;
+    if (ttlMs <= 0 || Date.now() - cached.ts >= ttlMs) {
+      this.deviceRelayCache.delete(deviceIdHex);
+      return null;
+    }
+    return cached;
+  }
+
+  _setDeviceCacheEntry(deviceIdHex, entry) {
+    if (this.deviceCacheTtlMs <= 0 || !deviceIdHex || !entry) {
+      return;
+    }
+    this.deviceRelayCache.set(deviceIdHex, {
+      serverIdHex: entry.serverIdHex,
+      hostKey: entry.hostKey,
+      ts: Number.isFinite(entry.ts) ? entry.ts : Date.now(),
+      ttlMs: Number.isFinite(entry.ttlMs) ? entry.ttlMs : this.deviceCacheTtlMs,
+    });
+  }
+
+  _getDeviceCacheTtlForHost(hostKey) {
+    const score = this.relayScores.get(hostKey);
+    if (score && Number.isFinite(score.ewmaLatencyMs) && score.ewmaLatencyMs >= this.relaySelection.slowRelayThresholdMs) {
+      return this.relaySelection.slowDeviceRetryTtlMs;
+    }
+    return this.deviceCacheTtlMs;
+  }
+
+  _getRelayLatencyMs(hostKey) {
+    const score = this.relayScores.get(hostKey);
+    return score && Number.isFinite(score.ewmaLatencyMs) ? score.ewmaLatencyMs : Number.POSITIVE_INFINITY;
+  }
+
   _connectedConnections() {
     return this.connections.filter((connection) => isConnected(connection));
   }
@@ -279,8 +1514,223 @@ class DiodeClientManager extends EventEmitter {
     if (connected.length === 0) {
       return null;
     }
-    this._rrIndex = (this._rrIndex + 1) % connected.length;
-    return connected[this._rrIndex];
+
+    if (!this.relaySelection.enabled) {
+      this._rrIndex = (this._rrIndex + 1) % connected.length;
+      return connected[this._rrIndex];
+    }
+
+    return this._selectPreferredConnectedConnection();
+  }
+
+  async _resolveDeviceRelayCandidate(connection, deviceIdBuffer) {
+    const rpc = this._getRpcFor(connection);
+    const ticket = await rpc.getObject(deviceIdBuffer);
+    const serverIdHex = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
+    if (!serverIdHex) {
+      return null;
+    }
+
+    const existing = this.serverIdToConnection.get(serverIdHex);
+    if (existing && isConnected(existing)) {
+      return {
+        serverIdHex,
+        hostKey: existing._managerHostKey || '',
+        relayConnection: existing,
+        controlConnection: connection,
+      };
+    }
+
+    const nodeId = Buffer.from(serverIdHex.slice(2), 'hex');
+    const nodeInfo = await rpc.getNode(nodeId);
+    if (!nodeInfo || !nodeInfo.host) {
+      return null;
+    }
+
+    const relayPort = nodeInfo.edgePort || nodeInfo.serverPort;
+    if (!relayPort) {
+      return null;
+    }
+
+    return {
+      serverIdHex,
+      hostKey: joinHostPort(nodeInfo.host, relayPort),
+      relayConnection: null,
+      controlConnection: connection,
+    };
+  }
+
+  async _ensureDeviceRelayCandidateConnection(candidate) {
+    if (!candidate || !candidate.hostKey) {
+      return null;
+    }
+    if (candidate.relayConnection && isConnected(candidate.relayConnection)) {
+      return candidate.relayConnection;
+    }
+    candidate.relayConnection = this.relaySelection.enabled
+      ? await this._probeHost(candidate.hostKey, 'target')
+      : await this._ensureConnection(candidate.hostKey);
+    return candidate.relayConnection;
+  }
+
+  _shouldReconcileDeviceRelay(controlHostKey, targetHostKey) {
+    if (!this.relaySelection.enabled || !controlHostKey || !targetHostKey) {
+      return false;
+    }
+
+    const reconciliation = this.relaySelection.deviceRelayReconciliation;
+    if (!reconciliation.enabled || reconciliation.maxControlRelays <= 0) {
+      return false;
+    }
+
+    const targetLatencyMs = this._getRelayLatencyMs(targetHostKey);
+    if (!Number.isFinite(targetLatencyMs) || targetLatencyMs < this.relaySelection.slowRelayThresholdMs) {
+      return false;
+    }
+
+    const controlLatencyMs = this._getRelayLatencyMs(controlHostKey);
+    if (!Number.isFinite(controlLatencyMs)) {
+      return true;
+    }
+    if (targetLatencyMs - controlLatencyMs < reconciliation.minLatencyDeltaMs) {
+      return false;
+    }
+    return targetLatencyMs >= controlLatencyMs * reconciliation.slowdownFactor;
+  }
+
+  async _withTimeout(promiseFactory, timeoutMs, label) {
+    return Promise.race([
+      Promise.resolve().then(() => promiseFactory()),
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  }
+
+  async _reconcileDeviceRelayCandidate(primaryConnection, deviceIdBuffer, initialCandidate, trace = null) {
+    if (!initialCandidate || !initialCandidate.hostKey) {
+      return initialCandidate;
+    }
+
+    const primaryHostKey = primaryConnection && primaryConnection._managerHostKey
+      ? primaryConnection._managerHostKey
+      : '';
+    const shouldReconcile = this._shouldReconcileDeviceRelay(primaryHostKey, initialCandidate.hostKey);
+    if (trace) {
+      trace.reconciliation = trace.reconciliation || {
+        triggered: false,
+        attempted: false,
+        hadAlternateAnswer: false,
+        choseAlternate: false,
+        alternateResults: [],
+      };
+      trace.reconciliation.triggered = shouldReconcile;
+    }
+    if (!shouldReconcile) {
+      return initialCandidate;
+    }
+
+    const reconciliation = this.relaySelection.deviceRelayReconciliation;
+    const alternates = this._rankConnectedConnections(this._connectedConnections(), { queueRefresh: true })
+      .filter((connection) => connection !== primaryConnection)
+      .slice(0, reconciliation.maxControlRelays);
+    if (trace) {
+      trace.reconciliation.attempted = alternates.length > 0;
+    }
+    if (alternates.length === 0) {
+      return initialCandidate;
+    }
+
+    const attempts = await Promise.allSettled(alternates.map(async (connection) => {
+      const startedAt = Date.now();
+      try {
+        const candidate = await this._withTimeout(
+          async () => this._resolveDeviceRelayCandidate(connection, deviceIdBuffer),
+          reconciliation.timeoutMs,
+          `Device relay reconciliation via ${connection._managerHostKey || 'unknown relay'}`
+        );
+        return {
+          ok: true,
+          controlHostKey: connection._managerHostKey || '',
+          lookupMs: Date.now() - startedAt,
+          candidate,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          controlHostKey: connection._managerHostKey || '',
+          lookupMs: Date.now() - startedAt,
+          error: String(error && error.message ? error.message : error),
+          candidate: null,
+        };
+      }
+    }));
+
+    let bestCandidate = initialCandidate;
+    let bestLatencyMs = this._getRelayLatencyMs(initialCandidate.hostKey);
+    for (const result of attempts) {
+      if (result.status !== 'fulfilled' || !result.value) {
+        continue;
+      }
+      const attempt = result.value;
+      const candidate = attempt.candidate;
+      const differentAnswer = !!(
+        candidate
+        && candidate.hostKey
+        && (
+          candidate.serverIdHex !== initialCandidate.serverIdHex
+          || candidate.hostKey !== initialCandidate.hostKey
+        )
+      );
+      if (trace) {
+        trace.reconciliation.alternateResults.push({
+          controlHostKey: attempt.controlHostKey,
+          lookupMs: attempt.lookupMs,
+          ok: attempt.ok,
+          error: attempt.error || null,
+          serverIdHex: candidate ? candidate.serverIdHex : null,
+          hostKey: candidate ? candidate.hostKey : null,
+          differentAnswer,
+          chosen: false,
+        });
+        if (differentAnswer) {
+          trace.reconciliation.hadAlternateAnswer = true;
+        }
+      }
+      if (!attempt.ok || !candidate || !candidate.hostKey) {
+        continue;
+      }
+      if (candidate.serverIdHex === bestCandidate.serverIdHex && candidate.hostKey === bestCandidate.hostKey) {
+        continue;
+      }
+      try {
+        await this._ensureDeviceRelayCandidateConnection(candidate);
+      } catch (error) {
+        logger.debug(() => `Device relay reconciliation candidate failed for ${candidate.hostKey}: ${error}`);
+        continue;
+      }
+      const candidateLatencyMs = this._getRelayLatencyMs(candidate.hostKey);
+      if (!Number.isFinite(candidateLatencyMs)) {
+        continue;
+      }
+      if (!Number.isFinite(bestLatencyMs) || candidateLatencyMs < bestLatencyMs) {
+        bestCandidate = candidate;
+        bestLatencyMs = candidateLatencyMs;
+      }
+    }
+
+    if (trace && trace.reconciliation && bestCandidate !== initialCandidate) {
+      trace.reconciliation.choseAlternate = true;
+      const chosen = trace.reconciliation.alternateResults.find((entry) => (
+        entry.serverIdHex === bestCandidate.serverIdHex
+        && entry.hostKey === bestCandidate.hostKey
+      ));
+      if (chosen) {
+        chosen.chosen = true;
+      }
+    }
+
+    return bestCandidate;
   }
 
   async connect() {
@@ -288,16 +1738,126 @@ class DiodeClientManager extends EventEmitter {
       throw new Error('No Diode hosts configured');
     }
 
-    const results = await Promise.allSettled(
-      this.initialHosts.map((host) => this._ensureConnection(host))
-    );
+    if (!this.relaySelection.enabled) {
+      const results = await Promise.allSettled(
+        this.initialHosts.map((host) => this._ensureConnection(host))
+      );
 
-    const success = results.some((result) => result.status === 'fulfilled');
-    if (!success) {
+      const success = results.some((result) => result.status === 'fulfilled');
+      if (!success) {
+        const errorMessages = results
+          .filter((result) => result.status === 'rejected')
+          .map((result) => result.reason && result.reason.message ? result.reason.message : String(result.reason));
+        throw new Error(`Failed to connect to any Diode hosts. ${errorMessages.join('; ')}`);
+      }
+
+      return this;
+    }
+
+    const initialSource = this._hasExplicitHost || this._hasExplicitHosts ? 'configured' : 'seed';
+    const initialCandidates = this.initialHosts.map((hostKey, index) => (
+      this._createCandidate(hostKey, initialSource, index)
+    ));
+
+    if (!this.relaySelection.probeAllInitialCandidates) {
+      const candidates = await this._buildStartupCandidates();
+      const requiredCoverageCandidates = this._rankRelayCandidates(candidates).slice(0, this.relaySelection.minReadyConnections);
+      const results = await runWithConcurrency(
+        requiredCoverageCandidates,
+        this.relaySelection.startupConcurrency,
+        (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+      );
+
+      const successes = results.filter((result) => result.status === 'fulfilled');
+      if (successes.length === 0) {
+        const errorMessages = results
+          .filter((result) => result.status === 'rejected')
+          .map((result) => result.reason && result.reason.message ? result.reason.message : String(result.reason));
+        throw new Error(`Failed to connect to any Diode hosts. ${errorMessages.join('; ')}`);
+      }
+
+      this._startupCoverageComplete = true;
+      this._pruneIdleConnections();
+      return this;
+    }
+
+    const allRequiredCoverageCandidates = this._getInitialCoverageCandidates(initialCandidates);
+    const bootstrapSeedCandidates = this._getStartupSeedBootstrapCandidates(initialCandidates);
+    const bootstrapCoveragePromise = runWithConcurrency(
+      bootstrapSeedCandidates,
+      this.relaySelection.startupConcurrency,
+      (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+    );
+    const candidatesPromise = this._buildStartupCandidates();
+    const [bootstrapResults, candidates] = await Promise.all([bootstrapCoveragePromise, candidatesPromise]);
+
+    const startupNetworkCandidates = this._selectStartupNetworkCandidates(candidates);
+    const useReducedSeedCoverage = (
+      !this._hasExplicitHost
+      && !this._hasExplicitHosts
+      && this.relaySelection.networkDiscovery.enabled
+      && startupNetworkCandidates.length > 0
+    );
+    const requiredCoverageCandidates = useReducedSeedCoverage
+      ? bootstrapSeedCandidates
+      : allRequiredCoverageCandidates;
+    const bootstrapCoverageHostKeys = new Set(bootstrapSeedCandidates.map((candidate) => candidate.hostKey));
+    const remainingRequiredCoverageCandidates = useReducedSeedCoverage
+      ? []
+      : allRequiredCoverageCandidates.filter((candidate) => !bootstrapCoverageHostKeys.has(candidate.hostKey));
+    const initialCoverageCandidates = [];
+    const coverageHostKeys = new Set();
+    [...requiredCoverageCandidates, ...startupNetworkCandidates].forEach((candidate) => {
+      if (!coverageHostKeys.has(candidate.hostKey)) {
+        coverageHostKeys.add(candidate.hostKey);
+        initialCoverageCandidates.push(candidate);
+      }
+    });
+
+    const remainingCandidates = this._rankRelayCandidates(
+      candidates.filter((candidate) => !coverageHostKeys.has(candidate.hostKey))
+    );
+    const backgroundNetworkCandidates = this._selectBackgroundNetworkCandidates(remainingCandidates);
+    const backgroundCandidates = [
+      ...backgroundNetworkCandidates,
+      ...remainingCandidates.filter((candidate) => candidate.source !== 'network'),
+    ];
+
+    const additionalRequiredResults = remainingRequiredCoverageCandidates.length > 0
+      ? await runWithConcurrency(
+        remainingRequiredCoverageCandidates,
+        this.relaySelection.startupConcurrency,
+        (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+      )
+      : [];
+    const networkResults = startupNetworkCandidates.length > 0
+      ? await runWithConcurrency(
+        startupNetworkCandidates,
+        this.relaySelection.startupConcurrency,
+        (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+      )
+      : [];
+    const results = [...bootstrapResults, ...additionalRequiredResults, ...networkResults];
+
+    const successes = results.filter((result) => result.status === 'fulfilled');
+    if (successes.length === 0) {
       const errorMessages = results
         .filter((result) => result.status === 'rejected')
         .map((result) => result.reason && result.reason.message ? result.reason.message : String(result.reason));
       throw new Error(`Failed to connect to any Diode hosts. ${errorMessages.join('; ')}`);
+    }
+
+    this._startupCoverageComplete = true;
+    this._pruneIdleConnections();
+
+    if (backgroundCandidates.length > 0 && this.relaySelection.continueProbingUntestedSeeds) {
+      this._backgroundWarmupPromise = runWithConcurrency(
+        backgroundCandidates,
+        this.relaySelection.startupConcurrency,
+        (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+      ).catch((error) => {
+        logger.debug(() => `Background relay measurement failed: ${error}`);
+      });
     }
 
     return this;
@@ -309,15 +1869,39 @@ class DiodeClientManager extends EventEmitter {
       throw new Error('Invalid device ID');
     }
     const deviceIdHex = deviceIdBuffer.toString('hex');
+    const trace = {
+      deviceId: `0x${deviceIdHex}`,
+      primaryControlHostKey: null,
+      primaryLookupMs: null,
+      controlPlaneSlowThresholdMs: Math.max(
+        this.relaySelection.probeTimeoutMs,
+        this.relaySelection.deviceRelayReconciliation.timeoutMs,
+      ),
+      controlPlaneSlow: false,
+      initialServerIdHex: null,
+      initialHostKey: null,
+      initialConnectMs: null,
+      finalServerIdHex: null,
+      finalHostKey: null,
+      reconciliation: {
+        triggered: false,
+        attempted: false,
+        hadAlternateAnswer: false,
+        choseAlternate: false,
+        alternateResults: [],
+      },
+    };
+    this._lastDeviceResolutionTrace = trace;
 
-    if (this.deviceCacheTtlMs > 0) {
-      const cached = this.deviceRelayCache.get(deviceIdHex);
-      if (cached && Date.now() - cached.ts < this.deviceCacheTtlMs) {
-        const cachedConn = this.serverIdToConnection.get(cached.serverIdHex) ||
-          this.connectionByHost.get(cached.hostKey);
-        if (cachedConn && isConnected(cachedConn)) {
-          return cachedConn;
-        }
+    const cached = this._getDeviceCacheEntry(deviceIdHex);
+    if (cached) {
+      const cachedConn = this.serverIdToConnection.get(cached.serverIdHex)
+        || this.connectionByHost.get(cached.hostKey);
+      if (cachedConn && isConnected(cachedConn)) {
+        trace.cacheHit = true;
+        trace.finalServerIdHex = cached.serverIdHex;
+        trace.finalHostKey = cached.hostKey;
+        return cachedConn;
       }
     }
 
@@ -325,61 +1909,58 @@ class DiodeClientManager extends EventEmitter {
     if (!primary) {
       throw new Error('No connected relay available');
     }
+    trace.primaryControlHostKey = primary._managerHostKey || null;
 
-    let ticket = null;
+    let candidate = null;
     try {
-      ticket = await this._getRpcFor(primary).getObject(deviceIdBuffer);
+      const startedAt = Date.now();
+      candidate = await this._resolveDeviceRelayCandidate(primary, deviceIdBuffer);
+      trace.primaryLookupMs = Date.now() - startedAt;
+      trace.controlPlaneSlow = trace.primaryLookupMs > trace.controlPlaneSlowThresholdMs;
     } catch (error) {
       logger.warn(() => `Failed to resolve device ticket: ${error}`);
+      trace.error = String(error && error.message ? error.message : error);
       return primary;
     }
-
-    const serverIdHex = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
-    if (!serverIdHex) {
+    if (!candidate || !candidate.serverIdHex) {
       return primary;
     }
+    trace.initialServerIdHex = candidate.serverIdHex;
+    trace.initialHostKey = candidate.hostKey || null;
 
-    const existing = this.serverIdToConnection.get(serverIdHex);
-    if (existing && isConnected(existing)) {
-      this.deviceRelayCache.set(deviceIdHex, {
-        serverIdHex,
-        hostKey: existing._managerHostKey || '',
+    if (candidate.relayConnection && isConnected(candidate.relayConnection)) {
+      const hostKey = candidate.hostKey || candidate.relayConnection._managerHostKey || '';
+      this._setDeviceCacheEntry(deviceIdHex, {
+        serverIdHex: candidate.serverIdHex,
+        hostKey,
         ts: Date.now(),
+        ttlMs: this._getDeviceCacheTtlForHost(hostKey),
       });
-      return existing;
+      trace.finalServerIdHex = candidate.serverIdHex;
+      trace.finalHostKey = hostKey;
+      return candidate.relayConnection;
     }
 
-    let nodeInfo = null;
     try {
-      const nodeId = Buffer.from(serverIdHex.slice(2), 'hex');
-      nodeInfo = await this._getRpcFor(primary).getNode(nodeId);
+      const startedAt = Date.now();
+      await this._ensureDeviceRelayCandidateConnection(candidate);
+      trace.initialConnectMs = Date.now() - startedAt;
     } catch (error) {
-      logger.warn(() => `Failed to resolve relay node for ${serverIdHex}: ${error}`);
+      logger.warn(() => `Failed to connect to relay ${candidate.hostKey}: ${error}`);
+      trace.error = String(error && error.message ? error.message : error);
       return primary;
     }
 
-    if (!nodeInfo || !nodeInfo.host) {
-      return primary;
-    }
-
-    const relayPort = nodeInfo.edgePort || nodeInfo.serverPort;
-    if (!relayPort) {
-      return primary;
-    }
-
-    const hostKey = joinHostPort(nodeInfo.host, relayPort);
-    let relayConnection;
-    try {
-      relayConnection = await this._ensureConnection(hostKey);
-    } catch (error) {
-      logger.warn(() => `Failed to connect to relay ${hostKey}: ${error}`);
-      return primary;
-    }
-
-    this.deviceRelayCache.set(deviceIdHex, {
-      serverIdHex,
+    candidate = await this._reconcileDeviceRelayCandidate(primary, deviceIdBuffer, candidate, trace);
+    const hostKey = candidate.hostKey || '';
+    const relayConnection = candidate.relayConnection || this.connectionByHost.get(hostKey) || primary;
+    trace.finalServerIdHex = candidate.serverIdHex;
+    trace.finalHostKey = hostKey;
+    this._setDeviceCacheEntry(deviceIdHex, {
+      serverIdHex: candidate.serverIdHex,
       hostKey,
       ts: Date.now(),
+      ttlMs: this._getDeviceCacheTtlForHost(hostKey),
     });
 
     return relayConnection || primary;
@@ -396,26 +1977,21 @@ class DiodeClientManager extends EventEmitter {
       throw new Error('No connected relay available');
     }
 
-    const ticket = await this._getRpcFor(primary).getObject(deviceIdBuffer);
-    const serverIdHex = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
-    if (!serverIdHex) {
+    let candidate = await this._resolveDeviceRelayCandidate(primary, deviceIdBuffer);
+    if (!candidate || !candidate.serverIdHex || !candidate.hostKey) {
       throw new Error('Device ticket missing server ID');
     }
 
-    const nodeId = Buffer.from(serverIdHex.slice(2), 'hex');
-    const nodeInfo = await this._getRpcFor(primary).getNode(nodeId);
-    if (!nodeInfo || !nodeInfo.host) {
-      throw new Error('Relay node info missing host');
-    }
-    const relayPort = nodeInfo.edgePort || nodeInfo.serverPort;
-    if (!relayPort) {
-      throw new Error('Relay node info missing port');
-    }
+    try {
+      await this._ensureDeviceRelayCandidateConnection(candidate);
+    } catch (_) {}
+    candidate = await this._reconcileDeviceRelayCandidate(primary, deviceIdBuffer, candidate);
+    const { host, port } = splitHostPort(candidate.hostKey, this.defaultPort);
 
     return {
-      serverId: serverIdHex,
-      host: nodeInfo.host,
-      port: relayPort,
+      serverId: candidate.serverIdHex,
+      host,
+      port,
     };
   }
 
@@ -424,10 +2000,13 @@ class DiodeClientManager extends EventEmitter {
   }
 
   close() {
-    for (const connection of this.connections) {
-      try {
-        connection.close();
-      } catch (_) {}
+    if (this._relayScoreFlushTimer) {
+      clearTimeout(this._relayScoreFlushTimer);
+      this._relayScoreFlushTimer = null;
+    }
+    this._flushRelayScores();
+    for (const connection of this.connections.slice()) {
+      this._closeManagedConnection(connection);
     }
   }
 }
