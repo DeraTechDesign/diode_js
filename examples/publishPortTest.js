@@ -10,9 +10,10 @@ async function startPublishing() {
 
   // Create a PublishPort instance with initial ports
   const publishPort = new PublishPort(client, {
-    3000: { mode: 'public' },
+    3000: { mode: 'public', host: '192.168.1.10' },
     8080: { 
       mode: 'private',
+      host: 'backend.internal',
       whitelist: ['0xca1e71d8105a598810578fb6042fa8cbc1e7f039'] // Replace with actual addresses
     }
   }, keyLocation);
@@ -29,7 +30,7 @@ async function startPublishing() {
   // After 15 seconds, add multiple ports
   setTimeout(() => {
     console.log("Adding multiple ports");
-    publishPort.addPort(3000,{ mode: 'public' });
+    publishPort.addPort(3000,{ mode: 'public', host: '127.0.0.1' });
     console.log('Updated published ports:', publishPort.getPublishedPorts());
   }, 15000);
   

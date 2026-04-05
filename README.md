@@ -326,9 +326,11 @@ async function main() {
   
   // Option 2: Object with port configurations for public/private access control
   const publishedPortsWithConfig = {
-    8080: { mode: 'public' },  // Public port, accessible by any device
+    8080: { mode: 'public' },  // Public port on 127.0.0.1, accessible by any device
+    8081: { mode: 'public', host: '192.168.1.10' }, // Forward to another reachable host
     3000: { 
       mode: 'private',  
+      host: 'backend.internal',
       whitelist: ['0x1234abcd5678...', '0x9876fedc5432...'] // Only these devices can connect
     }
   };
@@ -451,13 +453,14 @@ Connections returned by `getConnections()` or `getConnectionForDevice()` emit `r
   - `connection` (DiodeClientManager): An instance of `DiodeClientManager`.
   - `publishedPorts` (array|object): Either:
     - An array of ports to publish (all public mode)
-    - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'] } }`
+    - An object mapping ports to their configuration: `{ port: { mode: 'public'|'private', whitelist: ['0x123...'], host: '127.0.0.1' } }`
   - `_certPath` (string): Has no functionality and maintained for backward compatibility.
 
 - **Methods**:
   - `addPort(port, config)`: Adds a new port to publish. Config is optional and defaults to public mode.
     - `port` (number): The port number to publish.
-    - `config` (object): Optional configuration with `mode` ('public'|'private') and `whitelist` array.
+    - `config` (object): Optional configuration with `mode` ('public'|'private'), `whitelist` array, and `host` string.
+      - `host` (string, optional): Target IP or hostname for the published service. Defaults to `127.0.0.1`.
   - `removePort(port)`: Removes a published port.
     - `port` (number): The port number to remove.
   - `addPorts(ports)`: Adds multiple ports at once (equivalent to the constructor's publishedPorts parameter).

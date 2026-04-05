@@ -38,6 +38,25 @@ function normalizeDeviceId(raw) {
   return '';
 }
 
+function normalizePublishedPortConfig(config = {}) {
+  const hasHost = Object.prototype.hasOwnProperty.call(config, 'host');
+  const rawHost = hasHost ? config.host : '127.0.0.1';
+  if (typeof rawHost !== 'string') {
+    throw new TypeError('PublishPort config.host must be a non-empty string');
+  }
+
+  const host = rawHost.trim();
+  if (!host) {
+    throw new TypeError('PublishPort config.host must be a non-empty string');
+  }
+
+  return {
+    mode: config.mode || 'public',
+    whitelist: Array.isArray(config.whitelist) ? config.whitelist : [],
+    host,
+  };
+}
+
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
     super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
@@ -93,14 +112,11 @@ class PublishPort extends EventEmitter {
     const portNum = parseInt(port, 10);
     
     // Normalize the configuration
-    const portConfig = {
-      mode: config.mode || 'public',
-      whitelist: Array.isArray(config.whitelist) ? config.whitelist : []
-    };
+    const portConfig = normalizePublishedPortConfig(config);
     
     // Add to map
     this.publishedPorts.set(portNum, portConfig);
-    logger.info(() => `Added published port ${portNum} with mode: ${portConfig.mode}`);
+    logger.info(() => `Added published port ${portNum} with mode: ${portConfig.mode}, host: ${portConfig.host}`);
     
     return true;
   }
@@ -186,6 +202,10 @@ class PublishPort extends EventEmitter {
     return rpc;
   }
 
+  _getPublishedPortConfig(port) {
+    return this.publishedPorts.get(port);
+  }
+
   startListening() {
     if (this._listening) return this; // idempotent
     // Listen for unsolicited messages from the connection
@@ -269,7 +289,7 @@ class PublishPort extends EventEmitter {
     }
 
     // Get port configuration and check whitelist if in private mode
-    const portConfig = this.publishedPorts.get(port);
+    const portConfig = this._getPublishedPortConfig(port);
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
@@ -281,15 +301,15 @@ class PublishPort extends EventEmitter {
 
     // Handle based on protocol
     if (protocol === 'tcp') {
-      this.handleTCPConnection(sessionId, ref, port, deviceId, connection);
+      this.handleTCPConnection(sessionId, ref, port, deviceId, portConfig, connection);
     } else if (protocol === 'tls') {
       if (isHandshake) {
         this.handleTLSHandshake(sessionId, ref, port, deviceId, connection);
       } else {
-        this.handleTLSConnection(sessionId, ref, port, deviceId, connection);
+        this.handleTLSConnection(sessionId, ref, port, deviceId, portConfig, connection);
       }
     } else if (protocol === 'udp') {
-      this.handleUDPConnection(sessionId, ref, port, deviceId, connection);
+      this.handleUDPConnection(sessionId, ref, port, deviceId, portConfig, connection);
     } else {
       logger.warn(() => `Unsupported protocol: ${protocol}`);
       rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`);
@@ -449,7 +469,7 @@ class PublishPort extends EventEmitter {
     }
 
     // Get port configuration and check whitelist if in private mode
-    const portConfig = this.publishedPorts.get(port);
+    const portConfig = this._getPublishedPortConfig(port);
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
@@ -473,6 +493,7 @@ class PublishPort extends EventEmitter {
     const session = {
       physicalPort,
       port,
+      host: portConfig.host,
       protocol,
       deviceId: deviceId.toLowerCase(),
       connection,
@@ -527,7 +548,7 @@ class PublishPort extends EventEmitter {
 
   handleNativeTCPRelay(sessionId, physicalPortRef, session, connection) {
     const rpc = this._getRpcFor(connection);
-    const { physicalPort, port, deviceId } = session;
+    const { physicalPort, port, host, deviceId } = session;
     let responded = false;
     const sendOk = () => {
       if (responded) return;
@@ -544,7 +565,7 @@ class PublishPort extends EventEmitter {
     const relaySocket = net.connect({ host: relayHost, port: physicalPort }, () => {
       relaySocket.setNoDelay(true);
     });
-    const localSocket = net.connect({ port }, () => {
+    const localSocket = net.connect({ port, host }, () => {
       localSocket.setNoDelay(true);
     });
     localSocket.pause();
@@ -616,7 +637,7 @@ class PublishPort extends EventEmitter {
 
   handleNativeUDPRelay(sessionId, physicalPortRef, session, connection) {
     const rpc = this._getRpcFor(connection);
-    const { physicalPort, port, deviceId } = session;
+    const { physicalPort, port, host, deviceId } = session;
     let responded = false;
     const sendOk = () => {
       if (responded) return;
@@ -672,7 +693,7 @@ class PublishPort extends EventEmitter {
       relayReady = true;
       maybeReady();
     });
-    localSocket.connect(port, '127.0.0.1', () => {
+    localSocket.connect(port, host, () => {
       localReady = true;
       maybeReady();
     });
@@ -706,12 +727,12 @@ class PublishPort extends EventEmitter {
     }
   }
 
-  handleTCPConnection(sessionId, ref, port, deviceId, connection) {
+  handleTCPConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
     // Create a TCP connection to the local service on the specified port
-    const localSocket = net.connect({ port: port }, () => {
+    const localSocket = net.connect({ port, host: portConfig.host }, () => {
       localSocket.setNoDelay(true);
-      logger.info(() => `Connected to local TCP service on port ${port}`);
+      logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
       // Send success response
       rpc.sendResponse(sessionId, ref, 'ok');
     });
@@ -720,10 +741,10 @@ class PublishPort extends EventEmitter {
     this.setupLocalSocketHandlers(localSocket, ref, 'tcp', rpc, connection);
 
     // Store the local socket with the ref using connection's method
-    connection.addConnection(ref, { socket: localSocket, protocol: 'tcp', port, deviceId });
+    connection.addConnection(ref, { socket: localSocket, protocol: 'tcp', port, host: portConfig.host, deviceId });
   }
 
-  handleTLSConnection(sessionId, ref, port, deviceId, connection) {
+  handleTLSConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
     // Create a DiodeSocket instance
     const diodeSocket = new DiodeSocket(ref, rpc);
@@ -748,8 +769,8 @@ class PublishPort extends EventEmitter {
     });
     tlsSocket.setNoDelay(true);
     // Connect to the local service (TCP or TLS as needed)
-    const localSocket = net.connect({ port: port }, () => {
-      logger.info(() => `Connected to local TCP service on port ${port}`);
+    const localSocket = net.connect({ port, host: portConfig.host }, () => {
+      logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
       // Send success response
       rpc.sendResponse(sessionId, ref, 'ok');
     });
@@ -775,11 +796,12 @@ class PublishPort extends EventEmitter {
       localSocket,
       protocol: 'tls',
       port,
+      host: portConfig.host,
       deviceId,
     });
   }
 
-  handleUDPConnection(sessionId, ref, port, deviceId, connection) {
+  handleUDPConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
     // Create a UDP socket
     const localSocket = dgram.createSocket('udp4');
@@ -795,7 +817,7 @@ class PublishPort extends EventEmitter {
     });
 
     // Store the remote address and port from the Diode client
-    const remoteInfo = {port, address: '127.0.0.1'};
+    const remoteInfo = { port, address: portConfig.host };
 
     // Send success response
     rpc.sendResponse(sessionId, ref, 'ok');
@@ -806,10 +828,11 @@ class PublishPort extends EventEmitter {
       protocol: 'udp',
       remoteInfo,
       port,
+      host: portConfig.host,
       deviceId
     });
 
-    logger.info(() => `UDP connection set up on port ${port}`);
+    logger.info(() => `UDP connection set up for ${portConfig.host}:${port}`);
 
     // Handle messages from the local UDP service
     localSocket.on('message', (msg, rinfo) => {
@@ -835,7 +858,7 @@ class PublishPort extends EventEmitter {
     const connectionInfo = connection.getConnection(ref);
     // Check if the port is still open and address is still in whitelist
     if (connectionInfo) {
-      const { socket: localSocket, protocol, remoteInfo, port, deviceId } = connectionInfo;
+      const { socket: localSocket, protocol, remoteInfo, port, host, deviceId } = connectionInfo;
 
       if (!this.publishedPorts.has(port)) {
         logger.warn(() => `Port ${port} is not published. Sending portclose.`);
@@ -844,7 +867,7 @@ class PublishPort extends EventEmitter {
         return;
       }
 
-      const portConfig = this.publishedPorts.get(port);
+      const portConfig = this._getPublishedPortConfig(port);
       if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
         if (!portConfig.whitelist.includes(deviceId)) {
           logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Sending portclose.`);
@@ -865,7 +888,7 @@ class PublishPort extends EventEmitter {
 
         // Update remoteInfo if not set
         if (!localSocket.remoteAddress) {
-          localSocket.remoteAddress = '127.0.0.1'; // Assuming local service is on localhost
+          localSocket.remoteAddress = host || (remoteInfo && remoteInfo.address) || portConfig.host;
           localSocket.remotePort = port;
         }
       } else if (protocol === 'tcp') {
