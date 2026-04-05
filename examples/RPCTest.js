@@ -3,8 +3,13 @@ const { makeReadable } = require('../utils');
 
 async function main() {
   const keyLocation = './db/keys.json';
+  const fleetContract = process.env.DIODE_FLEET_CONTRACT;
+  const nextFleetContract = process.env.DIODE_NEXT_FLEET_CONTRACT;
 
-  const client = new DiodeClientManager({ keyLocation });
+  const client = new DiodeClientManager({
+    keyLocation,
+    ...(fleetContract ? { fleetContract } : {}),
+  });
   await client.connect();
   const [connection] = client.getConnections();
   if (!connection) {
@@ -15,6 +20,11 @@ async function main() {
   try {
     const address = connection.getEthereumAddress();
     console.log('Address:', address);
+    console.log('Current fleet contract:', connection.fleetContractHex);
+    if (nextFleetContract) {
+      client.setFleetContract(nextFleetContract);
+      console.log('Updated fleet contract for future tickets:', connection.fleetContractHex);
+    }
     const ping = await rpc.ping();
     console.log('Ping:', ping);
     const blockPeak = await rpc.getBlockPeak();

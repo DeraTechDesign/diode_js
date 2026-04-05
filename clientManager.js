@@ -6,6 +6,7 @@ const DiodeConnection = require('./connection');
 const DiodeRPC = require('./rpc');
 const { fetchNetworkDirectory } = require('./networkDiscoveryClient');
 const logger = require('./logger');
+const { DEFAULT_FLEET_CONTRACT, normalizeFleetContractAddress } = require('./utils');
 
 const DEFAULT_DIODE_ADDRS = [
   'as1.prenet.diode.io:41046',
@@ -176,9 +177,27 @@ class DiodeClientManager extends EventEmitter {
     this._startupCoverageComplete = false;
     this._lastNetworkDiscoveryStats = null;
     this._lastDeviceResolutionTrace = null;
+    this.fleetContract = DEFAULT_FLEET_CONTRACT;
+
+    if (options.fleetContract !== undefined) {
+      this.setFleetContract(options.fleetContract);
+    }
 
     this.initialHosts = this._buildInitialHosts(options);
     this._loadRelayScores();
+  }
+
+  setFleetContract(address) {
+    const normalizedFleetContract = normalizeFleetContractAddress(address);
+    this.fleetContract = normalizedFleetContract;
+
+    for (const connection of this.connections) {
+      if (connection && typeof connection.setFleetContract === 'function') {
+        connection.setFleetContract(normalizedFleetContract);
+      }
+    }
+
+    return this;
   }
 
   _buildRelaySelectionOptions(options = {}) {
@@ -1157,6 +1176,9 @@ class DiodeClientManager extends EventEmitter {
     connection._managerHostKey = hostKey;
     this.connections.push(connection);
     this.connectionByHost.set(hostKey, connection);
+    if (typeof connection.setFleetContract === 'function') {
+      connection.setFleetContract(this.fleetContract);
+    }
     if (typeof connection.setLocalAddressProvider === 'function') {
       connection.setLocalAddressProvider(() => this._localAddressHintFor(connection));
     }

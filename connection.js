@@ -3,7 +3,19 @@ const tls = require('tls');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
-const { makeReadable, parseRequestId, parseResponseType, parseReason, parseUInt, generateCert, ensureDirectoryExistence, loadOrGenerateKeyPair, toBufferView } = require('./utils');
+const {
+  makeReadable,
+  parseRequestId,
+  parseResponseType,
+  parseReason,
+  parseUInt,
+  generateCert,
+  ensureDirectoryExistence,
+  loadOrGenerateKeyPair,
+  toBufferView,
+  DEFAULT_FLEET_CONTRACT,
+  normalizeFleetContractAddress,
+} = require('./utils');
 const { Buffer } = require('buffer'); // Import Buffer
 const asn1 = require('asn1.js');
 const secp256k1 = require('secp256k1');
@@ -48,6 +60,8 @@ class DiodeConnection extends EventEmitter {
     this.certPem = null;
     this._serverEthAddress = null; // cache after first read
     this.localAddressProvider = null;
+    this.fleetContractHex = DEFAULT_FLEET_CONTRACT;
+    this.fleetContract = Buffer.from(DEFAULT_FLEET_CONTRACT.slice(2), 'hex');
     // Load or generate keypair
     this.keyPair = loadOrGenerateKeyPair(this.keyLocation);
     
@@ -280,6 +294,13 @@ class DiodeConnection extends EventEmitter {
   // Optional provider for LocalAddr ticket hint (Buffer or string)
   setLocalAddressProvider(provider) {
     this.localAddressProvider = typeof provider === 'function' ? provider : null;
+    return this;
+  }
+
+  setFleetContract(fleetContract) {
+    const normalizedFleetContract = normalizeFleetContractAddress(fleetContract);
+    this.fleetContractHex = normalizedFleetContract;
+    this.fleetContract = Buffer.from(normalizedFleetContract.slice(2), 'hex');
     return this;
   }
 
@@ -592,7 +613,7 @@ class DiodeConnection extends EventEmitter {
 
   async createTicketSignature(serverIdBuffer, totalConnections, totalBytes, localAddress, epoch) { 
     const chainId = 1284;
-    const fleetContractBuffer = ethUtil.toBuffer('0x6000000000000000000000000000000000000000'); // 20-byte Buffer
+    const fleetContractBuffer = this.fleetContract;
   
     const localAddressBytes = Buffer.isBuffer(localAddress) || localAddress instanceof Uint8Array
       ? toBufferView(localAddress)
@@ -637,7 +658,7 @@ class DiodeConnection extends EventEmitter {
 
   async createTicketCommand() {
     const chainId = 1284;
-    const fleetContract = ethUtil.toBuffer('0x6000000000000000000000000000000000000000')
+    const fleetContract = this.fleetContract;
     let localAddress = '';
     if (typeof this.localAddressProvider === 'function') {
       try {

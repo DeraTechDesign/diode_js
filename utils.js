@@ -199,6 +199,30 @@ function ensureDirectoryExistence(filePath) {
   fs.mkdirSync(dirname);
 }
 
+const DEFAULT_FLEET_CONTRACT = '0x6000000000000000000000000000000000000000';
+
+function normalizeFleetContractAddress(value) {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    const buffer = toBufferView(value);
+    if (buffer.length !== 20) {
+      throw new Error('fleetContract must be a 20-byte EVM address');
+    }
+    return `0x${buffer.toString('hex')}`.toLowerCase();
+  }
+
+  if (typeof value !== 'string') {
+    throw new Error('fleetContract must be a 20-byte EVM address hex string');
+  }
+
+  const trimmed = value.trim();
+  const hex = trimmed.toLowerCase().startsWith('0x') ? trimmed.slice(2) : trimmed;
+  if (!/^[0-9a-fA-F]{40}$/.test(hex)) {
+    throw new Error('fleetContract must be a 20-byte EVM address hex string');
+  }
+
+  return `0x${hex.toLowerCase()}`;
+}
+
 module.exports = { 
   makeReadable, 
   parseRequestId, 
@@ -209,4 +233,6 @@ module.exports = {
   loadOrGenerateKeyPair,
   ensureDirectoryExistence,
   toBufferView,
+  DEFAULT_FLEET_CONTRACT,
+  normalizeFleetContractAddress,
 };

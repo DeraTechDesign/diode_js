@@ -8,6 +8,7 @@ const { WebSocketServer } = require('ws');
 
 const DiodeClientManager = require('../clientManager');
 const { fetchNetworkDirectory } = require('../networkDiscoveryClient');
+const { DEFAULT_FLEET_CONTRACT } = require('../utils');
 
 const networkSnapshot = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures', 'dio-network-snapshot.json'), 'utf8')
@@ -48,6 +49,8 @@ class FakeConnection extends EventEmitter {
     this.socket = { destroyed: false };
     this.closeCount = 0;
     this.serverEthereumAddress = options.serverEthereumAddress || '0x' + Buffer.from(hostKey).toString('hex').slice(0, 40).padEnd(40, '0');
+    this.fleetContract = null;
+    this.fleetContractUpdates = [];
     this.RPC = {
       ping: async () => {
         await delay(options.pingDelayMs || 0);
@@ -64,6 +67,12 @@ class FakeConnection extends EventEmitter {
 
   setLocalAddressProvider(provider) {
     this.localAddressProvider = provider;
+  }
+
+  setFleetContract(address) {
+    this.fleetContract = address;
+    this.fleetContractUpdates.push(address);
+    return this;
   }
 
   close() {
@@ -116,6 +125,75 @@ class TestClientManager extends DiodeClientManager {
     return super._fetchNetworkDiscoveryNodes();
   }
 }
+
+test('constructor-provided fleet contract propagates to new managed connections', async () => {
+  const tempDir = makeTempDir();
+  const keyLocation = path.join(tempDir, 'keys.json');
+  const connection = new FakeConnection('custom:41046');
+  const manager = new TestClientManager({
+    keyLocation,
+    hosts: ['custom:41046'],
+    fleetContract: '1234567890abcdef1234567890ABCDEF12345678',
+    relaySelection: { scoreCachePath: null, networkDiscovery: { enabled: false } },
+  }, new Map([
+    ['custom:41046', { connection }],
+  ]));
+
+  await manager.connect();
+
+  assert.equal(connection.fleetContract, '0x1234567890abcdef1234567890abcdef12345678');
+  manager.close();
+});
+
+test('setFleetContract updates existing and future managed connections', async () => {
+  const tempDir = makeTempDir();
+  const keyLocation = path.join(tempDir, 'keys.json');
+  const manager = new TestClientManager({
+    keyLocation,
+    relaySelection: { scoreCachePath: null, networkDiscovery: { enabled: false } },
+  });
+  const existing = new FakeConnection('existing:41046');
+  const future = new FakeConnection('future:41046');
+
+  manager._registerConnection(existing, 'existing:41046');
+  manager.hostBehaviors.set('future:41046', { connection: future });
+
+  manager.setFleetContract('0xabcdefabcdefabcdefabcdefabcdefabcdefabcd');
+  await manager._ensureConnection('future:41046');
+
+  assert.equal(existing.fleetContract, '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd');
+  assert.equal(future.fleetContract, '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd');
+  manager.close();
+});
+
+test('invalid fleet contract values fail fast', () => {
+  const tempDir = makeTempDir();
+  const keyLocation = path.join(tempDir, 'keys.json');
+
+  assert.throws(
+    () => new DiodeClientManager({ keyLocation, fleetContract: '0x1234', relaySelection: { scoreCachePath: null } }),
+    /fleetContract must be a 20-byte EVM address hex string/i,
+  );
+
+  const manager = new DiodeClientManager({ keyLocation, relaySelection: { scoreCachePath: null } });
+  assert.throws(
+    () => manager.setFleetContract('not-a-contract'),
+    /fleetContract must be a 20-byte EVM address hex string/i,
+  );
+  manager.close();
+});
+
+test('default fleet contract is applied when manager config is omitted', () => {
+  const tempDir = makeTempDir();
+  const keyLocation = path.join(tempDir, 'keys.json');
+  const manager = new DiodeClientManager({ keyLocation, relaySelection: { scoreCachePath: null } });
+  const connection = new FakeConnection('default:41046');
+
+  manager._registerConnection(connection, 'default:41046');
+
+  assert.equal(connection.fleetContract, DEFAULT_FLEET_CONTRACT);
+  manager.close();
+});
 
 test('tested candidates rank by measured latency', () => {
   const tempDir = makeTempDir();
