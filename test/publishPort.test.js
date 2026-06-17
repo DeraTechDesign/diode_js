@@ -6,6 +6,7 @@ const tls = require('tls');
 const dgram = require('dgram');
 
 const PublishPort = require('../publishPort');
+const nativeCrypto = require('../nativeCrypto');
 
 class FakeStreamSocket extends EventEmitter {
   constructor() {
@@ -13,11 +14,14 @@ class FakeStreamSocket extends EventEmitter {
     this.destroyed = false;
     this.remoteAddress = undefined;
     this.remotePort = undefined;
+    this.writes = [];
   }
 
   setNoDelay() {}
   pause() {}
-  write() {}
+  write(data) {
+    this.writes.push(data);
+  }
   end() {}
   destroy() {
     this.destroyed = true;
@@ -305,6 +309,63 @@ test('native TCP publish connects local socket to configured host', () => {
   assert.equal(connectCalls.length, 2);
   assert.deepEqual(connectCalls[0], { host: 'relay.example', port: 41000 });
   assert.deepEqual(connectCalls[1], { port: 8089, host: '10.0.0.8' });
+});
+
+test('native TCP publish buffers relay data until handshake is ready', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, {
+    8089: { mode: 'public', host: '10.0.0.8' },
+  });
+  const originalConnect = net.connect;
+  const originalConsumeTcpFrames = nativeCrypto.consumeTcpFrames;
+  const sockets = [];
+
+  net.connect = (options, callback) => {
+    const socket = new FakeStreamSocket();
+    socket.options = options;
+    sockets.push(socket);
+    process.nextTick(() => {
+      if (typeof callback === 'function') {
+        callback();
+      }
+      socket.emit('connect');
+    });
+    return socket;
+  };
+  nativeCrypto.consumeTcpFrames = () => [Buffer.from('plain-http')];
+
+  try {
+    const session = {
+      physicalPort: 41000,
+      port: 8089,
+      host: '10.0.0.8',
+      protocol: 'tcp',
+      deviceId: '0x' + '11'.repeat(20),
+      ready: false,
+      session: null,
+      pendingRelayChunks: [],
+    };
+    publishPort.handleNativeTCPRelay(makeSessionId('07'), 41000, session, connection);
+
+    const relaySocket = sockets[0];
+    const localSocket = sockets[1];
+    relaySocket.emit('data', Buffer.from('early-encrypted'));
+
+    assert.equal(session.pendingRelayChunks.length, 1);
+    assert.equal(localSocket.writes.length, 0);
+
+    session.ready = true;
+    session.session = {};
+    publishPort._flushNativeTCPRelayPending(session);
+
+    assert.equal(session.pendingRelayChunks.length, 0);
+    assert.equal(localSocket.writes.length, 1);
+    assert.equal(localSocket.writes[0].toString(), 'plain-http');
+  } finally {
+    nativeCrypto.consumeTcpFrames = originalConsumeTcpFrames;
+    net.connect = originalConnect;
+    publishPort.stopListening();
+  }
 });
 
 test('native UDP publish connects local socket to configured host', () => {

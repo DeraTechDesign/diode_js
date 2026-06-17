@@ -1,6 +1,6 @@
 {
   "name": "diodejs",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "A JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.",
   "main": "index.js",
   "scripts": {

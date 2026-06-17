@@ -8,6 +8,8 @@ const DiodeRPC = require('./rpc');
 const nativeCrypto = require('./nativeCrypto');
 const logger = require('./logger');
 
+const BIND_PORT_LISTENER_STATE = Symbol.for('diodejs.bindPort.listenerState');
+
 // Custom Duplex stream to handle the Diode connection
 class DiodeSocket extends Duplex {
   constructor(ref, rpc) {
@@ -129,6 +131,104 @@ class BindPort {
     return this.connection;
   }
 
+  _connectionKey(connection) {
+    if (!connection) return '';
+    if (connection._managerHostKey) return connection._managerHostKey;
+    if (connection.host && connection.port) return `${connection.host}:${connection.port}`;
+    return '';
+  }
+
+  _isUsableConnection(connection) {
+    return connection && connection.socket && !connection.socket.destroyed;
+  }
+
+  _clearDeviceRelayCache(deviceIdHex) {
+    const cache = this.connection && this.connection.deviceRelayCache;
+    if (!cache || typeof cache.delete !== 'function') {
+      return;
+    }
+    const normalized = this._stripHexPrefix(deviceIdHex || '').toLowerCase();
+    cache.delete(normalized);
+    cache.delete(`0x${normalized}`);
+  }
+
+  async _getApiRelayCandidates(deviceId, deviceIdHex) {
+    const candidates = [];
+    const seen = new Set();
+    const push = (connection) => {
+      if (!this._isUsableConnection(connection)) {
+        return;
+      }
+      const key = this._connectionKey(connection) || String(candidates.length);
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      candidates.push(connection);
+    };
+
+    try {
+      push(await this._resolveConnectionForDevice(deviceId));
+    } catch (error) {
+      logger.warn(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
+    }
+
+    if (typeof (this.connection && this.connection.getNearestConnection) === 'function') {
+      push(this.connection.getNearestConnection());
+    }
+
+    if (typeof (this.connection && this.connection.getConnections) === 'function') {
+      for (const connection of this.connection.getConnections()) {
+        push(connection);
+      }
+    } else {
+      push(this.connection);
+    }
+
+    return candidates;
+  }
+
+  async _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
+    let candidates = await this._getApiRelayCandidates(deviceId, deviceIdHex);
+    let clearedCache = false;
+    let lastError = null;
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      const connection = candidates[index];
+      const rpc = this._getRpcFor(connection);
+      const relayKey = this._connectionKey(connection) || 'unknown relay';
+
+      try {
+        const ref = await rpc.portOpen(deviceId, formattedTargetPort, flags);
+        if (ref) {
+          if (index > 0) {
+            logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
+          }
+          return { connection, rpc, ref };
+        }
+        lastError = new Error(`portopen returned no ref via ${relayKey}`);
+      } catch (error) {
+        lastError = error;
+      }
+
+      logger.warn(() => `Port ${formattedTargetPort} did not open via ${relayKey}: ${lastError}`);
+      if (!clearedCache) {
+        clearedCache = true;
+        this._clearDeviceRelayCache(deviceIdHex);
+        const refreshed = await this._getApiRelayCandidates(deviceId, deviceIdHex);
+        for (const candidate of refreshed) {
+          const key = this._connectionKey(candidate) || String(candidates.length);
+          const exists = candidates.some((existing) => (this._connectionKey(existing) || '') === key);
+          if (!exists) {
+            candidates.push(candidate);
+          }
+        }
+      }
+    }
+
+    throw lastError || new Error('No relay connection available');
+  }
+
   async _openTlsHandshakeChannel(connection, rpc, ref) {
     const diodeSocket = new DiodeSocket(ref, rpc);
     const certPem = connection.getDeviceCertificate();
@@ -230,8 +330,26 @@ class BindPort {
   }
   
   _setupMessageListener() {
-    // Listen for data events from the device
-    this.connection.on('unsolicited', (message, sourceConnection) => {
+    const rootConnection = this.connection;
+    if (!rootConnection || typeof rootConnection.on !== 'function') {
+      return;
+    }
+
+    let state = rootConnection[BIND_PORT_LISTENER_STATE];
+    if (state) {
+      state.instances.add(this);
+      return;
+    }
+
+    state = {
+      instances: new Set([this]),
+    };
+    rootConnection[BIND_PORT_LISTENER_STATE] = state;
+
+    // Listen for data events from the device. This is shared per connection
+    // manager so multiple BindPort instances do not duplicate payloads into
+    // the same client socket.
+    state.onUnsolicited = (message, sourceConnection) => {
       const connection = sourceConnection || this.connection;
       if (!connection || typeof connection.getClientSocket !== 'function') {
         logger.warn(() => 'Received unsolicited message without a valid connection context');
@@ -276,7 +394,11 @@ class BindPort {
           if (clientSocket.diodeSocket) {
             clientSocket.diodeSocket._destroy(null, () => {});
           }
-          clientSocket.end();
+          if (typeof clientSocket.end === 'function') {
+            clientSocket.end();
+          } else if (typeof clientSocket.close === 'function') {
+            clientSocket.close();
+          }
           connection.deleteClientSocket(dataRef);
           logger.info(() => `Port closed for ref: ${dataRef.toString('hex')}`);
         }
@@ -285,19 +407,26 @@ class BindPort {
           logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
       }
-    });
+    };
+    rootConnection.on('unsolicited', state.onUnsolicited);
     
     // Handle device disconnect
-    this.connection.on('end', () => {
+    state.onEnd = () => {
       logger.info(() => 'Disconnected from Diode.io server');
-      this.closeAllServers();
-    });
+      for (const instance of state.instances) {
+        instance.closeAllServers();
+      }
+    };
+    rootConnection.on('end', state.onEnd);
 
     // Handle connection errors
-    this.connection.on('error', (err) => {
+    state.onError = (err) => {
       logger.error(() => `Connection error: ${err}`);
-      this.closeAllServers();
-    });
+      for (const instance of state.instances) {
+        instance.closeAllServers();
+      }
+    };
+    rootConnection.on('error', state.onError);
   }
 
   addPort(localPort, targetPort, deviceIdHex, protocol = 'tls', transport = undefined) {
@@ -471,39 +600,23 @@ class BindPort {
         let entry = server.clientRefs && server.clientRefs[clientKey];
         
         if (!entry) {
-          let connection;
           try {
-            connection = await this._resolveConnectionForDevice(deviceId);
-          } catch (error) {
-            logger.error(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
-            return;
-          }
-          if (!connection) {
-            logger.error(() => `No relay connection available for device ${deviceIdHex}`);
-            return;
-          }
-          const rpc = this._getRpcFor(connection);
-          try {
-            const ref = await rpc.portOpen(deviceId, formattedTargetPort, 'rw');
-            if (!ref) {
-              logger.error(() => `Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
-              return;
-            } else {
-              logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for udp client ${clientKey}`);
-              if (!server.clientRefs) server.clientRefs = {};
-              entry = { ref, connection };
-              server.clientRefs[clientKey] = entry;
-              
-              // Store the client info
-              connection.addClientSocket(ref, {
-                address: rinfo.address,
-                port: rinfo.port,
-                protocol: 'udp',
-                write: (data) => {
-                  server.send(data, rinfo.port, rinfo.address);
-                }
-              });
-            }
+            const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw');
+            const { ref, connection } = opened;
+            logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for udp client ${clientKey}`);
+            if (!server.clientRefs) server.clientRefs = {};
+            entry = { ref, connection };
+            server.clientRefs[clientKey] = entry;
+            
+            // Store the client info
+            connection.addClientSocket(ref, {
+              address: rinfo.address,
+              port: rinfo.port,
+              protocol: 'udp',
+              write: (data) => {
+                server.send(data, rinfo.port, rinfo.address);
+              }
+            });
           } catch (error) {
             logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
             return;
@@ -539,24 +652,29 @@ class BindPort {
       const server = net.createServer(async (clientSocket) => {
         logger.info(() => `Client connected to local server on port ${localPort}`);
         clientSocket.setNoDelay(true);
+        if (useNative) {
+          clientSocket.pause();
+        }
 
-        let connection;
-        try {
-          connection = await this._resolveConnectionForDevice(deviceId);
-        } catch (error) {
-          logger.error(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
-          clientSocket.destroy();
-          return;
-        }
-        if (!connection) {
-          logger.error(() => `No relay connection available for device ${deviceIdHex}`);
-          clientSocket.destroy();
-          return;
-        }
-        const rpc = this._getRpcFor(connection);
+        let connection = null;
+        let rpc = null;
 
         let ref;
         if (useNative) {
+          try {
+            connection = await this._resolveConnectionForDevice(deviceId);
+          } catch (error) {
+            logger.error(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
+            clientSocket.destroy();
+            return;
+          }
+          if (!connection) {
+            logger.error(() => `No relay connection available for device ${deviceIdHex}`);
+            clientSocket.destroy();
+            return;
+          }
+          rpc = this._getRpcFor(connection);
+
           // Open a new native relay port on the device for this client
           let physicalPort;
           try {
@@ -647,20 +765,18 @@ class BindPort {
           });
           clientSocket.on('end', cleanup);
           relaySocket.on('end', cleanup);
+          clientSocket.resume();
 
           return;
         }
 
         // Legacy API relay
         try {
-          ref = await rpc.portOpen(deviceId, formattedTargetPort, 'rw');
-          if (!ref) {
-            logger.error(() => `Error opening port ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
-            clientSocket.destroy();
-            return;
-          } else {
-            logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
-          }
+          const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw');
+          connection = opened.connection;
+          rpc = opened.rpc;
+          ref = opened.ref;
+          logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
         } catch (error) {
           logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
           clientSocket.destroy();

@@ -399,6 +399,7 @@ class PublishPort extends EventEmitter {
         if (session.localSocket && typeof session.localSocket.resume === 'function') {
           session.localSocket.resume();
         }
+        this._flushNativeTCPRelayPending(session);
 
         if (session.protocol === 'udp' && session.relaySocket && session.session) {
           const probe = nativeCrypto.createUdpPacket(session.session, Buffer.alloc(0));
@@ -502,6 +503,7 @@ class PublishPort extends EventEmitter {
       relaySocket: null,
       localSocket: null,
       timer: null,
+      pendingRelayChunks: [],
     };
     session.timer = setTimeout(() => {
       if (!session.ready) {
@@ -544,6 +546,35 @@ class PublishPort extends EventEmitter {
       } catch (_) {}
     }
     this.nativeSessions.delete(session.physicalPort);
+  }
+
+  _consumeNativeTCPRelayData(session, data) {
+    if (!session || !session.session || !session.localSocket) {
+      return true;
+    }
+    try {
+      const messages = nativeCrypto.consumeTcpFrames(session.session, data);
+      for (const msg of messages) {
+        session.localSocket.write(msg);
+      }
+      return true;
+    } catch (error) {
+      logger.error(() => `TCP decrypt error (${session.deviceId}): ${error}`);
+      return false;
+    }
+  }
+
+  _flushNativeTCPRelayPending(session) {
+    if (!session || session.protocol !== 'tcp' || !Array.isArray(session.pendingRelayChunks)) {
+      return;
+    }
+    const pending = session.pendingRelayChunks.splice(0, session.pendingRelayChunks.length);
+    for (const chunk of pending) {
+      if (!this._consumeNativeTCPRelayData(session, chunk)) {
+        this._cleanupNativeSession(session);
+        return;
+      }
+    }
   }
 
   handleNativeTCPRelay(sessionId, physicalPortRef, session, connection) {
@@ -611,14 +642,11 @@ class PublishPort extends EventEmitter {
     localSocket.on('end', cleanup);
 
     relaySocket.on('data', (data) => {
-      if (!session.ready || !session.session) return;
-      try {
-        const messages = nativeCrypto.consumeTcpFrames(session.session, data);
-        for (const msg of messages) {
-          localSocket.write(msg);
-        }
-      } catch (error) {
-        logger.error(() => `TCP decrypt error (${deviceId}): ${error}`);
+      if (!session.ready || !session.session) {
+        session.pendingRelayChunks.push(Buffer.from(data));
+        return;
+      }
+      if (!this._consumeNativeTCPRelayData(session, data)) {
         cleanup();
       }
     });
