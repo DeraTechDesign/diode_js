@@ -660,6 +660,46 @@ class BindPort {
         let rpc = null;
 
         let ref;
+        let clientClosed = false;
+        let remoteCleanupStarted = false;
+        let tlsSocketWrapper = null;
+
+        const closeRemoteRef = async () => {
+          if (remoteCleanupStarted) {
+            return;
+          }
+
+          if (!ref || !connection || !rpc) {
+            return;
+          }
+          remoteCleanupStarted = true;
+
+          const storedSocket = typeof connection.getClientSocket === 'function'
+            ? connection.getClientSocket(ref)
+            : null;
+          if (storedSocket && storedSocket !== clientSocket && typeof storedSocket.end === 'function') {
+            try { storedSocket.end(); } catch {}
+          }
+          if (typeof connection.deleteClientSocket === 'function') {
+            try { connection.deleteClientSocket(ref); } catch {}
+          }
+
+          try {
+            await rpc.portClose(ref);
+            logger.info(() => `Port closed on device for ref: ${ref.toString('hex')}`);
+          } catch (error) {
+            logger.error(() => `Error closing port on device: ${error}`);
+          }
+        };
+
+        clientSocket.once('close', () => {
+          clientClosed = true;
+          closeRemoteRef();
+        });
+        clientSocket.once('error', (err) => {
+          logger.error(() => `Client socket error: ${err}`);
+        });
+
         if (useNative) {
           try {
             connection = await this._resolveConnectionForDevice(deviceId);
@@ -783,6 +823,12 @@ class BindPort {
           return;
         }
 
+        if (clientClosed || clientSocket.destroyed) {
+          logger.warn(() => `Local client disconnected before port ${formattedTargetPort} opened; closing ref ${ref.toString('hex')}`);
+          await closeRemoteRef();
+          return;
+        }
+
         if (protocol === 'tls') {
           // For tls protocol, create a proper tls connection
           try {
@@ -829,16 +875,27 @@ class BindPort {
               diodeSocket,
               tlsSocket,
               end: () => {
-                tlsSocket.end();
-                diodeSocket._destroy(null, () => {});
+                try { tlsSocket.end(); } catch {}
+                try { diodeSocket._destroy(null, () => {}); } catch {}
               }
             };
+            tlsSocketWrapper = socketWrapper;
             
             // Store the socket wrapper
             connection.addClientSocket(ref, socketWrapper);
+            tlsSocket.once('close', () => {
+              if (!clientSocket.destroyed) {
+                clientSocket.end();
+              }
+              closeRemoteRef();
+            });
             
           } catch (error) {
             logger.error(() => `Error setting up tls connection: ${error}`);
+            if (tlsSocketWrapper && typeof tlsSocketWrapper.end === 'function') {
+              tlsSocketWrapper.end();
+            }
+            await closeRemoteRef();
             clientSocket.destroy();
             return;
           }
@@ -858,24 +915,9 @@ class BindPort {
         }
 
         // Handle client socket closure (common for all protocols)
-        clientSocket.on('end', async () => {
+        clientSocket.once('end', () => {
           logger.info(() => 'Client disconnected');
-          if (ref && connection.hasClientSocket(ref)) {
-            try {
-              await rpc.portClose(ref);
-              logger.info(() => `Port closed on device for ref: ${ref.toString('hex')}`);
-              connection.deleteClientSocket(ref);
-            } catch (error) {
-              logger.error(() => `Error closing port on device: ${error}`);
-            }
-          } else {
-            logger.warn(() => 'Ref is invalid or no longer in clientSockets.');
-          }
-        });
-
-        // Handle client socket errors
-        clientSocket.on('error', (err) => {
-          logger.error(() => `Client socket error: ${err}`);
+          closeRemoteRef();
         });
       });
 

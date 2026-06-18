@@ -1,6 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const EventEmitter = require('events');
+const net = require('net');
+const { once } = require('events');
 
 const BindPort = require('../bindPort');
 
@@ -9,19 +11,59 @@ function makeRef(hex) {
 }
 
 function makeRelay(hostKey, result, calls) {
+  const clientSockets = new Map();
+  const portCloseCalls = [];
   return {
     _managerHostKey: hostKey,
     socket: { destroyed: false },
+    clientSockets,
+    portCloseCalls,
     RPC: {
       portOpen: async (_deviceId, port, flags) => {
         calls.push({ hostKey, port, flags });
         if (result instanceof Error) {
           throw result;
         }
-        return result;
+        return typeof result === 'function' ? result() : result;
+      },
+      portClose: async (ref) => {
+        portCloseCalls.push(ref);
       },
     },
+    addClientSocket(ref, socket) {
+      clientSockets.set(ref.toString('hex'), socket);
+    },
+    getClientSocket(ref) {
+      return clientSockets.get(ref.toString('hex'));
+    },
+    deleteClientSocket(ref) {
+      return clientSockets.delete(ref.toString('hex'));
+    },
+    hasClientSocket(ref) {
+      return clientSockets.has(ref.toString('hex'));
+    },
   };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(predicate(), true);
 }
 
 class FakeManager extends EventEmitter {
@@ -122,4 +164,79 @@ test('multiple BindPort instances share one manager listener set', () => {
   assert.equal(manager.listenerCount('unsolicited'), 1);
   assert.equal(manager.listenerCount('end'), 1);
   assert.equal(manager.listenerCount('error'), 1);
+});
+
+test('API bind closes ref when local TCP client disconnects before portopen returns', async () => {
+  const calls = [];
+  const opened = deferred();
+  const ref = makeRef('0a0b0c0d');
+  const relay = makeRelay('relay.example:41046', () => opened.promise, calls);
+  const manager = new FakeManager({
+    relays: [relay],
+    resolvedRelay: relay,
+    nearestRelay: relay,
+  });
+
+  const bind = new BindPort(manager, {
+    0: {
+      targetPort: 8088,
+      deviceIdHex: '8a72468957504d50247a260deb0218d504dd091b',
+      protocol: 'tcp',
+    }
+  });
+  bind.addPort(0, 8088, '8a72468957504d50247a260deb0218d504dd091b', 'tcp');
+  const server = bind.servers.get(0);
+
+  try {
+    await once(server, 'listening');
+    const client = net.connect(server.address().port, '127.0.0.1');
+    await once(client, 'connect');
+    client.destroy();
+    await once(client, 'close');
+
+    opened.resolve(ref);
+    await waitFor(() => relay.portCloseCalls.length === 1);
+
+    assert.equal(relay.portCloseCalls[0].toString('hex'), ref.toString('hex'));
+    assert.equal(relay.hasClientSocket(ref), false);
+  } finally {
+    server.close();
+  }
+});
+
+test('API bind closes ref when local TCP client disconnects after portopen returns', async () => {
+  const calls = [];
+  const ref = makeRef('0e0f1011');
+  const relay = makeRelay('relay.example:41046', ref, calls);
+  const manager = new FakeManager({
+    relays: [relay],
+    resolvedRelay: relay,
+    nearestRelay: relay,
+  });
+
+  const bind = new BindPort(manager, {
+    0: {
+      targetPort: 8088,
+      deviceIdHex: '8a72468957504d50247a260deb0218d504dd091b',
+      protocol: 'tcp',
+    }
+  });
+  bind.addPort(0, 8088, '8a72468957504d50247a260deb0218d504dd091b', 'tcp');
+  const server = bind.servers.get(0);
+
+  try {
+    await once(server, 'listening');
+    const client = net.connect(server.address().port, '127.0.0.1');
+    await once(client, 'connect');
+    await waitFor(() => relay.hasClientSocket(ref));
+
+    client.end();
+    await once(client, 'close');
+    await waitFor(() => relay.portCloseCalls.length === 1);
+
+    assert.equal(relay.portCloseCalls[0].toString('hex'), ref.toString('hex'));
+    assert.equal(relay.hasClientSocket(ref), false);
+  } finally {
+    server.close();
+  }
 });
