@@ -91,9 +91,13 @@ class DiodeConnection extends EventEmitter {
     // Add ticket batching configuration
     this.lastTicketUpdate = Date.now();
     this.accumulatedBytes = 0;
-    this.ticketUpdateThreshold = parseInt(process.env.DIODE_TICKET_BYTES_THRESHOLD, 10) || 512000; // 512KB default
+    this.ticketUpdateThreshold = parseInt(process.env.DIODE_TICKET_BYTES_THRESHOLD, 10) || 4 * 1024 * 1024; // 4MB default
     this.ticketUpdateInterval = parseInt(process.env.DIODE_TICKET_UPDATE_INTERVAL, 10) || 30000; // 30 seconds default
     this.ticketUpdateTimer = null;
+    this.ticketUpdateInFlight = false;
+    this.pendingTicketUpdateForce = false;
+    this.lastAcceptedTicketBytes = 0;
+    this.lastRelayMeasuredBytes = 0;
     
     // Log the ticket batching settings
     logger.info(() => `Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
@@ -144,6 +148,7 @@ class DiodeConnection extends EventEmitter {
         this._startTicketUpdateTimer();
         // Send the ticketv2 command
         try {
+          await this._syncMeasuredBytesWithRelay();
           const ticketCommand = await this.createTicketCommand();
           const response = await this.sendCommand(ticketCommand).catch(reject);
           resolve();
@@ -155,6 +160,7 @@ class DiodeConnection extends EventEmitter {
 
       this.socket.on('data', (data) => {
         // logger.debug(() => `Received data: ${data.toString('hex')}`);
+        this._recordTrafficBytes(data.length);
         try {
           this._handleData(data);
         } catch (error) {
@@ -371,17 +377,35 @@ class DiodeConnection extends EventEmitter {
             logger.debug(() => `Received response for requestId: ${requestId}`);
             logger.debug(() => `Response Type: '${responseType}'`);
     
-            const { resolve, reject } = this.pendingRequests.get(requestId);
+            const pending = this.pendingRequests.get(requestId);
+            const { resolve, reject } = pending;
             try{
               if (responseType === 'response') {
                 if (!Array.isArray(responseRaw) && makeReadable(responseRaw) === 'too_low') {
-                  this.fixResponse(responseData);
-                  // Re-send the ticket command
-                  this.createTicketCommand().then((ticketCommand) => {
-                    this.sendCommand(ticketCommand).then(resolve).catch(reject);
-                  }).catch(reject);
+                  const originalCommand = pending && pending.commandArray;
+                  const retryCount = pending && pending.ticketRetryCount ? pending.ticketRetryCount : 0;
+                  const isTicketCommand = Array.isArray(originalCommand) &&
+                    (originalCommand[0] === 'ticket' || originalCommand[0] === 'ticketv2');
+
+                  if (isTicketCommand && retryCount < 1) {
+                    this.fixResponse(responseData);
+                    this.pendingRequests.delete(requestId);
+                    this._syncMeasuredBytesWithRelay()
+                      .catch((error) => {
+                        logger.debug(() => `Unable to sync relay measured bytes after too_low: ${error}`);
+                      })
+                      .then(() => this.createTicketCommand())
+                      .then((ticketCommand) => this.sendCommand(ticketCommand, { ticketRetryCount: retryCount + 1 }))
+                      .then(resolve)
+                      .catch(reject);
+                    return;
+                  }
+                  this._recordTicketResponse(originalCommand, responseData);
                   resolve(responseData);
+                  this.pendingRequests.delete(requestId);
+                  return;
                 }
+                this._recordTicketResponse(pending && pending.commandArray, responseData);
                 resolve(responseData);
               } else if (responseType === 'error') {
                 if (responseData.length > 1) {
@@ -433,11 +457,23 @@ class DiodeConnection extends EventEmitter {
       }
 
       // Send a fresh ticket promptly to avoid disconnect
-      this.createTicketCommand()
-        .then((ticketCommand) => this.sendCommand(ticketCommand))
-        .then(() => {
-          this.accumulatedBytes = 0;
-          this.lastTicketUpdate = Date.now();
+      this._syncMeasuredBytesWithRelay()
+        .catch((error) => {
+          logger.debug(() => `Unable to sync relay measured bytes for ticket_request: ${error}`);
+        })
+        .then(() => this.createTicketCommand())
+        .then((ticketCommand) => {
+          const ticketTotalBytes = parseUInt(ticketCommand[5]);
+          return this.sendCommand(ticketCommand).then((responseData) => ({ responseData, ticketTotalBytes }));
+        })
+        .then(({ responseData, ticketTotalBytes }) => {
+          const status = responseData && responseData[0] !== undefined ? parseResponseType(responseData[0]) : '';
+          if (status === 'thanks!') {
+            if (Number.isFinite(ticketTotalBytes)) {
+              this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
+            }
+            this.lastTicketUpdate = Date.now();
+          }
         })
         .catch((error) => {
           logger.error(() => `Error handling ticket_request: ${error}`);
@@ -446,26 +482,141 @@ class DiodeConnection extends EventEmitter {
   }
 
   fixResponse(response) {
-    /* response is : 
-    [
-    'too_low',
-    1284,
-    666,
-    11,
-    135591,
-    'test',
-    '0x01eb1726dd7286d2dab222ea5dfef7c820cd01c30936240f5780a6e468e731f3b55d4c963b3eb768663263b396555aa52be49d7d3ae2a9173732fa410ad46434f3'
-  ]
-    [3] is last totalConnections
-    [4] is last totalBytes
+    /*
+      ticketv2 too_low responses are:
+      [
+        'too_low',
+        chain_id,
+        epoch,
+        last_total_connections,
+        last_total_bytes,
+        local_address,
+        device_signature
+      ]
+      The byte value is the relay's last accepted paid floor. The live
+      unpaid measurement still comes from the relay "bytes" command.
     */
-    const totalConnectionsBuffer = Buffer.from(response[3]);
-    const totalBytesBuffer = Buffer.from(response[4]);
-    this.totalConnections = parseInt(totalConnectionsBuffer.readUIntBE(0, totalConnectionsBuffer.length), 10) +1;
-    this.totalBytes = parseInt(totalBytesBuffer.readUIntBE(0, totalBytesBuffer.length), 10) + 128000;
+    const lastTicket = this._parseTooLowTicketSummary(response);
+    if (Number.isFinite(lastTicket.totalConnections)) {
+      this.totalConnections = Math.max(this.totalConnections, lastTicket.totalConnections);
+    }
+    if (Number.isFinite(lastTicket.totalBytes)) {
+      this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, lastTicket.totalBytes);
+      const relayMeasuredBytes = Number.isFinite(this.lastRelayMeasuredBytes) ? this.lastRelayMeasuredBytes : 0;
+      const pendingBytes = Math.max(this.accumulatedBytes, relayMeasuredBytes, 0);
+      this.totalBytes = Math.max(this.totalBytes, lastTicket.totalBytes + pendingBytes + 1024);
+      this.accumulatedBytes = Math.max(this.accumulatedBytes, this.totalBytes - lastTicket.totalBytes);
+    }
   }
 
-  sendCommand(commandArray) {
+  _parseTooLowTicketSummary(response) {
+    if (!Array.isArray(response)) {
+      return { totalConnections: null, totalBytes: null };
+    }
+
+    const firstItem = response[0];
+    const firstItemType = typeof firstItem === 'string' || Buffer.isBuffer(firstItem) || firstItem instanceof Uint8Array
+      ? parseResponseType(firstItem)
+      : '';
+    let normalized = response;
+    if (firstItemType === 'response') {
+      const secondItem = response[1];
+      const secondItemType = typeof secondItem === 'string' || Buffer.isBuffer(secondItem) || secondItem instanceof Uint8Array
+        ? parseResponseType(secondItem)
+        : '';
+      normalized = secondItemType === 'too_low' ? response.slice(2) : response;
+    } else if (firstItemType === 'too_low') {
+      normalized = response.slice(1);
+    }
+
+    if (normalized.length >= 6) {
+      return {
+        version: 2,
+        chainId: parseUInt(normalized[0]),
+        epoch: parseUInt(normalized[1]),
+        totalConnections: parseUInt(normalized[2]),
+        totalBytes: parseUInt(normalized[3]),
+        localAddress: normalized[4],
+        deviceSignature: normalized[5],
+      };
+    }
+
+    if (normalized.length >= 5) {
+      return {
+        version: 1,
+        blockHash: normalized[0],
+        totalConnections: parseUInt(normalized[1]),
+        totalBytes: parseUInt(normalized[2]),
+        localAddress: normalized[3],
+        deviceSignature: normalized[4],
+      };
+    }
+
+    return { totalConnections: null, totalBytes: null };
+  }
+
+  _isTicketCommand(commandArray) {
+    return Array.isArray(commandArray) &&
+      (commandArray[0] === 'ticket' || commandArray[0] === 'ticketv2');
+  }
+
+  _ticketTotalBytes(commandArray) {
+    if (!this._isTicketCommand(commandArray)) return null;
+    const index = commandArray[0] === 'ticketv2' ? 5 : 4;
+    return parseUInt(commandArray[index]);
+  }
+
+  _recordTicketResponse(commandArray, responseData) {
+    if (!this._isTicketCommand(commandArray) || !Array.isArray(responseData)) return;
+    const status = responseData[0] !== undefined ? parseResponseType(responseData[0]) : '';
+    if (status !== 'thanks!') return;
+    const ticketTotalBytes = this._ticketTotalBytes(commandArray);
+    if (!Number.isFinite(ticketTotalBytes)) return;
+    this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, ticketTotalBytes);
+    this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
+    this.lastTicketUpdate = Date.now();
+  }
+
+  _recordTrafficBytes(bytesCount) {
+    if (!Number.isFinite(bytesCount) || bytesCount <= 0) return;
+    this.totalBytes += bytesCount;
+    this.accumulatedBytes += bytesCount;
+
+    if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
+      this._updateTicketIfNeeded();
+    }
+  }
+
+  _parseRelaySignedInt(valueRaw) {
+    const encoded = parseUInt(valueRaw);
+    if (!Number.isFinite(encoded)) return null;
+    if (encoded % 2 === 0) return encoded / 2;
+    return -((encoded - 1) / 2);
+  }
+
+  async _syncMeasuredBytesWithRelay() {
+    if (!this.socket || this.socket.destroyed) return null;
+    const responseData = await this.sendCommand(['bytes']);
+    const measuredBytes = responseData && responseData[0] !== undefined
+      ? this._parseRelaySignedInt(responseData[0])
+      : null;
+    if (!Number.isFinite(measuredBytes) || measuredBytes <= 0) {
+      return measuredBytes;
+    }
+
+    this.lastRelayMeasuredBytes = measuredBytes;
+    const baseBytes = Number.isFinite(this.lastAcceptedTicketBytes) && this.lastAcceptedTicketBytes > 0
+      ? this.lastAcceptedTicketBytes
+      : 128000;
+    const targetTotalBytes = baseBytes + measuredBytes + 1024;
+    if (targetTotalBytes > this.totalBytes) {
+      this.totalBytes = targetTotalBytes;
+      this.accumulatedBytes = Math.max(this.accumulatedBytes, this.totalBytes - baseBytes);
+    }
+    return measuredBytes;
+  }
+
+  sendCommand(commandArray, options = {}) {
     return new Promise((resolve, reject) => {
       this._ensureConnected().then(() => {
         const requestId = this._getNextRequestId();
@@ -473,7 +624,12 @@ class DiodeConnection extends EventEmitter {
         const commandWithId = [requestId, commandArray];
 
         // Store the promise callbacks to resolve/reject later
-        this.pendingRequests.set(requestId, { resolve, reject });
+        this.pendingRequests.set(requestId, {
+          resolve,
+          reject,
+          commandArray,
+          ticketRetryCount: options.ticketRetryCount || 0,
+        });
 
         const commandBuffer = RLP.encode(commandWithId);
         const byteLength = commandBuffer.length; // Buffer/Uint8Array length is bytes
@@ -488,6 +644,7 @@ class DiodeConnection extends EventEmitter {
         // logger.debug(() => `Command buffer: ${message.toString('hex')}`);
   
         this.socket.write(message);
+        this._recordTrafficBytes(message.length);
       }).catch(reject);
     });
   }
@@ -499,9 +656,6 @@ class DiodeConnection extends EventEmitter {
         // Build the message as [requestId, [commandArray]]
         const commandWithId = [requestId, commandArray];
 
-        // Store the promise callbacks to resolve/reject later
-        this.pendingRequests.set(requestId, { resolve, reject });
-
         const commandBuffer = RLP.encode(commandWithId);
         const byteLength = commandBuffer.length; // Buffer/Uint8Array length is bytes
 
@@ -514,8 +668,8 @@ class DiodeConnection extends EventEmitter {
         logger.debug(() => `Sending command with requestId ${requestId}: ${commandArray}`);
         // logger.debug(() => `Command buffer: ${message.toString('hex')}`);
   
-        this.socket.write(message);
-        resolve();
+        this.socket.write(message, resolve);
+        this._recordTrafficBytes(message.length);
       }).catch(reject);
     });
   }
@@ -765,7 +919,7 @@ class DiodeConnection extends EventEmitter {
     }
     
     this.ticketUpdateTimer = setTimeout(() => {
-      this._updateTicketIfNeeded(true);
+      this._updateTicketIfNeeded();
     }, this.ticketUpdateInterval);
   }
 
@@ -773,6 +927,11 @@ class DiodeConnection extends EventEmitter {
   async _updateTicketIfNeeded(force = false) {
     // If socket is not connected, don't try to update
     if (!this.socket || this.socket.destroyed) {
+      return;
+    }
+
+    if (this.ticketUpdateInFlight) {
+      this.pendingTicketUpdateForce = this.pendingTicketUpdateForce || force;
       return;
     }
     
@@ -783,18 +942,38 @@ class DiodeConnection extends EventEmitter {
       (this.accumulatedBytes >= this.ticketUpdateThreshold || 
       timeSinceLastUpdate >= this.ticketUpdateInterval))) {
       
+      this.ticketUpdateInFlight = true;
+      let accepted = false;
       try {
-      if (this.accumulatedBytes > 0 || force) {
-        logger.debug(() => `Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
-        const ticketCommand = await this.createTicketCommand();
-        await this.sendCommand(ticketCommand);
-        
-        // Reset counters
-        this.accumulatedBytes = 0;
-        this.lastTicketUpdate = Date.now();
-      }
+        if (this.accumulatedBytes > 0 || force) {
+          logger.debug(() => `Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
+          await this._syncMeasuredBytesWithRelay().catch((error) => {
+            logger.debug(() => `Unable to sync relay measured bytes before ticket update: ${error}`);
+          });
+          const ticketCommand = await this.createTicketCommand();
+          const ticketTotalBytes = parseUInt(ticketCommand[5]);
+          const responseData = await this.sendCommand(ticketCommand);
+          const status = responseData && responseData[0] !== undefined ? parseResponseType(responseData[0]) : '';
+          if (status === 'thanks!') {
+            accepted = true;
+            if (Number.isFinite(ticketTotalBytes)) {
+              this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
+            }
+            this.lastTicketUpdate = Date.now();
+          }
+        }
       } catch (error) {
-      logger.error(() => `Error updating ticket: ${error}`);
+        logger.error(() => `Error updating ticket: ${error}`);
+      } finally {
+        this.ticketUpdateInFlight = false;
+      }
+
+      if (accepted && (this.pendingTicketUpdateForce || this.accumulatedBytes >= this.ticketUpdateThreshold)) {
+        const pendingForce = this.pendingTicketUpdateForce;
+        this.pendingTicketUpdateForce = false;
+        setImmediate(() => this._updateTicketIfNeeded(pendingForce));
+      } else {
+        this.pendingTicketUpdateForce = false;
       }
     }
     
@@ -804,13 +983,7 @@ class DiodeConnection extends EventEmitter {
 
   // Add method to track bytes without immediate ticket update
   addBytes(bytesCount) {
-    this.totalBytes += bytesCount;
-    this.accumulatedBytes += bytesCount;
-    
-    // Optionally check if we should update ticket now
-    if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
-      this._updateTicketIfNeeded();
-    }
+    this._recordTrafficBytes(bytesCount);
   }
 
   // Method to set ticket batching options

@@ -403,7 +403,7 @@ class BindPort {
           logger.info(() => `Port closed for ref: ${dataRef.toString('hex')}`);
         }
       } else {
-        if (messageType != 'portopen' && messageType != 'portopen2' && messageType != 'ticket_request') {
+        if (messageType != 'portopen' && messageType != 'portopen2' && messageType != 'ticket_request' && messageType != 'response') {
           logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
       }
@@ -904,9 +904,19 @@ class BindPort {
           connection.addClientSocket(ref, clientSocket);
           
           // Handle data from client to device
-          clientSocket.on('data', async (data) => {
+          clientSocket.on('data', (data) => {
+            clientSocket.pause();
             try {
-              await rpc.portSend(ref, data);
+              rpc.portSend(ref, data)
+                .then(() => {
+                  if (!clientSocket.destroyed) {
+                    clientSocket.resume();
+                  }
+                })
+                .catch((error) => {
+                  logger.error(() => `Error sending data to device: ${error}`);
+                  clientSocket.destroy();
+                });
             } catch (error) {
               logger.error(() => `Error sending data to device: ${error}`);
               clientSocket.destroy();

@@ -231,7 +231,7 @@ class PublishPort extends EventEmitter {
       } else if (messageType === 'portclose') {
         this.handlePortClose(sessionIdRaw, messageContent, connection);
       } else {
-        if (messageType !== 'ticket_request') {
+        if (messageType !== 'ticket_request' && messageType !== 'response') {
           logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
       }
@@ -736,7 +736,17 @@ class PublishPort extends EventEmitter {
     } else {
       localSocket.on('data', (data) => {
         // When data is received from the local service, send it back via Diode
-        rpc.portSend(ref, data);
+        localSocket.pause();
+        rpc.portSend(ref, data)
+          .then(() => {
+            if (!localSocket.destroyed) {
+              localSocket.resume();
+            }
+          })
+          .catch((error) => {
+            logger.error(() => `Error sending data to device: ${error}`);
+            localSocket.destroy();
+          });
       });
 
       localSocket.on('end', () => {

@@ -240,3 +240,50 @@ test('API bind closes ref when local TCP client disconnects after portopen retur
     server.close();
   }
 });
+
+test('API bind pauses local TCP socket while portSend is in flight', async () => {
+  const calls = [];
+  const send = deferred();
+  const ref = makeRef('12131415');
+  const relay = makeRelay('relay.example:41046', ref, calls);
+  const portSendCalls = [];
+  relay.RPC.portSend = async (...args) => {
+    portSendCalls.push(args);
+    return send.promise;
+  };
+  const manager = new FakeManager({
+    relays: [relay],
+    resolvedRelay: relay,
+    nearestRelay: relay,
+  });
+
+  const bind = new BindPort(manager, {
+    0: {
+      targetPort: 8088,
+      deviceIdHex: '8a72468957504d50247a260deb0218d504dd091b',
+      protocol: 'tcp',
+    }
+  });
+  bind.addPort(0, 8088, '8a72468957504d50247a260deb0218d504dd091b', 'tcp');
+  const server = bind.servers.get(0);
+
+  try {
+    await once(server, 'listening');
+    const client = net.connect(server.address().port, '127.0.0.1');
+    await once(client, 'connect');
+    await waitFor(() => relay.hasClientSocket(ref));
+
+    client.write(Buffer.from('hello'));
+    await waitFor(() => portSendCalls.length === 1);
+
+    const acceptedSocket = relay.getClientSocket(ref);
+    assert.equal(acceptedSocket.isPaused(), true);
+
+    send.resolve();
+    await waitFor(() => acceptedSocket.isPaused() === false);
+
+    client.destroy();
+  } finally {
+    server.close();
+  }
+});

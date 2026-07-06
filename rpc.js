@@ -1,5 +1,12 @@
 //rpc.js
-const { makeReadable, parseRequestId, parseResponseType, parseReason, parseUInt, toBufferView } = require('./utils');
+const {
+  makeReadable,
+  parseRequestId,
+  parseResponseType,
+  parseReason,
+  parseUInt,
+  toBufferView,
+} = require('./utils');
 const logger = require('./logger');
 
 function decodeToken(value) {
@@ -88,6 +95,80 @@ class DiodeRPC {
         epoch: null,
         expiry: null,
       };
+    }
+
+    async dioTraffic(options = {}) {
+      const chainId = options.chainId === undefined ? 1284 : options.chainId;
+      const params = options.epoch === undefined ? [chainId] : [chainId, options.epoch];
+
+      return this.nodeRpc('dio_traffic', params, options);
+    }
+
+    dio_traffic(options = {}) {
+      return this.dioTraffic(options);
+    }
+
+    async nodeRpc(method, params = [], options = {}) {
+      if (typeof fetch !== 'function') {
+        throw new Error('global fetch is required for node RPC calls');
+      }
+
+      const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? Math.floor(options.timeoutMs)
+        : 30000;
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+      try {
+        const response = await fetch(this._nodeRpcEndpoint(options), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: options.id || 1,
+            method,
+            params,
+          }),
+          signal: controller ? controller.signal : undefined,
+        });
+
+        let payload = {};
+        try {
+          payload = await response.json();
+        } catch (_) {
+          payload = {};
+        }
+
+        if (!response.ok || payload.error) {
+          const error = new Error(payload?.error?.message || `${method} failed with status ${response.status}`);
+          error.status = response.status;
+          error.response = payload;
+          throw error;
+        }
+
+        return payload.result;
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+    }
+
+    _nodeRpcEndpoint(options = {}) {
+      const protocol = options.protocol || 'https';
+      const rpcPort = Number.isFinite(options.rpcPort) && options.rpcPort > 0 ? options.rpcPort : 8443;
+      let host = options.host || '';
+      if (!host && this.connection) {
+        host = this.connection.host;
+      }
+      if (!host && this.connection && typeof this.connection.getServerRelayHost === 'function') {
+        host = this.connection.getServerRelayHost();
+      }
+      if (!host) {
+        throw new Error('No relay host available for node RPC call');
+      }
+      const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+      return `${protocol}://${formattedHost}:${rpcPort}/`;
     }
   
     getBlockPeak() {
@@ -223,10 +304,6 @@ class DiodeRPC {
       }
     
       async portSend(ref, data) {
-        // Update bytes count but don't update ticket yet
-        const bytesToSend = data.length;
-        this.connection.addBytes(bytesToSend);
-    
         // Maximum size that can be sent in a single message (less than 65535 to be safe)
         const MAX_CHUNK_SIZE = 65000;
         

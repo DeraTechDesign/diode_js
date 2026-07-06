@@ -15,10 +15,17 @@ class FakeStreamSocket extends EventEmitter {
     this.remoteAddress = undefined;
     this.remotePort = undefined;
     this.writes = [];
+    this.pauseCalls = 0;
+    this.resumeCalls = 0;
   }
 
   setNoDelay() {}
-  pause() {}
+  pause() {
+    this.pauseCalls += 1;
+  }
+  resume() {
+    this.resumeCalls += 1;
+  }
   write(data) {
     this.writes.push(data);
   }
@@ -145,6 +152,27 @@ function makeDeviceId(hexByte) {
   return Buffer.from(byte.repeat(20), 'hex');
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(predicate(), true);
+}
+
 test('PublishPort array input defaults host to 127.0.0.1', () => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, [8080]);
@@ -209,6 +237,29 @@ test('TCP publish connects to configured host', () => {
 
   assert.equal(connectCalls.length, 1);
   assert.deepEqual(connectCalls[0], { port: 8080, host: '192.168.1.10' });
+});
+
+test('TCP publish pauses local service socket while portSend is in flight', async () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8080]);
+  const localSocket = new FakeStreamSocket();
+  const send = deferred();
+  connection.RPC.portSend = async (...args) => {
+    connection.portSendCalls.push(args);
+    return send.promise;
+  };
+
+  publishPort.setupLocalSocketHandlers(localSocket, makeRef('04'), 'tcp', connection.RPC, connection);
+  localSocket.emit('data', Buffer.from('hello'));
+
+  await waitFor(() => connection.portSendCalls.length === 1);
+  assert.equal(localSocket.pauseCalls, 1);
+  assert.equal(localSocket.resumeCalls, 0);
+
+  send.resolve();
+  await waitFor(() => localSocket.resumeCalls === 1);
+
+  publishPort.stopListening();
 });
 
 test('TLS publish backend socket connects to configured host', () => {
