@@ -9,6 +9,26 @@ const {
 } = require('./utils');
 const logger = require('./logger');
 
+const MAX_NODE_TIMER_MS = 0x7fffffff;
+
+function normalizeTimerMs(value, fallback) {
+    if (!Number.isFinite(value) || value <= 0) return fallback;
+    return Math.min(Math.floor(value), MAX_NODE_TIMER_MS);
+}
+
+class DiodeRPCError extends Error {
+    constructor(operation, reason, options = {}) {
+      const message = reason instanceof Error ? reason.message : String(reason || `${operation} failed`);
+      super(`${operation}: ${message}`);
+      this.name = 'DiodeRPCError';
+      this.code = 'DIODE_RPC_ERROR';
+      this.operation = operation;
+      this.reason = message;
+      if (reason instanceof Error) this.cause = reason;
+      if (options.status) this.status = options.status;
+    }
+}
+
 function decodeToken(value) {
     if (typeof value === 'string') return value;
     if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
@@ -113,9 +133,7 @@ class DiodeRPC {
         throw new Error('global fetch is required for node RPC calls');
       }
 
-      const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-        ? Math.floor(options.timeoutMs)
-        : 30000;
+      const timeoutMs = normalizeTimerMs(options.timeoutMs, 30000);
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
       const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
@@ -171,8 +189,8 @@ class DiodeRPC {
       return `${protocol}://${formattedHost}:${rpcPort}/`;
     }
   
-    getBlockPeak() {
-        return this.connection.sendCommand(['getblockpeak']).then((responseData) => {
+    _getBlockPeakWithSender(sendCommand) {
+        return sendCommand(['getblockpeak']).then((responseData) => {
           // responseData is an array containing [blockNumber]
           const blockNumberRaw = responseData[0];
           let blockNumber;
@@ -193,13 +211,22 @@ class DiodeRPC {
           return;
         });
       }
-    getBlockHeader(index) {
-      return this.connection.sendCommand(['getblockheader', index]).then((responseData) => {
+
+    getBlockPeak(options = {}) {
+      return this._getBlockPeakWithSender((command) => this.connection.sendCommand(command, options));
+    }
+
+    _getBlockHeaderWithSender(index, sendCommand) {
+      return sendCommand(['getblockheader', index]).then((responseData) => {
         return responseData[0]; // block_header
       }).catch((error) => {
         logger.error(() => `Error during get block header: ${error}`);
         return;
       });
+    }
+
+    getBlockHeader(index, options = {}) {
+      return this._getBlockHeaderWithSender(index, (command) => this.connection.sendCommand(command, options));
     }
   
     getBlock(index) {
@@ -211,9 +238,9 @@ class DiodeRPC {
       });
     }
 
-    getObject(deviceId) {
+    getObject(deviceId, options = {}) {
       const normalized = normalizeAddressParam(deviceId);
-      return this.connection.sendCommand(['getobject', normalized]).then((responseData) => {
+      return this.connection.sendCommand(['getobject', normalized], options).then((responseData) => {
         const obj = responseData[0];
         const parsed = parseDeviceTicketObject(obj);
         return parsed || obj;
@@ -223,9 +250,9 @@ class DiodeRPC {
       });
     }
 
-    getNode(nodeId) {
+    getNode(nodeId, options = {}) {
       const normalized = normalizeAddressParam(nodeId);
-      return this.connection.sendCommand(['getnode', normalized]).then((responseData) => {
+      return this.connection.sendCommand(['getnode', normalized], options).then((responseData) => {
         const obj = responseData[0];
         const parsed = parseServerObject(obj);
         return parsed || obj;
@@ -235,8 +262,8 @@ class DiodeRPC {
       });
     }
   
-    ping() {
-      return this.connection.sendCommand(['ping']).then((responseData) => {
+    ping(options = {}) {
+      return this.connection.sendCommand(['ping'], options).then((responseData) => {
         // responseData is an array containing [status]
         const statusRaw = responseData[0];
         const status = parseResponseType(statusRaw);
@@ -256,8 +283,8 @@ class DiodeRPC {
 
         
 
-    portOpen(deviceId, port, flags = 'rw') {
-        return this.connection.sendCommand(['portopen', deviceId, port, flags]).then((responseData) => {
+    portOpen(deviceId, port, flags = 'rw', options = {}) {
+        return this.connection.sendCommand(['portopen', deviceId, port, flags], options).then((responseData) => {
           // responseData is [status, refOrReason]
           const [statusRaw, refOrReasonRaw] = responseData;
       
@@ -271,19 +298,19 @@ class DiodeRPC {
             }
             return ref;
           } else if (status === 'error') {
-            let reason = parseReason(refOrReasonRaw);
-            throw new Error(reason);
+            const reason = parseReason(refOrReasonRaw);
+            throw new DiodeRPCError('portopen', reason, { status });
           } else {
-            throw new Error(`Unknown status in response: '${status}'`);
+            throw new DiodeRPCError('portopen', `Unknown status in response: '${status}'`, { status });
           }
         }).catch((error) => {
           logger.error(() => `Error during port open: ${error}`);
-          return;
+          throw error;
         });
       }
 
-      portOpen2(deviceId, port, flags = 'rw') {
-        return this.connection.sendCommand(['portopen2', deviceId, port, flags]).then((responseData) => {
+      portOpen2(deviceId, port, flags = 'rw', options = {}) {
+        return this.connection.sendCommand(['portopen2', deviceId, port, flags], options).then((responseData) => {
           // responseData is [status, physicalPortOrReason]
           const [statusRaw, portOrReasonRaw] = responseData;
           const status = parseResponseType(statusRaw);
@@ -293,17 +320,17 @@ class DiodeRPC {
             return physicalPort !== null ? physicalPort : portOrReasonRaw;
           } else if (status === 'error') {
             const reason = parseReason(portOrReasonRaw);
-            throw new Error(reason);
+            throw new DiodeRPCError('portopen2', reason, { status });
           } else {
-            throw new Error(`Unknown status in response: '${status}'`);
+            throw new DiodeRPCError('portopen2', `Unknown status in response: '${status}'`, { status });
           }
         }).catch((error) => {
           logger.error(() => `Error during port open2: ${error}`);
-          return;
+          throw error;
         });
       }
     
-      async portSend(ref, data) {
+      async portSend(ref, data, options = {}) {
         // Maximum size that can be sent in a single message (less than 65535 to be safe)
         const MAX_CHUNK_SIZE = 65000;
         
@@ -318,7 +345,7 @@ class DiodeRPC {
               const chunk = data.slice(offset, offset + chunkSize);
               
               // Send this chunk
-              const responseData = await this.connection.sendCommand(['portsend', ref, chunk]);
+              const responseData = await this.connection.sendCommand(['portsend', ref, chunk], options);
               const [statusRaw] = responseData;
               const status = parseResponseType(statusRaw);
               
@@ -332,7 +359,7 @@ class DiodeRPC {
             return; // All chunks sent successfully
           } else {
             // Small enough to send in one piece
-            return this.connection.sendCommand(['portsend', ref, data]).then((responseData) => {
+            return this.connection.sendCommand(['portsend', ref, data], options).then((responseData) => {
               const [statusRaw] = responseData;
               const status = parseResponseType(statusRaw);
           
@@ -351,9 +378,9 @@ class DiodeRPC {
         }
       }
     
-      portClose(ref) {
-        return this.connection.sendCommand(['portclose', ref]).then((responseData) => {
-          const [statusRaw] = responseData;
+      portClose(ref, options = {}) {
+        return this.connection.sendCommand(['portclose', ref], options).then((responseData) => {
+          const [statusRaw, reasonRaw] = responseData;
     
           const status = Buffer.isBuffer(statusRaw) || statusRaw instanceof Uint8Array
             ? Buffer.from(statusRaw).toString('utf8')
@@ -362,39 +389,57 @@ class DiodeRPC {
           if (status === 'ok') {
             return;
           } else if (status === 'error') {
-            throw new Error('Error during port close');
+            throw new DiodeRPCError('portclose', parseReason(reasonRaw) || 'Relay rejected port close', { status });
           } else {
-            throw new Error(`Unknown status in response: '${status}'`);
+            throw new DiodeRPCError('portclose', `Unknown status in response: '${status}'`, { status });
           }
         }).catch((error) => {
           logger.error(() => `Error during port close: ${error}`);
-          return;
+          throw error;
+        });
+      }
+
+      portClose2(physicalPort, options = {}) {
+        return this.connection.sendCommand(['portclose2', physicalPort], options).then((responseData) => {
+          const [statusRaw, reasonRaw] = responseData;
+          const status = parseResponseType(statusRaw);
+
+          if (status === 'ok') {
+            return;
+          } else if (status === 'error') {
+            throw new DiodeRPCError('portclose2', parseReason(reasonRaw) || 'Relay rejected native port close', { status });
+          } else {
+            throw new DiodeRPCError('portclose2', `Unknown status in response: '${status}'`, { status });
+          }
+        }).catch((error) => {
+          logger.error(() => `Error during port close2: ${error}`);
+          throw error;
         });
       }
 
       sendError(sessionId, ref, error) {
         return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId).catch((error) => {
           logger.error(() => `Error during send error: ${error}`);
-          return;
+          throw error;
         });
       }
 
       sendResponse(sessionId, ref, response) {
         return this.connection.sendCommandWithSessionId(['response', ref, response], sessionId).catch((error) => {
           logger.error(() => `Error during send response: ${error}`);
-          return;
+          throw error;
         });
       }
 
-      async getEpoch() {
+      async _getEpochWithSender(sendCommand) {
         const currentTime = Math.floor(Date.now() / 1000); // Current time in seconds
         if (this.epochCache.expiry && this.epochCache.expiry > currentTime) {
           logger.debug(() => `Using cached epoch: ${this.epochCache.epoch}`);
           return this.epochCache.epoch;
         }
         logger.debug(() => `Fetching new epoch. Expiry: ${this.epochCache.expiry}, Current time: ${currentTime}`);
-        const blockPeak = await this.getBlockPeak();
-        const blockHeader = await this.getBlockHeader(blockPeak);
+        const blockPeak = await this._getBlockPeakWithSender(sendCommand);
+        const blockHeader = await this._getBlockHeaderWithSender(blockPeak, sendCommand);
     
         // Assuming blockHeader is an object with a timestamp property
         const timestamp = this.parseTimestamp(blockHeader);
@@ -409,6 +454,10 @@ class DiodeRPC {
         this.epochCache.expiry = currentTime + timeLeft;
 
         return epoch;
+      }
+
+      getEpoch(options = {}) {
+        return this._getEpochWithSender((command) => this.connection.sendCommand(command, options));
       }
     
       parseTimestamp(blockHeader) {
@@ -443,4 +492,5 @@ class DiodeRPC {
       }
   }
   
-  module.exports = DiodeRPC;
+module.exports = DiodeRPC;
+DiodeRPC.Error = DiodeRPCError;

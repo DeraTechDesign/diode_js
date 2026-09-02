@@ -4,48 +4,160 @@ const dgram = require('dgram');
 const { Buffer } = require('buffer');
 const { toBufferView } = require('./utils');
 const { Duplex } = require('stream');
+const EventEmitter = require('events');
 const DiodeRPC = require('./rpc');
 const nativeCrypto = require('./nativeCrypto');
 const logger = require('./logger');
 
 const BIND_PORT_LISTENER_STATE = Symbol.for('diodejs.bindPort.listenerState');
+const SOCKET_BACKPRESSURE_STATE = Symbol('diodejs.bindPort.backpressure');
+const MAX_SOCKET_QUEUE_BYTES = 1024 * 1024;
+const MAX_TIMER_MS = 0x7fffffff;
+
+function normalizeTimerMs(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), MAX_TIMER_MS);
+}
+
+function isByteSequence(value, { nonEmpty = false } = {}) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) return false;
+  return !nonEmpty || value.byteLength > 0;
+}
+
+function decodeMessageType(raw) {
+  if (typeof raw === 'string') return raw;
+  if (!isByteSequence(raw, { nonEmpty: true })) return null;
+  return toBufferView(raw).toString('utf8');
+}
+
+function validateBindUnsolicited(message) {
+  if (!Array.isArray(message) || message.length < 2) return { error: 'invalid envelope' };
+  if (!isByteSequence(message[0], { nonEmpty: true })) return { error: 'invalid session id' };
+  const messageContent = message[1];
+  if (!Array.isArray(messageContent) || messageContent.length === 0) {
+    return { error: 'invalid message content' };
+  }
+  const messageType = decodeMessageType(messageContent[0]);
+  if (!messageType) return { error: 'invalid message type' };
+  if (messageType === 'data' || messageType === 'portsend') {
+    if (messageContent.length < 3
+      || !isByteSequence(messageContent[1], { nonEmpty: true })
+      || !isByteSequence(messageContent[2])) {
+      return { error: `invalid ${messageType} payload` };
+    }
+  } else if (messageType === 'portclose') {
+    if (messageContent.length < 2 || !isByteSequence(messageContent[1], { nonEmpty: true })) {
+      return { error: 'invalid portclose payload' };
+    }
+  }
+  return { messageContent, messageType };
+}
+
+function destroySocket(socket, error = undefined) {
+  if (!socket) return;
+  try {
+    if (typeof socket.destroy === 'function') socket.destroy(error);
+    else if (typeof socket.close === 'function') socket.close();
+    else if (typeof socket.end === 'function') socket.end();
+  } catch (_) {}
+}
+
+function scheduleSocketDrain(socket, state) {
+  if (!state.blocked || state.draining || typeof socket.once !== 'function') return;
+  state.draining = true;
+  socket.once('drain', () => {
+    state.draining = false;
+    state.blocked = false;
+    while (!state.blocked && state.queued.length > 0 && !socket.destroyed) {
+      const chunk = state.queued.shift();
+      state.bytes -= chunk.length;
+      state.blocked = socket.write(chunk) === false;
+    }
+    scheduleSocketDrain(socket, state);
+  });
+}
+
+function writeWithBoundedBackpressure(socket, data) {
+  if (!socket || socket.destroyed) return false;
+  let state = socket[SOCKET_BACKPRESSURE_STATE];
+  if (!state) {
+    state = { blocked: false, queued: [], bytes: 0, draining: false };
+    socket[SOCKET_BACKPRESSURE_STATE] = state;
+  }
+  if (state.blocked) {
+    const copy = Buffer.from(data);
+    state.bytes += copy.length;
+    if (state.bytes > MAX_SOCKET_QUEUE_BYTES) {
+      destroySocket(socket, new Error('Diode inbound socket queue limit exceeded'));
+      return false;
+    }
+    state.queued.push(copy);
+    scheduleSocketDrain(socket, state);
+    return false;
+  }
+
+  state.blocked = socket.write(data) === false;
+  scheduleSocketDrain(socket, state);
+  return !state.blocked;
+}
 
 // Custom Duplex stream to handle the Diode connection
 class DiodeSocket extends Duplex {
-  constructor(ref, rpc) {
+  constructor(ref, rpc, timeoutMs = 10000) {
     super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
     this.ref = ref;
     this.rpc = rpc;
-    this.destroyed = false;
+    this.timeoutMs = timeoutMs;
+    this._inboundQueue = [];
+    this._inboundBytes = 0;
+    this._inboundBlocked = false;
   }
 
   _write(chunk, encoding, callback) {
     // Send data to the remote device via portSend
-    this.rpc.portSend(this.ref, chunk)
+    this.rpc.portSend(this.ref, chunk, { timeoutMs: this.timeoutMs })
       .then(() => callback())
       .catch((err) => callback(err));
   }
 
   _read(size) {
-    // No need to implement this method for our use case
+    this._inboundBlocked = false;
+    while (!this._inboundBlocked && this._inboundQueue.length > 0 && !this.destroyed) {
+      const chunk = this._inboundQueue.shift();
+      this._inboundBytes -= chunk.length;
+      this._inboundBlocked = this.push(chunk) === false;
+    }
   }
 
   // Method to push data received from the remote device
   pushData(data) {
-    if (!this.destroyed) {
-      this.push(data);
+    if (this.destroyed) return false;
+    if (!this._inboundBlocked && this._inboundQueue.length === 0) {
+      this._inboundBlocked = this.push(data) === false;
+      return !this._inboundBlocked;
     }
+    const copy = Buffer.from(data);
+    this._inboundQueue.push(copy);
+    this._inboundBytes += copy.length;
+    if (this._inboundBytes > MAX_SOCKET_QUEUE_BYTES) {
+      this.destroy(new Error('Diode TLS inbound queue limit exceeded'));
+      return false;
+    }
+    return false;
   }
 
   _destroy(err, callback) {
-    this.destroyed = true;
+    this._inboundQueue.length = 0;
+    this._inboundBytes = 0;
     this.push(null);
     callback(err);
   }
 }
 
-class BindPort {
+class BindPort extends EventEmitter {
   constructor(connection, localPortOrPortsConfig, targetPort, deviceIdHex) {
+    super();
     this.connection = connection;
     
     // Handle legacy constructor (connection, localPort, targetPort, deviceIdHex)
@@ -84,9 +196,16 @@ class BindPort {
     }
     
     this.servers = new Map(); // Track server instances by localPort
-    this._rpcByConnection = new Map();
+    this._rpcByConnection = new WeakMap();
     this.rpc = this._isManager() ? null : this._getRpcFor(this.connection);
-    this.handshakeTimeoutMs = parseInt(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10) || 10000;
+    this.handshakeTimeoutMs = normalizeTimerMs(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10000);
+    this.portOpenTimeoutMs = normalizeTimerMs(process.env.DIODE_PORTOPEN_TIMEOUT_MS, 5000);
+    this.ioTimeoutMs = normalizeTimerMs(process.env.DIODE_PORT_IO_TIMEOUT_MS, 10000);
+    this.relayResolveTimeoutMs = normalizeTimerMs(process.env.DIODE_RELAY_RESOLVE_TIMEOUT_MS, this.portOpenTimeoutMs);
+    this.nativeQueueLimitBytes = parseInt(process.env.DIODE_NATIVE_QUEUE_LIMIT_BYTES, 10) || MAX_SOCKET_QUEUE_BYTES;
+    this.udpSessionIdleTimeoutMs = normalizeTimerMs(process.env.DIODE_UDP_SESSION_IDLE_TIMEOUT_MS, 300000);
+    this._activeContexts = new Set();
+    this._disposed = false;
     
     // Set up listener for unsolicited messages once
     this._setupMessageListener();
@@ -138,8 +257,157 @@ class BindPort {
     return '';
   }
 
+  async _withTimeout(promiseOrFactory, timeoutMs, label) {
+    const boundedTimeoutMs = normalizeTimerMs(timeoutMs, this.portOpenTimeoutMs || 5000);
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => (
+          typeof promiseOrFactory === 'function' ? promiseOrFactory() : promiseOrFactory
+        )),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} timed out after ${boundedTimeoutMs}ms`)), boundedTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   _isUsableConnection(connection) {
-    return connection && connection.socket && !connection.socket.destroyed;
+    if (!connection) return false;
+    if (typeof connection.isReady === 'function') {
+      return connection.isReady();
+    }
+    if (connection._managerReady === false || connection.ready === false) {
+      return false;
+    }
+    return !!(connection.socket && !connection.socket.destroyed && connection.socket.writable !== false);
+  }
+
+  _trackContext(server, localPort, context) {
+    context.server = server;
+    context.localPort = Number(localPort);
+    context.closed = false;
+    context.sockets = context.sockets || new Set();
+    this._activeContexts.add(context);
+    if (!server._diodeContexts) server._diodeContexts = new Set();
+    server._diodeContexts.add(context);
+    this._acquireNativeLease(context);
+    return context;
+  }
+
+  _touchContext(context) {
+    if (!context || context.closed || !context.udp) return;
+    if (context.idleTimer) clearTimeout(context.idleTimer);
+    context.idleTimer = setTimeout(
+      () => this._closeContext(context),
+      normalizeTimerMs(this.udpSessionIdleTimeoutMs, 300000)
+    );
+    if (typeof context.idleTimer.unref === 'function') context.idleTimer.unref();
+  }
+
+  _acquireNativeLease(context) {
+    if (!context || context.closed || context.nativeLease || !context.physicalPort || !context.connection) return;
+    context.nativeLease = true;
+    context.connection._diodeActiveNativeSessions = Number(context.connection._diodeActiveNativeSessions || 0) + 1;
+  }
+
+  _closeNativePort(context) {
+    if (!context || !context.physicalPort || !context.connection || context.nativeCloseStarted) return;
+    context.nativeCloseStarted = true;
+    const rpc = context.rpc || this._getRpcFor(context.connection);
+    try {
+      if (rpc && typeof rpc.portClose2 === 'function') {
+        void Promise.resolve(rpc.portClose2(context.physicalPort, { timeoutMs: this.portOpenTimeoutMs })).catch(() => {});
+      } else if (typeof context.connection.sendCommand === 'function') {
+        void Promise.resolve(context.connection.sendCommand(
+          ['portclose2', context.physicalPort],
+          { timeoutMs: this.portOpenTimeoutMs }
+        )).catch(() => {});
+      }
+    } catch (_) {}
+  }
+
+  _replaceClientSocket(connection, ref, socketWrapper) {
+    let existing;
+    try { existing = connection.getClientSocket(ref); } catch (_) {}
+    if (existing && existing !== socketWrapper) {
+      if (existing._diodeOwner && existing._diodeContext) {
+        existing._diodeOwner._closeContext(existing._diodeContext, { notifyRemote: false });
+      } else {
+        destroySocket(existing.tlsSocket || existing.diodeSocket || existing);
+        try {
+          if (connection.getClientSocket(ref) === existing) connection.deleteClientSocket(ref);
+        } catch (_) {}
+      }
+    }
+    connection.addClientSocket(ref, socketWrapper);
+  }
+
+  _closeContext(context, { notifyRemote = true } = {}) {
+    if (!context || context.closed) return;
+    context.closed = true;
+    if (context.idleTimer) {
+      clearTimeout(context.idleTimer);
+      context.idleTimer = null;
+    }
+    if (context.nativeLease && context.connection) {
+      context.connection._diodeActiveNativeSessions = Math.max(
+        0,
+        Number(context.connection._diodeActiveNativeSessions || 0) - 1
+      );
+      context.nativeLease = false;
+    }
+    this._activeContexts.delete(context);
+    if (context.server && context.server._diodeContexts) {
+      context.server._diodeContexts.delete(context);
+    }
+
+    if (typeof context.cleanup === 'function') {
+      try { context.cleanup(); } catch (_) {}
+    }
+    for (const socket of context.sockets || []) {
+      destroySocket(socket);
+    }
+
+    if (context.ref && context.connection) {
+      let currentWrapper;
+      let canInspectCurrent = false;
+      try {
+        if (typeof context.connection.getClientSocket === 'function') {
+          canInspectCurrent = true;
+          currentWrapper = context.connection.getClientSocket(context.ref);
+        }
+      } catch (_) {}
+      const ownsCurrentRef = !canInspectCurrent
+        || currentWrapper === context.clientSocketWrapper
+        || (currentWrapper && currentWrapper._diodeContext === context);
+      const refWasReused = canInspectCurrent && currentWrapper && !ownsCurrentRef;
+      if (ownsCurrentRef) {
+        try { context.connection.deleteClientSocket(context.ref); } catch (_) {}
+      }
+      if (notifyRemote && !refWasReused && !context.remoteCloseStarted && context.rpc) {
+        context.remoteCloseStarted = true;
+        void Promise.resolve(context.rpc.portClose(context.ref, { timeoutMs: this.portOpenTimeoutMs })).catch(() => {});
+      }
+    }
+    if (notifyRemote) this._closeNativePort(context);
+  }
+
+  _closeServerContexts(server, options) {
+    if (!server || !server._diodeContexts) return;
+    for (const context of Array.from(server._diodeContexts)) {
+      this._closeContext(context, options);
+    }
+  }
+
+  _closeConnectionContexts(connection, options) {
+    for (const context of Array.from(this._activeContexts)) {
+      if (!connection || context.connection === connection) {
+        this._closeContext(context, options);
+      }
+    }
   }
 
   _clearDeviceRelayCache(deviceIdHex) {
@@ -168,7 +436,11 @@ class BindPort {
     };
 
     try {
-      push(await this._resolveConnectionForDevice(deviceId));
+      push(await this._withTimeout(
+        () => this._resolveConnectionForDevice(deviceId),
+        this.relayResolveTimeoutMs,
+        `Relay resolution for ${deviceIdHex}`
+      ));
     } catch (error) {
       logger.warn(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
     }
@@ -199,7 +471,11 @@ class BindPort {
       const relayKey = this._connectionKey(connection) || 'unknown relay';
 
       try {
-        const ref = await rpc.portOpen(deviceId, formattedTargetPort, flags);
+        const ref = await this._withTimeout(
+          () => rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+          this.portOpenTimeoutMs,
+          `portopen ${formattedTargetPort} via ${relayKey}`
+        );
         if (ref) {
           if (index > 0) {
             logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
@@ -229,8 +505,8 @@ class BindPort {
     throw lastError || new Error('No relay connection available');
   }
 
-  async _openTlsHandshakeChannel(connection, rpc, ref) {
-    const diodeSocket = new DiodeSocket(ref, rpc);
+  async _openTlsHandshakeChannel(connection, rpc, ref, context = null) {
+    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
     const certPem = connection.getDeviceCertificate();
     if (!certPem) {
       throw new Error('No device certificate available');
@@ -261,33 +537,69 @@ class BindPort {
       }
     };
 
-    connection.addClientSocket(ref, socketWrapper);
+    if (context) context.clientSocketWrapper = socketWrapper;
+    this._replaceClientSocket(connection, ref, socketWrapper);
+    if (context) {
+      context.sockets.add(tlsSocket);
+      context.sockets.add(diodeSocket);
+      if (context.closed) {
+        destroySocket(tlsSocket);
+        destroySocket(diodeSocket);
+        throw new Error('Native handshake was cancelled');
+      }
+    }
 
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('TLS handshake timeout')), this.handshakeTimeoutMs);
-      tlsSocket.once('secureConnect', () => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        resolve();
-      });
-      tlsSocket.once('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+        tlsSocket.off('secureConnect', onSecure);
+        tlsSocket.off('error', onError);
+        tlsSocket.off('close', onClose);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onSecure = () => finish();
+      const onError = (error) => finish(error);
+      const onClose = () => finish(new Error('TLS handshake socket closed'));
+      const timer = setTimeout(() => {
+        finish(new Error('TLS handshake timeout'));
+        destroySocket(tlsSocket);
+      }, normalizeTimerMs(this.handshakeTimeoutMs, 10000));
+      tlsSocket.once('secureConnect', onSecure);
+      tlsSocket.once('error', onError);
+      tlsSocket.once('close', onClose);
     });
 
     return { tlsSocket, socketWrapper };
   }
 
-  async _performNativeHandshake(connection, rpc, deviceId, targetPort, physicalPort) {
+  async _performNativeHandshake(connection, rpc, deviceId, targetPort, physicalPort, context = null) {
     const handshakePort = `tls:${targetPort}#hs`;
-    const ref = await rpc.portOpen(deviceId, handshakePort, 'rw');
+    const ref = await this._withTimeout(
+      () => rpc.portOpen(deviceId, handshakePort, 'rw', { timeoutMs: this.portOpenTimeoutMs }),
+      this.portOpenTimeoutMs,
+      `native handshake portopen ${handshakePort}`
+    );
     if (!ref) {
       throw new Error('Handshake portopen failed');
     }
 
     let tlsSocket;
+    let diodeSocket;
+    let socketWrapper;
     try {
-      ({ tlsSocket } = await this._openTlsHandshakeChannel(connection, rpc, ref));
+      if (context && context.closed) throw new Error('Native handshake was cancelled');
+      ({ tlsSocket, socketWrapper } = await this._openTlsHandshakeChannel(
+        connection,
+        rpc,
+        ref,
+        context
+      ));
+      diodeSocket = socketWrapper.diodeSocket;
+      if (context && context.closed) throw new Error('Native handshake was cancelled');
 
       const localDeviceId = connection.getEthereumAddress().toLowerCase();
       const remoteDeviceId = `0x${Buffer.from(deviceId).toString('hex')}`.toLowerCase();
@@ -298,9 +610,10 @@ class BindPort {
         privateKey: connection.getPrivateKey()
       });
 
-      nativeCrypto.writeHandshakeMessage(tlsSocket, message);
+      await nativeCrypto.writeHandshakeMessage(tlsSocket, message);
 
       const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
+      if (context && context.closed) throw new Error('Native handshake was cancelled');
       const verification = nativeCrypto.verifyHandshakeMessage(peerMessage, {
         expectedRole: 'publish',
         expectedDeviceId: remoteDeviceId,
@@ -324,8 +637,22 @@ class BindPort {
       return session;
     } finally {
       try { if (tlsSocket) tlsSocket.end(); } catch {}
-      try { await rpc.portClose(ref); } catch {}
-      try { connection.deleteClientSocket(ref); } catch {}
+      let currentWrapper;
+      try { currentWrapper = connection.getClientSocket(ref); } catch {}
+      const expectedWrapper = socketWrapper || (context && context.clientSocketWrapper);
+      const refWasReused = currentWrapper && expectedWrapper && currentWrapper !== expectedWrapper;
+      if (!refWasReused) {
+        try { await rpc.portClose(ref, { timeoutMs: this.portOpenTimeoutMs }); } catch {}
+        try {
+          if (!currentWrapper || connection.getClientSocket(ref) === expectedWrapper) {
+            connection.deleteClientSocket(ref);
+          }
+        } catch {}
+      }
+      if (context) {
+        if (tlsSocket) context.sockets.delete(tlsSocket);
+        if (diodeSocket) context.sockets.delete(diodeSocket);
+      }
     }
   }
   
@@ -336,97 +663,85 @@ class BindPort {
     }
 
     let state = rootConnection[BIND_PORT_LISTENER_STATE];
-    if (state) {
-      state.instances.add(this);
-      return;
+    if (!state) {
+      state = { weakInstances: new Set() };
+      rootConnection[BIND_PORT_LISTENER_STATE] = state;
+      state.notify = (method, ...args) => {
+        for (const weakInstance of Array.from(state.weakInstances)) {
+          const instance = weakInstance.deref();
+          if (!instance) {
+            state.weakInstances.delete(weakInstance);
+          } else {
+            instance[method](...args);
+          }
+        }
+      };
+
+      // Data routing is shared per manager. The dispatcher does not retain any
+      // BindPort instance; the registered client wrapper owns its own cleanup.
+      state.onUnsolicited = (message, sourceConnection) => {
+        try {
+          const connection = sourceConnection || rootConnection;
+          if (!connection || typeof connection.getClientSocket !== 'function') return;
+          const validated = validateBindUnsolicited(message);
+          if (validated.error) {
+            logger.warn(() => `Ignoring malformed unsolicited bind frame: ${validated.error}`);
+            return;
+          }
+          const { messageContent, messageType } = validated;
+
+          if (messageType === 'data' || messageType === 'portsend') {
+            const dataRef = toBufferView(messageContent[1]);
+            const data = toBufferView(messageContent[2]);
+            const clientSocket = connection.getClientSocket(dataRef);
+            if (!clientSocket) {
+              logger.debug(() => `No bind client socket for ref: ${dataRef.toString('hex')}`);
+              return;
+            }
+            if (clientSocket._diodeOwner && clientSocket._diodeContext) {
+              clientSocket._diodeOwner._touchContext(clientSocket._diodeContext);
+            }
+            if (clientSocket.diodeSocket) clientSocket.diodeSocket.pushData(data);
+            else writeWithBoundedBackpressure(clientSocket, data);
+            return;
+          }
+
+          if (messageType === 'portclose') {
+            const dataRef = toBufferView(messageContent[1]);
+            const clientSocket = connection.getClientSocket(dataRef);
+            if (clientSocket && clientSocket._diodeOwner && clientSocket._diodeContext) {
+              clientSocket._diodeOwner._closeContext(clientSocket._diodeContext, { notifyRemote: false });
+            } else {
+              destroySocket(clientSocket && (clientSocket.tlsSocket || clientSocket.diodeSocket || clientSocket));
+              try { connection.deleteClientSocket(dataRef); } catch (_) {}
+            }
+            logger.info(() => `Port closed for ref: ${dataRef.toString('hex')}`);
+          }
+        } catch (error) {
+          logger.error(() => `Bind unsolicited dispatcher failed: ${error}`);
+        }
+      };
+      rootConnection.on('unsolicited', state.onUnsolicited);
+      state.onDisconnect = (payload) => state.notify('_handleRootDisconnect', payload);
+      state.onEnd = () => state.notify('_handleRootDisconnect', null);
+      state.onError = (error, sourceConnection) => {
+        logger.error(() => `Connection error: ${error}`);
+        state.notify('_handleRootDisconnect', sourceConnection || null);
+      };
+      rootConnection.on('disconnect', state.onDisconnect);
+      rootConnection.on('end', state.onEnd);
+      rootConnection.on('error', state.onError);
     }
+    this._listenerState = state;
+    this._listenerRef = new WeakRef(this);
+    state.weakInstances.add(this._listenerRef);
+  }
 
-    state = {
-      instances: new Set([this]),
-    };
-    rootConnection[BIND_PORT_LISTENER_STATE] = state;
-
-    // Listen for data events from the device. This is shared per connection
-    // manager so multiple BindPort instances do not duplicate payloads into
-    // the same client socket.
-    state.onUnsolicited = (message, sourceConnection) => {
-      const connection = sourceConnection || this.connection;
-      if (!connection || typeof connection.getClientSocket !== 'function') {
-        logger.warn(() => 'Received unsolicited message without a valid connection context');
-        return;
-      }
-      const [messageIdRaw, messageContent] = message;
-      const messageTypeRaw = messageContent[0];
-      const messageType = toBufferView(messageTypeRaw).toString('utf8');
-
-      if (messageType === 'data' || messageType === 'portsend') {
-        const refRaw = messageContent[1];
-        const dataRaw = messageContent[2];
-
-        const dataRef = toBufferView(refRaw);
-        const data = toBufferView(dataRaw);
-
-        // Find the associated client socket from connection
-        const clientSocket = connection.getClientSocket(dataRef);
-        if (clientSocket) {
-          if (clientSocket.diodeSocket) {
-            // If it's a DiodeSocket, push data to it so tls can process
-            clientSocket.diodeSocket.pushData(data);
-          } else {
-            // Otherwise write directly to the socket
-            clientSocket.write(data);
-          }
-        } else {
-          const connectionInfo = connection.getConnection(dataRef);
-          if (connectionInfo) {
-            logger.debug(() => `No client socket found for ref: ${dataRef.toString('hex')}, but connection exists for ${connectionInfo.host}:${connectionInfo.port}`);
-          } else {
-            logger.warn(() => `No client socket found for ref: ${dataRef.toString('hex')}`);
-          }
-        }
-      } else if (messageType === 'portclose') {
-        const refRaw = messageContent[1];
-        const dataRef = toBufferView(refRaw);
-
-        // Close the associated client socket
-        const clientSocket = connection.getClientSocket(dataRef);
-        if (clientSocket) {
-          if (clientSocket.diodeSocket) {
-            clientSocket.diodeSocket._destroy(null, () => {});
-          }
-          if (typeof clientSocket.end === 'function') {
-            clientSocket.end();
-          } else if (typeof clientSocket.close === 'function') {
-            clientSocket.close();
-          }
-          connection.deleteClientSocket(dataRef);
-          logger.info(() => `Port closed for ref: ${dataRef.toString('hex')}`);
-        }
-      } else {
-        if (messageType != 'portopen' && messageType != 'portopen2' && messageType != 'ticket_request' && messageType != 'response') {
-          logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
-        }
-      }
-    };
-    rootConnection.on('unsolicited', state.onUnsolicited);
-    
-    // Handle device disconnect
-    state.onEnd = () => {
-      logger.info(() => 'Disconnected from Diode.io server');
-      for (const instance of state.instances) {
-        instance.closeAllServers();
-      }
-    };
-    rootConnection.on('end', state.onEnd);
-
-    // Handle connection errors
-    state.onError = (err) => {
-      logger.error(() => `Connection error: ${err}`);
-      for (const instance of state.instances) {
-        instance.closeAllServers();
-      }
-    };
-    rootConnection.on('error', state.onError);
+  _handleRootDisconnect(payload) {
+    const disconnected = payload && payload.connection
+      ? payload.connection
+      : (payload && payload.socket ? payload : (this._isManager() ? null : this.connection));
+    this._closeConnectionContexts(disconnected, { notifyRemote: false });
   }
 
   addPort(localPort, targetPort, deviceIdHex, protocol = 'tls', transport = undefined) {
@@ -456,6 +771,8 @@ class BindPort {
     // Close the server if it's running
     if (this.servers.has(localPort)) {
       const server = this.servers.get(localPort);
+      server._diodeClosed = true;
+      this._closeServerContexts(server);
       server.close(() => {
         logger.info(() => `Server on port ${localPort} closed`);
       });
@@ -469,10 +786,219 @@ class BindPort {
   
   closeAllServers() {
     for (const [localPort, server] of this.servers.entries()) {
-      server.close();
+      server._diodeClosed = true;
+      this._closeServerContexts(server);
+      try { server.close(); } catch (_) {}
       logger.info(() => `Server on port ${localPort} closed`);
     }
     this.servers.clear();
+  }
+
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    this.closeAllServers();
+    if (this._listenerState && this._listenerRef) {
+      this._listenerState.weakInstances.delete(this._listenerRef);
+      if (this._listenerState.weakInstances.size === 0
+        && this.connection && typeof this.connection.off === 'function') {
+        this.connection.off('unsolicited', this._listenerState.onUnsolicited);
+        this.connection.off('disconnect', this._listenerState.onDisconnect);
+        this.connection.off('end', this._listenerState.onEnd);
+        this.connection.off('error', this._listenerState.onError);
+        if (this.connection[BIND_PORT_LISTENER_STATE] === this._listenerState) {
+          delete this.connection[BIND_PORT_LISTENER_STATE];
+        }
+      }
+    }
+  }
+
+  _handleServerError(error, localPort, server) {
+    logger.error(() => `Local bind server error on port ${localPort}: ${error}`);
+    server._diodeClosed = true;
+    this._closeServerContexts(server);
+    const portKey = Number(localPort);
+    if (this.servers.get(portKey) === server) {
+      this.servers.delete(portKey);
+    }
+    try { server.close(); } catch (_) {}
+    this.emit('bindError', error, { localPort: Number(localPort) });
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', error, { localPort: Number(localPort) });
+    }
+  }
+
+  async _getOrOpenNativeUdpRelay(server, clientKey, options) {
+    if (server._diodeClosed) throw new Error('UDP bind server is closed');
+    if (!server.nativeRelays) server.nativeRelays = Object.create(null);
+    const existing = server.nativeRelays[clientKey];
+    if (existing) return existing.openPromise ? existing.openPromise : existing;
+
+    const opening = { openPromise: null };
+    server.nativeRelays[clientKey] = opening;
+    opening.openPromise = (async () => {
+      const {
+        deviceId,
+        deviceIdHex,
+        formattedTargetPort,
+        config,
+        localPort,
+        targetPort,
+        rinfo,
+      } = options;
+      let connection;
+      let rpc;
+      let physicalPort;
+      let relayInfo = null;
+      try {
+        connection = await this._resolveConnectionForDevice(deviceId);
+        if (!connection) throw new Error(`No relay connection available for device ${deviceIdHex}`);
+        if (server._diodeClosed) throw new Error('UDP bind server closed during relay resolution');
+        rpc = this._getRpcFor(connection);
+        const flags = config.flags || 'rwu';
+        physicalPort = await this._withTimeout(
+          () => rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+          this.portOpenTimeoutMs,
+          `portopen2 ${formattedTargetPort}`
+        );
+        if (!physicalPort) throw new Error(`portopen2 ${formattedTargetPort} returned no port`);
+        if (server._diodeClosed) {
+          throw new Error('UDP bind server closed during portopen2');
+        }
+
+        const relaySocket = dgram.createSocket('udp4');
+        relayInfo = {
+          socket: relaySocket,
+          physicalPort,
+          relayHost: connection.getServerRelayHost(),
+          connection,
+          session: null,
+          handshakePromise: null,
+          client: { address: rinfo.address, port: rinfo.port },
+        };
+        relaySocket.on('message', (msg) => {
+          if (!relayInfo.session || relayInfo.context.closed) return;
+          this._touchContext(relayInfo.context);
+          const plaintext = nativeCrypto.parseUdpPacket(relayInfo.session, msg);
+          if (!plaintext) return;
+          server.send(plaintext, rinfo.port, rinfo.address);
+        });
+        relaySocket.on('error', (error) => {
+          logger.error(() => `UDP relay socket error: ${error}`);
+          if (relayInfo.context) this._closeContext(relayInfo.context);
+          else destroySocket(relaySocket);
+        });
+        relayInfo.context = this._trackContext(server, localPort, {
+          connection,
+          rpc,
+          physicalPort,
+          udp: true,
+          sockets: new Set([relaySocket]),
+          cleanup: () => {
+            if (server.nativeRelays && server.nativeRelays[clientKey] === relayInfo) {
+              delete server.nativeRelays[clientKey];
+            }
+          },
+        });
+        relaySocket.bind(0);
+        if (server._diodeClosed || server.nativeRelays[clientKey] !== opening) {
+          this._closeContext(relayInfo.context);
+          throw new Error('UDP bind server closed during native relay setup');
+        }
+        server.nativeRelays[clientKey] = relayInfo;
+        this._touchContext(relayInfo.context);
+        logger.info(() => `Portopen2 ${formattedTargetPort} opened with server port ${physicalPort} for udp client ${clientKey}`);
+        return relayInfo;
+      } catch (error) {
+        if (relayInfo && relayInfo.context) this._closeContext(relayInfo.context);
+        else if (physicalPort && connection) this._closeNativePort({ connection, rpc, physicalPort });
+        throw error;
+      } finally {
+        if (server.nativeRelays && server.nativeRelays[clientKey] === opening && server._diodeClosed) {
+          delete server.nativeRelays[clientKey];
+        }
+      }
+    })();
+
+    try {
+      return await opening.openPromise;
+    } catch (error) {
+      if (server.nativeRelays && server.nativeRelays[clientKey] === opening) {
+        delete server.nativeRelays[clientKey];
+      }
+      throw error;
+    }
+  }
+
+  async _getOrOpenApiUdpEntry(server, clientKey, options) {
+    if (server._diodeClosed) throw new Error('UDP bind server is closed');
+    if (!server.clientRefs) server.clientRefs = Object.create(null);
+    const existing = server.clientRefs[clientKey];
+    if (existing) return existing.openPromise ? existing.openPromise : existing;
+
+    const opening = { openPromise: null };
+    server.clientRefs[clientKey] = opening;
+    opening.openPromise = (async () => {
+      const { deviceId, deviceIdHex, formattedTargetPort, localPort, rinfo } = options;
+      let opened;
+      let entry = null;
+      try {
+        opened = await this._openApiPortWithRelayFallback(
+          deviceId,
+          deviceIdHex,
+          formattedTargetPort,
+          'rw'
+        );
+        const { ref, connection, rpc } = opened;
+        if (server._diodeClosed) {
+          void Promise.resolve(rpc.portClose(ref, { timeoutMs: this.portOpenTimeoutMs })).catch(() => {});
+          throw new Error('UDP bind server closed during portopen');
+        }
+        entry = { ref, connection, rpc };
+        const socketWrapper = {
+          address: rinfo.address,
+          port: rinfo.port,
+          protocol: 'udp',
+          write: (data) => server.send(data, rinfo.port, rinfo.address),
+        };
+        const context = this._trackContext(server, localPort, {
+          connection,
+          rpc,
+          ref,
+          udp: true,
+          cleanup: () => {
+            if (server.clientRefs && server.clientRefs[clientKey] === entry) {
+              delete server.clientRefs[clientKey];
+            }
+          },
+        });
+        entry.context = context;
+        socketWrapper._diodeOwner = this;
+        socketWrapper._diodeContext = context;
+        context.clientSocketWrapper = socketWrapper;
+        this._replaceClientSocket(connection, ref, socketWrapper);
+        if (server._diodeClosed || server.clientRefs[clientKey] !== opening) {
+          this._closeContext(context);
+          throw new Error('UDP bind server closed during API relay setup');
+        }
+        server.clientRefs[clientKey] = entry;
+        this._touchContext(context);
+        logger.info(() => `Port ${formattedTargetPort} opened on device with ref ${ref.toString('hex')} for udp client ${clientKey}`);
+        return entry;
+      } catch (error) {
+        if (entry && entry.context) this._closeContext(entry.context);
+        throw error;
+      }
+    })();
+
+    try {
+      return await opening.openPromise;
+    } catch (error) {
+      if (server.clientRefs && server.clientRefs[clientKey] === opening) {
+        delete server.clientRefs[clientKey];
+      }
+      throw error;
+    }
   }
   
   bindSinglePort(localPort) {
@@ -497,67 +1023,39 @@ class BindPort {
     // For udp protocol, use udp server
     if (protocol === 'udp') {
       const server = dgram.createSocket('udp4');
+      server._diodeClosed = false;
       
       server.on('listening', () => {
         logger.info(() => `udp server listening on port ${localPort} forwarding to device port ${targetPort}`);
+        this.emit('listening', {
+          localPort: Number(server.address().port),
+          requestedLocalPort: Number(localPort),
+          address: server.address(),
+          targetPort: Number(targetPort),
+          protocol: 'udp',
+        });
       });
       
       server.on('message', async (data, rinfo) => {
         const clientKey = `${rinfo.address}:${rinfo.port}`;
         if (useNative) {
-          if (!server.nativeRelays) server.nativeRelays = {};
-          let relayInfo = server.nativeRelays[clientKey];
-          if (!relayInfo) {
-            let connection;
-            try {
-              connection = await this._resolveConnectionForDevice(deviceId);
-            } catch (error) {
-              logger.error(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
-              return;
-            }
-            if (!connection) {
-              logger.error(() => `No relay connection available for device ${deviceIdHex}`);
-              return;
-            }
-            const rpc = this._getRpcFor(connection);
-            try {
-              const flags = config.flags || 'rwu';
-              const physicalPort = await rpc.portOpen2(deviceId, formattedTargetPort, flags);
-              if (!physicalPort) {
-                logger.error(() => `Error opening portopen2 ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
-                return;
-              }
-
-              const relaySocket = dgram.createSocket('udp4');
-              relaySocket.on('message', (msg) => {
-                if (!relayInfo || !relayInfo.session) return;
-                const plaintext = nativeCrypto.parseUdpPacket(relayInfo.session, msg);
-                if (!plaintext) return;
-                server.send(plaintext, rinfo.port, rinfo.address);
-              });
-              relaySocket.on('error', (err) => {
-                logger.error(() => `udp relay socket error: ${err}`);
-                try { relaySocket.close(); } catch {}
-                delete server.nativeRelays[clientKey];
-              });
-              relaySocket.bind(0);
-
-              relayInfo = {
-                socket: relaySocket,
-                physicalPort,
-                relayHost: connection.getServerRelayHost(),
-                connection,
-                session: null,
-                handshakePromise: null,
-                client: { address: rinfo.address, port: rinfo.port }
-              };
-              server.nativeRelays[clientKey] = relayInfo;
-              logger.info(() => `Portopen2 ${formattedTargetPort} opened with server port ${physicalPort} for udp client ${clientKey}`);
-            } catch (error) {
-              logger.error(() => `Error opening portopen2 ${formattedTargetPort} on device: ${error}`);
-              return;
-            }
+          let relayInfo;
+          try {
+            relayInfo = await this._getOrOpenNativeUdpRelay(server, clientKey, {
+              deviceId,
+              deviceIdHex,
+              formattedTargetPort,
+              config,
+              localPort,
+              targetPort,
+              rinfo,
+            });
+          } catch (error) {
+            logger.error(() => `Error opening native UDP ${formattedTargetPort} on device: ${error}`);
+            return;
           }
+
+          if (!relayInfo || relayInfo.context.closed || server._diodeClosed) return;
 
           if (!relayInfo.handshakePromise) {
             const rpc = this._getRpcFor(relayInfo.connection);
@@ -566,14 +1064,17 @@ class BindPort {
               rpc,
               deviceId,
               targetPort,
-              relayInfo.physicalPort
+              relayInfo.physicalPort,
+              relayInfo.context
             ).then((session) => {
+              if (relayInfo.context.closed) {
+                throw new Error('Native UDP session closed during handshake');
+              }
               relayInfo.session = session;
               return session;
             }).catch((error) => {
               logger.error(() => `Native UDP handshake failed: ${error}`);
-              try { relayInfo.socket.close(); } catch {}
-              delete server.nativeRelays[clientKey];
+              this._closeContext(relayInfo.context);
               throw error;
             });
           }
@@ -588,6 +1089,7 @@ class BindPort {
 
           // Send encrypted data to the server relay port
           try {
+            this._touchContext(relayInfo.context);
             const packet = nativeCrypto.createUdpPacket(relayInfo.session, data);
             relayInfo.socket.send(packet, relayInfo.physicalPort, relayInfo.relayHost);
           } catch (error) {
@@ -597,52 +1099,40 @@ class BindPort {
         }
 
         // Legacy API relay
-        let entry = server.clientRefs && server.clientRefs[clientKey];
-        
-        if (!entry) {
-          try {
-            const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw');
-            const { ref, connection } = opened;
-            logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for udp client ${clientKey}`);
-            if (!server.clientRefs) server.clientRefs = {};
-            entry = { ref, connection };
-            server.clientRefs[clientKey] = entry;
-            
-            // Store the client info
-            connection.addClientSocket(ref, {
-              address: rinfo.address,
-              port: rinfo.port,
-              protocol: 'udp',
-              write: (data) => {
-                server.send(data, rinfo.port, rinfo.address);
-              }
-            });
-          } catch (error) {
-            logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
-            return;
-          }
+        let entry;
+        try {
+          entry = await this._getOrOpenApiUdpEntry(server, clientKey, {
+            deviceId,
+            deviceIdHex,
+            formattedTargetPort,
+            localPort,
+            rinfo,
+          });
+        } catch (error) {
+          logger.error(() => `Error opening UDP ${formattedTargetPort} on device: ${error}`);
+          return;
         }
+
+        if (!entry || entry.context.closed || server._diodeClosed) return;
         
         // Send data to the device
         try {
+          this._touchContext(entry.context);
           const rpc = this._getRpcFor(entry.connection);
-          await rpc.portSend(entry.ref, data);
+          await rpc.portSend(entry.ref, data, { timeoutMs: this.ioTimeoutMs });
         } catch (error) {
           logger.error(() => `Error sending udp data to device: ${error}`);
+          this._closeContext(entry.context);
         }
       });
       
-      server.on('error', (err) => {
-        logger.error(() => `udp Server error: ${err}`);
-      });
+      server.on('error', (err) => this._handleServerError(err, localPort, server));
       
       server.on('close', () => {
-        if (server.nativeRelays) {
-          for (const relayInfo of Object.values(server.nativeRelays)) {
-            try { relayInfo.socket.close(); } catch {}
-          }
-          server.nativeRelays = null;
-        }
+        server._diodeClosed = true;
+        this._closeServerContexts(server);
+        server.nativeRelays = null;
+        server.clientRefs = null;
       });
 
       server.bind(localPort);
@@ -652,9 +1142,16 @@ class BindPort {
       const server = net.createServer(async (clientSocket) => {
         logger.info(() => `Client connected to local server on port ${localPort}`);
         clientSocket.setNoDelay(true);
-        if (useNative) {
-          clientSocket.pause();
-        }
+        // Do not consume application bytes until a remote ref and all routing
+        // handlers are installed. This also bounds pre-open buffering in Node.
+        clientSocket.pause();
+
+        const context = this._trackContext(server, localPort, {
+          connection: null,
+          rpc: null,
+          ref: null,
+          sockets: new Set([clientSocket]),
+        });
 
         let connection = null;
         let rpc = null;
@@ -665,31 +1162,9 @@ class BindPort {
         let tlsSocketWrapper = null;
 
         const closeRemoteRef = async () => {
-          if (remoteCleanupStarted) {
-            return;
-          }
-
-          if (!ref || !connection || !rpc) {
-            return;
-          }
+          if (remoteCleanupStarted) return;
           remoteCleanupStarted = true;
-
-          const storedSocket = typeof connection.getClientSocket === 'function'
-            ? connection.getClientSocket(ref)
-            : null;
-          if (storedSocket && storedSocket !== clientSocket && typeof storedSocket.end === 'function') {
-            try { storedSocket.end(); } catch {}
-          }
-          if (typeof connection.deleteClientSocket === 'function') {
-            try { connection.deleteClientSocket(ref); } catch {}
-          }
-
-          try {
-            await rpc.portClose(ref);
-            logger.info(() => `Port closed on device for ref: ${ref.toString('hex')}`);
-          } catch (error) {
-            logger.error(() => `Error closing port on device: ${error}`);
-          }
+          this._closeContext(context);
         };
 
         clientSocket.once('close', () => {
@@ -714,12 +1189,18 @@ class BindPort {
             return;
           }
           rpc = this._getRpcFor(connection);
+          context.connection = connection;
+          context.rpc = rpc;
 
           // Open a new native relay port on the device for this client
           let physicalPort;
           try {
             const flags = config.flags || 'rw';
-            physicalPort = await rpc.portOpen2(deviceId, formattedTargetPort, flags);
+            physicalPort = await this._withTimeout(
+              () => rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+              this.portOpenTimeoutMs,
+              `portopen2 ${formattedTargetPort}`
+            );
             if (!physicalPort) {
               logger.error(() => `Error opening portopen2 ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
               clientSocket.destroy();
@@ -730,67 +1211,66 @@ class BindPort {
             clientSocket.destroy();
             return;
           }
-
-          let session;
-          try {
-            session = await this._performNativeHandshake(connection, rpc, deviceId, targetPort, physicalPort);
-          } catch (error) {
-            logger.error(() => `Native TCP handshake failed: ${error}`);
-            clientSocket.destroy();
+          context.physicalPort = physicalPort;
+          this._acquireNativeLease(context);
+          if (clientClosed || context.closed || clientSocket.destroyed) {
+            this._closeNativePort(context);
             return;
           }
 
           const relayHost = connection.getServerRelayHost();
-          const relaySocket = net.connect({ host: relayHost, port: physicalPort }, () => {
-            logger.info(() => `Connected to relay ${relayHost}:${physicalPort} for ${formattedTargetPort}`);
-          });
+          let relaySocket;
+          try {
+            relaySocket = net.connect({ host: relayHost, port: physicalPort });
+          } catch (error) {
+            logger.error(() => `Could not create native relay socket: ${error}`);
+            this._closeContext(context);
+            return;
+          }
           relaySocket.setNoDelay(true);
+          context.sockets.add(relaySocket);
 
-          let relayReady = false;
+          let session = null;
+          const pendingRelayChunks = [];
+          let pendingRelayBytes = 0;
           const pendingChunks = [];
+          let pendingBytes = 0;
+          let relayWriteBlocked = false;
 
-          const cleanup = () => {
-            if (!clientSocket.destroyed) clientSocket.destroy();
-            if (!relaySocket.destroyed) relaySocket.destroy();
+          const onRelayDrain = () => {
+            relayWriteBlocked = false;
+            if (!context.closed && !clientSocket.destroyed) clientSocket.resume();
           };
 
-          relaySocket.on('connect', () => {
-            relayReady = true;
-            while (pendingChunks.length > 0) {
-              const chunk = pendingChunks.shift();
-              try {
-                const frame = nativeCrypto.createTcpFrame(session, chunk);
-                relaySocket.write(frame);
-              } catch (error) {
-                logger.error(() => `Error sending TCP frame: ${error}`);
-                cleanup();
-                break;
-              }
-            }
-          });
+          const cleanup = () => {
+            relaySocket.off('drain', onRelayDrain);
+            this._closeContext(context);
+          };
 
           relaySocket.on('data', (data) => {
-            try {
-              const messages = nativeCrypto.consumeTcpFrames(session, data);
-              for (const msg of messages) {
-                clientSocket.write(msg);
+            if (!session) {
+              const copy = Buffer.from(data);
+              pendingRelayBytes += copy.length;
+              if (pendingRelayBytes > this.nativeQueueLimitBytes) {
+                logger.error(() => 'Native TCP pre-handshake relay queue limit exceeded');
+                cleanup();
+                return;
               }
-            } catch (error) {
-              logger.error(() => `TCP decrypt error: ${error}`);
-              cleanup();
-            }
-          });
-
-          clientSocket.on('data', (data) => {
-            if (!relayReady) {
-              pendingChunks.push(data);
+              pendingRelayChunks.push(copy);
               return;
             }
             try {
-              const frame = nativeCrypto.createTcpFrame(session, data);
-              relaySocket.write(frame);
+              const messages = nativeCrypto.consumeTcpFrames(session, data);
+              for (const msg of messages) {
+                if (!writeWithBoundedBackpressure(clientSocket, msg)) {
+                  relaySocket.pause();
+                  clientSocket.once('drain', () => {
+                    if (!relaySocket.destroyed) relaySocket.resume();
+                  });
+                }
+              }
             } catch (error) {
-              logger.error(() => `Error sending TCP frame: ${error}`);
+              logger.error(() => `TCP decrypt error: ${error}`);
               cleanup();
             }
           });
@@ -799,12 +1279,111 @@ class BindPort {
             logger.error(() => `Relay socket error: ${err}`);
             cleanup();
           });
+          relaySocket.on('end', cleanup);
+          relaySocket.on('close', cleanup);
+
+          try {
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              const finish = (error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                relaySocket.off('connect', onConnect);
+                relaySocket.off('error', onConnectError);
+                relaySocket.off('close', onConnectClose);
+                if (error) reject(error);
+                else resolve();
+              };
+              const onConnect = () => finish();
+              const onConnectError = (error) => finish(error);
+              const onConnectClose = () => finish(new Error('Relay socket closed before connect'));
+              const timer = setTimeout(
+                () => finish(new Error(`Relay socket connection timed out for ${relayHost}:${physicalPort}`)),
+                normalizeTimerMs(this.portOpenTimeoutMs, 5000)
+              );
+              relaySocket.once('connect', onConnect);
+              relaySocket.once('error', onConnectError);
+              relaySocket.once('close', onConnectClose);
+            });
+          } catch (error) {
+            logger.error(() => `Native TCP relay connection failed: ${error}`);
+            cleanup();
+            return;
+          }
+          logger.info(() => `Connected to relay ${relayHost}:${physicalPort} for ${formattedTargetPort}`);
+
+          if (clientClosed || context.closed || clientSocket.destroyed) {
+            cleanup();
+            return;
+          }
+
+          // Establish the native relay socket before completing the crypto
+          // handshake. The publisher resumes its backend immediately after the
+          // handshake, so reversing this order can lose an SSH/banner first byte.
+          try {
+            session = await this._performNativeHandshake(
+              connection,
+              rpc,
+              deviceId,
+              targetPort,
+              physicalPort,
+              context
+            );
+          } catch (error) {
+            logger.error(() => `Native TCP handshake failed: ${error}`);
+            cleanup();
+            return;
+          }
+
+          if (clientClosed || context.closed || clientSocket.destroyed) {
+            cleanup();
+            return;
+          }
+
+          while (pendingRelayChunks.length > 0 && !context.closed) {
+            const encrypted = pendingRelayChunks.shift();
+            pendingRelayBytes -= encrypted.length;
+            try {
+              const messages = nativeCrypto.consumeTcpFrames(session, encrypted);
+              for (const msg of messages) writeWithBoundedBackpressure(clientSocket, msg);
+            } catch (error) {
+              logger.error(() => `TCP decrypt error: ${error}`);
+              cleanup();
+              return;
+            }
+          }
+
+          clientSocket.on('data', (data) => {
+            if (!session) {
+              const copy = Buffer.from(data);
+              pendingBytes += copy.length;
+              if (pendingBytes > this.nativeQueueLimitBytes) {
+                logger.error(() => 'Native TCP pre-connect queue limit exceeded');
+                cleanup();
+                return;
+              }
+              pendingChunks.push(copy);
+              return;
+            }
+            try {
+              const frame = nativeCrypto.createTcpFrame(session, data);
+              if (relaySocket.write(frame) === false && !relayWriteBlocked) {
+                relayWriteBlocked = true;
+                clientSocket.pause();
+                relaySocket.once('drain', onRelayDrain);
+              }
+            } catch (error) {
+              logger.error(() => `Error sending TCP frame: ${error}`);
+              cleanup();
+            }
+          });
           clientSocket.on('error', (err) => {
             logger.error(() => `Client socket error: ${err}`);
             cleanup();
           });
           clientSocket.on('end', cleanup);
-          relaySocket.on('end', cleanup);
+          clientSocket.on('close', cleanup);
           clientSocket.resume();
 
           return;
@@ -816,6 +1395,9 @@ class BindPort {
           connection = opened.connection;
           rpc = opened.rpc;
           ref = opened.ref;
+          context.connection = connection;
+          context.rpc = rpc;
+          context.ref = ref;
           logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
         } catch (error) {
           logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
@@ -825,7 +1407,8 @@ class BindPort {
 
         if (clientClosed || clientSocket.destroyed) {
           logger.warn(() => `Local client disconnected before port ${formattedTargetPort} opened; closing ref ${ref.toString('hex')}`);
-          await closeRemoteRef();
+          try { connection.deleteClientSocket(ref); } catch (_) {}
+          try { await rpc.portClose(ref, { timeoutMs: this.portOpenTimeoutMs }); } catch (_) {}
           return;
         }
 
@@ -833,7 +1416,7 @@ class BindPort {
           // For tls protocol, create a proper tls connection
           try {
             // Create a DiodeSocket to handle communication with the device
-            const diodeSocket = new DiodeSocket(ref, rpc);
+            const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
             
             // Get the device certificate for tls
             const certPem = connection.getDeviceCertificate();
@@ -880,10 +1463,24 @@ class BindPort {
               }
             };
             tlsSocketWrapper = socketWrapper;
+            socketWrapper._diodeOwner = this;
+            socketWrapper._diodeContext = context;
+            context.sockets.add(tlsSocket);
+            context.sockets.add(diodeSocket);
             
             // Store the socket wrapper
-            connection.addClientSocket(ref, socketWrapper);
+            context.clientSocketWrapper = socketWrapper;
+            this._replaceClientSocket(connection, ref, socketWrapper);
+            const secureTimer = setTimeout(() => {
+              logger.error(() => `TLS connection timed out for device ${deviceIdHex}`);
+              this._closeContext(context);
+            }, normalizeTimerMs(this.handshakeTimeoutMs, 10000));
+            tlsSocket.once('secureConnect', () => {
+              clearTimeout(secureTimer);
+              if (!clientSocket.destroyed) clientSocket.resume();
+            });
             tlsSocket.once('close', () => {
+              clearTimeout(secureTimer);
               if (!clientSocket.destroyed) {
                 clientSocket.end();
               }
@@ -901,13 +1498,16 @@ class BindPort {
           }
         } else {
           // For TCP protocol, just use the raw socket
-          connection.addClientSocket(ref, clientSocket);
+          clientSocket._diodeOwner = this;
+          clientSocket._diodeContext = context;
+          context.clientSocketWrapper = clientSocket;
+          this._replaceClientSocket(connection, ref, clientSocket);
           
           // Handle data from client to device
           clientSocket.on('data', (data) => {
             clientSocket.pause();
             try {
-              rpc.portSend(ref, data)
+              rpc.portSend(ref, data, { timeoutMs: this.ioTimeoutMs })
                 .then(() => {
                   if (!clientSocket.destroyed) {
                     clientSocket.resume();
@@ -922,6 +1522,7 @@ class BindPort {
               clientSocket.destroy();
             }
           });
+          clientSocket.resume();
         }
 
         // Handle client socket closure (common for all protocols)
@@ -930,9 +1531,22 @@ class BindPort {
           closeRemoteRef();
         });
       });
+      server._diodeClosed = false;
 
       server.listen(localPort, () => {
         logger.info(() => `Local server listening on port ${localPort} forwarding to device ${protocol} port ${targetPort}`);
+        this.emit('listening', {
+          localPort: Number(server.address().port),
+          requestedLocalPort: Number(localPort),
+          address: server.address(),
+          targetPort: Number(targetPort),
+          protocol,
+        });
+      });
+      server.on('error', (err) => this._handleServerError(err, localPort, server));
+      server.on('close', () => {
+        server._diodeClosed = true;
+        this._closeServerContexts(server);
       });
       
       this.servers.set(parseInt(localPort), server);

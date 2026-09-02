@@ -4,7 +4,8 @@ const logger = require('./logger');
 const { KJUR } = require("jsrsasign");
 const { KEYUTIL } = require("jsrsasign");
 const fs = require('fs');
-var path = require('path');
+const path = require('path');
+const crypto = require('crypto');
 
 // Zero-copy view for Uint8Array -> Buffer where possible
 function toBufferView(u8) {
@@ -160,29 +161,51 @@ function loadOrGenerateKeyPair(keyLocation) {
     // Try to load existing keys
     if (fs.existsSync(keyLocation)) {
       logger.info(() => `Loading keys from ${keyLocation}`);
-      const keyData = JSON.parse(fs.readFileSync(keyLocation, 'utf8'));
-      
-      // Convert the stored JSON back to keypair objects
-      const prvKeyObj = KEYUTIL.getKeyFromPlainPrivatePKCS8PEM(keyData.privateKey);
-      const pubKeyObj = KEYUTIL.getKey(keyData.publicKey);
-      
-      return { prvKeyObj, pubKeyObj };
-    } else {
-      // Generate new keypair
-      logger.info(() => `Generating new key pair at ${keyLocation}`);
-      const kp = KEYUTIL.generateKeypair("EC", "secp256k1");
-      
-      // Store the keys in a serializable format
-      const keyData = {
-        privateKey: KEYUTIL.getPEM(kp.prvKeyObj, "PKCS8PRV"),
-        publicKey: KEYUTIL.getPEM(kp.pubKeyObj, "PKCS8PUB"),
-        check: kp.prvKeyObj.prvKeyHex
-      };
-      
-      // Save to file
-      fs.writeFileSync(keyLocation, JSON.stringify(keyData, null, 2), 'utf8');
-      
+      return loadKeyPairFile(keyLocation);
+    }
+
+    // Generate into a private temporary file, then publish it atomically with
+    // a hard link. linkSync is create-if-absent, so concurrent starters all
+    // converge on the same on-disk identity without exposing a partial JSON
+    // file or overwriting the winner.
+    logger.info(() => `Generating new key pair at ${keyLocation}`);
+    const kp = KEYUTIL.generateKeypair("EC", "secp256k1");
+    const keyData = {
+      privateKey: KEYUTIL.getPEM(kp.prvKeyObj, "PKCS8PRV"),
+      publicKey: KEYUTIL.getPEM(kp.pubKeyObj, "PKCS8PUB")
+    };
+    const directory = path.dirname(keyLocation);
+    const temporaryPath = path.join(
+      directory,
+      `.${path.basename(keyLocation)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`
+    );
+    let temporaryFd = null;
+    try {
+      temporaryFd = fs.openSync(temporaryPath, 'wx', 0o600);
+      fs.writeFileSync(temporaryFd, JSON.stringify(keyData, null, 2), 'utf8');
+      fs.fsyncSync(temporaryFd);
+      fs.closeSync(temporaryFd);
+      temporaryFd = null;
+
+      try {
+        fs.linkSync(temporaryPath, keyLocation);
+      } catch (error) {
+        if (error && error.code === 'EEXIST') {
+          return loadKeyPairFile(keyLocation);
+        }
+        throw error;
+      }
+      enforcePrivateFileMode(keyLocation);
       return kp;
+    } finally {
+      if (temporaryFd !== null) {
+        try { fs.closeSync(temporaryFd); } catch (_) {}
+      }
+      try { fs.unlinkSync(temporaryPath); } catch (error) {
+        if (!error || error.code !== 'ENOENT') {
+          logger.warn(() => `Could not remove temporary Diode key file ${temporaryPath}: ${error}`);
+        }
+      }
     }
   } catch (error) {
     logger.error(() => `Error loading or generating key pair: ${error}`);
@@ -190,13 +213,27 @@ function loadOrGenerateKeyPair(keyLocation) {
   }
 }
 
-function ensureDirectoryExistence(filePath) {
-  var dirname = path.dirname(filePath);
-  if (fs.existsSync(dirname)) {
-    return true;
+function enforcePrivateFileMode(filePath) {
+  if (process.platform === 'win32') return;
+  fs.chmodSync(filePath, 0o600);
+}
+
+function loadKeyPairFile(keyLocation) {
+  enforcePrivateFileMode(keyLocation);
+  const keyData = JSON.parse(fs.readFileSync(keyLocation, 'utf8'));
+  if (!keyData || typeof keyData.privateKey !== 'string' || typeof keyData.publicKey !== 'string') {
+    throw new Error('Invalid Diode key file');
   }
-  ensureDirectoryExistence(dirname);
-  fs.mkdirSync(dirname);
+  const prvKeyObj = KEYUTIL.getKeyFromPlainPrivatePKCS8PEM(keyData.privateKey);
+  const pubKeyObj = KEYUTIL.getKey(keyData.publicKey);
+  return { prvKeyObj, pubKeyObj };
+}
+
+function ensureDirectoryExistence(filePath) {
+  const dirname = path.dirname(filePath);
+  if (fs.existsSync(dirname)) return true;
+  fs.mkdirSync(dirname, { recursive: true, mode: 0o700 });
+  return true;
 }
 
 const DEFAULT_FLEET_CONTRACT = '0x6000000000000000000000000000000000000000';

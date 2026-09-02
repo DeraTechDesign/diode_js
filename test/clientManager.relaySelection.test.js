@@ -7,6 +7,7 @@ const EventEmitter = require('events');
 const { WebSocketServer } = require('ws');
 
 const DiodeClientManager = require('../clientManager');
+const PublishPort = require('../publishPort');
 const { fetchNetworkDirectory } = require('../networkDiscoveryClient');
 const { DEFAULT_FLEET_CONTRACT } = require('../utils');
 
@@ -124,6 +125,19 @@ class TestClientManager extends DiodeClientManager {
     }
     return super._fetchNetworkDiscoveryNodes();
   }
+
+  async _probeConnection(connection, hostKey, discoveredFrom, startedAt) {
+    const behavior = this.hostBehaviors.get(hostKey) || {};
+    if (!Number.isFinite(behavior.measuredLatencyMs)) {
+      return super._probeConnection(connection, hostKey, discoveredFrom, startedAt);
+    }
+    const result = await this._getRpcFor(connection).ping({
+      timeoutMs: this.relaySelection.probeTimeoutMs,
+    });
+    if (!result) throw new Error(`Relay probe failed for ${hostKey}`);
+    this._recordRelayProbeSuccess(hostKey, behavior.measuredLatencyMs, discoveredFrom);
+    return connection;
+  }
 }
 
 test('constructor-provided fleet contract propagates to new managed connections', async () => {
@@ -181,6 +195,100 @@ test('invalid fleet contract values fail fast', () => {
     /fleetContract must be a 20-byte EVM address hex string/i,
   );
   manager.close();
+});
+
+test('manager clamps configurable and direct timeout values to Node timer bounds', async () => {
+  const tempDir = makeTempDir();
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: {
+      scoreCachePath: null,
+      probeTimeoutMs: Number.MAX_SAFE_INTEGER,
+      deviceLookupTimeoutMs: Number.POSITIVE_INFINITY,
+      discoveryProviderTimeoutMs: -1,
+      backgroundProbeIntervalMs: Number.MAX_SAFE_INTEGER,
+      deviceRelayReconciliation: { timeoutMs: Number.MAX_SAFE_INTEGER },
+      networkDiscovery: { enabled: false, timeoutMs: Number.MAX_SAFE_INTEGER },
+    },
+  });
+
+  assert.equal(manager.relaySelection.probeTimeoutMs, 0x7fffffff);
+  assert.equal(manager.relaySelection.deviceLookupTimeoutMs, 3000);
+  assert.equal(manager.relaySelection.discoveryProviderTimeoutMs, 1500);
+  assert.equal(manager.relaySelection.backgroundProbeIntervalMs, 0x7fffffff);
+  assert.equal(manager.relaySelection.deviceRelayReconciliation.timeoutMs, 0x7fffffff);
+  assert.equal(manager.relaySelection.networkDiscovery.timeoutMs, 0x7fffffff);
+
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const delays = [];
+  global.setTimeout = (_callback, delayMs) => {
+    delays.push(delayMs);
+    return { fakeTimer: true };
+  };
+  global.clearTimeout = () => {};
+  try {
+    assert.equal(
+      await manager._withTimeout(() => Promise.resolve('huge'), Number.MAX_SAFE_INTEGER, 'huge timeout'),
+      'huge'
+    );
+    assert.equal(
+      await manager._withTimeout(() => Promise.resolve('negative'), -10, 'negative timeout'),
+      'negative'
+    );
+    assert.equal(
+      await manager._withTimeout(() => Promise.resolve('nonfinite'), Number.NaN, 'nonfinite timeout'),
+      'nonfinite'
+    );
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+    manager.close();
+  }
+
+  assert.deepEqual(delays, [0x7fffffff, 1200, 1200]);
+});
+
+test('background probe failures are counted once', async () => {
+  const tempDir = makeTempDir();
+  const hostKey = 'failed-probe:41046';
+  const connection = new FakeConnection(hostKey, { pingResult: false });
+  const manager = new TestClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: {
+      scoreCachePath: null,
+      probeTimeoutMs: 100,
+      backgroundProbeIntervalMs: 1,
+      networkDiscovery: { enabled: false },
+    },
+  }, new Map([[hostKey, { connection }]]));
+  manager._registerConnection(connection, hostKey);
+
+  manager._queueBackgroundProbe(connection, hostKey);
+  while (manager.pendingProbes.has(hostKey)) {
+    await delay(1);
+  }
+
+  assert.equal(manager.relayScores.get(hostKey).failureCount, 1);
+  manager.close();
+});
+
+test('late probe completion cannot mutate scores or schedule a flush after manager close', () => {
+  const tempDir = makeTempDir();
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: {
+      scoreCachePath: path.join(tempDir, 'relay-scores.json'),
+      networkDiscovery: { enabled: false },
+    },
+  });
+
+  manager.close();
+  manager._recordRelayProbeFailure('late:41046', new Error('late failure'));
+  manager._recordRelayProbeSuccess('late:41046', 10, 'seed');
+
+  assert.equal(manager.relayScores.has('late:41046'), false);
+  assert.equal(manager._relayScoreFlushTimer, null);
 });
 
 test('default fleet contract is applied when manager config is omitted', () => {
@@ -673,12 +781,12 @@ test('default mode probes all default seeds before final pruning', async () => {
       networkDiscovery: { enabled: false },
     },
   }, new Map([
-    ['as1.prenet.diode.io:41046', { pingDelayMs: 60 }],
-    ['as2.prenet.diode.io:41046', { pingDelayMs: 55 }],
-    ['us1.prenet.diode.io:41046', { pingDelayMs: 40 }],
-    ['us2.prenet.diode.io:41046', { pingDelayMs: 35 }],
-    ['eu1.prenet.diode.io:41046', { pingDelayMs: 5 }],
-    ['eu2.prenet.diode.io:41046', { pingDelayMs: 25 }],
+    ['as1.prenet.diode.io:41046', { measuredLatencyMs: 60 }],
+    ['as2.prenet.diode.io:41046', { measuredLatencyMs: 55 }],
+    ['us1.prenet.diode.io:41046', { measuredLatencyMs: 40 }],
+    ['us2.prenet.diode.io:41046', { measuredLatencyMs: 35 }],
+    ['eu1.prenet.diode.io:41046', { measuredLatencyMs: 5 }],
+    ['eu2.prenet.diode.io:41046', { measuredLatencyMs: 25 }],
   ]));
 
   await manager.connect();
@@ -1451,4 +1559,114 @@ test('closing a duplicate relay alias remaps serverId to the surviving connectio
   const resolved = await manager.getConnectionForDevice('0x01');
   assert.equal(resolved, hostnameConnection);
   manager.close();
+});
+
+test('idle pruning never closes a relay with active tunnel state', () => {
+  const tempDir = makeTempDir();
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: { scoreCachePath: null, warmConnectionBudget: 1 },
+  });
+  const fast = new FakeConnection('fast:41046');
+  const active = new FakeConnection('active:41046');
+  active.clientSockets = new Map([['ref', {}]]);
+  manager._registerConnection(fast, 'fast:41046');
+  manager._registerConnection(active, 'active:41046');
+  manager._startupCoverageComplete = true;
+  manager.relayScores.set('fast:41046', {
+    hostKey: 'fast:41046', ewmaLatencyMs: 5, lastSuccessAt: Date.now(), discoveredFrom: 'seed',
+  });
+  manager.relayScores.set('active:41046', {
+    hostKey: 'active:41046', ewmaLatencyMs: 100, lastSuccessAt: Date.now(), discoveredFrom: 'seed',
+  });
+
+  manager._pruneIdleConnections();
+
+  assert.equal(fast.closeCount, 0);
+  assert.equal(active.closeCount, 0);
+  assert.equal(manager.getConnections().includes(active), true);
+  manager.close();
+});
+
+test('manager readiness follows connection readiness and forwards disconnect context', async () => {
+  const tempDir = makeTempDir();
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: { scoreCachePath: null },
+  });
+  const connection = new FakeConnection('ready:41046');
+  let ready = false;
+  connection.isReady = () => ready;
+  manager._registerConnection(connection, 'ready:41046');
+
+  assert.equal(manager.getNearestConnection(), null);
+  ready = true;
+  connection.emit('reconnected');
+  assert.equal(manager.getNearestConnection(), connection);
+
+  const disconnected = new Promise((resolve) => manager.once('disconnect', resolve));
+  const error = new Error('relay lost');
+  connection.emit('disconnect', { connection, error, generation: 2 });
+  const payload = await disconnected;
+
+  assert.equal(payload.connection, connection);
+  assert.equal(payload.error, error);
+  assert.equal(manager.getNearestConnection(), null);
+  manager.close();
+});
+
+test('manager close forwards synchronous disconnect before unregistering publisher cleanup', () => {
+  const tempDir = makeTempDir();
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(tempDir, 'keys.json'),
+    relaySelection: { scoreCachePath: null },
+  });
+  const connection = new FakeConnection('closing:41046');
+  const disconnectError = new Error('manager requested close');
+  connection.close = function close() {
+    this.closeCount += 1;
+    this.socket.destroyed = true;
+    this.emit('disconnect', { connection: this, error: disconnectError, generation: 1 });
+  };
+  manager._registerConnection(connection, 'closing:41046');
+
+  const publisher = new PublishPort(manager, {});
+  const relaySocket = {
+    destroyed: false,
+    close() { this.destroyed = true; },
+  };
+  const localSocket = {
+    destroyed: false,
+    close() { this.destroyed = true; },
+  };
+  const physicalPort = 42000;
+  const session = {
+    connection,
+    physicalPort,
+    port: 8080,
+    sessionKey: publisher._nativeSessionKey(connection, physicalPort),
+    relaySocket,
+    localSocket,
+    nativeLease: true,
+  };
+  connection._diodeActiveNativeSessions = 1;
+  publisher.nativeSessions.set(session.sessionKey, session);
+  let forwarded = null;
+  manager.once('disconnect', (payload) => {
+    forwarded = payload;
+  });
+
+  manager.close();
+
+  assert.equal(forwarded.connection, connection);
+  assert.equal(forwarded.error, disconnectError);
+  assert.equal(connection.closeCount, 1);
+  assert.equal(manager.getConnections().length, 0);
+  assert.equal(manager.connectionByHost.has('closing:41046'), false);
+  assert.equal(publisher.nativeSessions.has(session.sessionKey), false);
+  assert.equal(session.nativeLease, false);
+  assert.equal(connection._diodeActiveNativeSessions, 0);
+  assert.equal(relaySocket.destroyed, true);
+  assert.equal(localSocket.destroyed, true);
+  publisher.close();
 });

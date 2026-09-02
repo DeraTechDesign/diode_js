@@ -10,8 +10,12 @@ npm install diodejs
 
 ### Quick Start
 
-If you want to enable logs, set environment variable LOG to true. 
-If you want to enable debug logs, set environment variable DEBUG to true. 
+Warnings and errors are always written to stderr. Set `LOG=true` to also enable
+bounded persistent logging in `logs/diodejs.log`; the default retention is five
+files of at most 2 MiB each. Use `DIODE_LOG_DIRECTORY`,
+`DIODE_LOG_MAX_BYTES`, and `DIODE_LOG_MAX_FILES` to reduce those limits or
+change the directory. Set `DEBUG=true` together with `LOG=true` to enable debug
+output.
 
 Can also use .env files
 
@@ -25,7 +29,7 @@ Connection retry behavior can be configured via environment variables:
 | DIODE_RETRY_DELAY | Initial delay between retries (ms) | 1000 |
 | DIODE_MAX_RETRY_DELAY | Maximum delay between retries (ms) | 30000 |
 | DIODE_AUTO_RECONNECT | Whether to automatically reconnect | true |
-| DIODE_TICKET_BYTES_THRESHOLD | Bytes threshold for ticket updates | 512000 (512KB) |
+| DIODE_TICKET_BYTES_THRESHOLD | Bytes threshold for ticket updates | 4194304 (4 MiB) |
 | DIODE_TICKET_UPDATE_INTERVAL | Time interval for ticket updates (ms) | 30000 (30s) |
 
 Example `.env` file:
@@ -331,12 +335,19 @@ async function main() {
     3000: { 
       mode: 'private',  
       host: 'backend.internal',
-      whitelist: ['0x1234abcd5678...', '0x9876fedc5432...'] // Only these devices can connect
+      whitelist: [
+        '0x1234567890abcdef1234567890abcdef12345678',
+        '0x9876543210fedcba9876543210fedcba98765432'
+      ] // Only these 20-byte EVM device addresses can connect
     }
   };
   
   // certPath parameter is maintained for backward compatibility but not required
   const publishPort = new PublishPort(client, publishedPortsWithConfig);
+
+  // When permanently stopping publication, release sessions and listeners.
+  // clearPorts() only changes the live port set; close() is terminal.
+  // publishPort.close();
 }
 
 main();
@@ -406,17 +417,20 @@ Connections returned by `getConnections()` or `getConnectionForDevice()` emit `r
   - `getBlockPeak()`: Retrieves the current block peak. Returns a promise.
   - `getBlockHeader(index)`: Retrieves the block header for a given index. Returns a promise.
   - `getBlock(index)`: Retrieves the block for a given index. Returns a promise.
-  - `getObject(deviceId)`: Retrieves a device ticket object. Returns a promise.
-  - `getNode(nodeId)`: Retrieves relay node information. Returns a promise.
-  - `ping()`: Sends a ping command. Returns a promise.
-  - `portOpen(deviceId, port, flags)`: Opens a port on the device. Returns a promise.
-  - `portOpen2(deviceId, port, flags)`: Opens a native relay port on the device (TCP/UDP). Returns the server relay port.
-  - `portSend(ref, data)`: Sends data to the device. Returns a promise.
-  - `portClose(ref)`: Closes a port on the device. Returns a promise.
+  - `getObject(deviceId, options)`: Retrieves a device ticket object. Returns a promise.
+  - `getNode(nodeId, options)`: Retrieves relay node information. Returns a promise.
+  - `ping(options)`: Sends a ping command. Returns a promise.
+  - `portOpen(deviceId, port, flags, options)`: Opens a port on the device. Returns a promise.
+  - `portOpen2(deviceId, port, flags, options)`: Opens a native relay port on the device (TCP/UDP). Returns the server relay port.
+  - `portSend(ref, data, options)`: Sends data to the device. Returns a promise.
+  - `portClose(ref, options)`: Closes an API-relayed port. Returns a promise.
+  - `portClose2(physicalPort, options)`: Closes a native relay port. Returns a promise.
   - `sendError(sessionId, ref, error)`: Sends an error response. Returns a promise.
   - `sendResponse(sessionId, ref, response)`: Sends a response. Returns a promise.
   - `getEpoch()`: Retrieves the current epoch. Returns a promise.
   - `parseTimestamp(blockHeader)`: Parses the timestamp from a block header. Returns a number.
+
+For the RPC methods that accept `options`, pass `{ timeoutMs, signal }` to set a per-call deadline or an `AbortSignal`. Commands use a 15-second default deadline and reject with typed errors such as `DIODE_COMMAND_TIMEOUT`, `DIODE_COMMAND_ABORTED`, `DIODE_DISCONNECTED`, or `DIODE_RPC_ERROR`. Port open/close failures reject instead of resolving as an undefined success; callers should handle those promise rejections.
 
 #### `BindPort`
 
@@ -446,6 +460,7 @@ Connections returned by `getConnections()` or `getConnectionForDevice()` emit `r
   - `removePort(localPort)`: Removes a port binding configuration.
   - `bindSinglePort(localPort)`: Binds a single local port to its target.
   - `closeAllServers()`: Closes all active server instances.
+  - `dispose()`: Permanently closes servers, active tunnels, and shared manager listeners. Use this when replacing or discarding a `BindPort` instance.
 
 #### `PublishPort`
 
@@ -461,6 +476,7 @@ Connections returned by `getConnections()` or `getConnectionForDevice()` emit `r
     - `port` (number): The port number to publish.
     - `config` (object): Optional configuration with `mode` ('public'|'private'), `whitelist` array, and `host` string.
       - `host` (string, optional): Target IP or hostname for the published service. Defaults to `127.0.0.1`.
+      - Private whitelists accept complete 20-byte `0x` EVM addresses; address matching is case-insensitive and stored in lowercase.
   - `removePort(port)`: Removes a published port.
     - `port` (number): The port number to remove.
   - `addPorts(ports)`: Adds multiple ports at once (equivalent to the constructor's publishedPorts parameter).
@@ -468,6 +484,8 @@ Connections returned by `getConnections()` or `getConnectionForDevice()` emit `r
   - `getPublishedPorts()`: Returns a plain object with all published ports and their configurations.
   - `clearPorts()`: Removes all published ports. Returns the number of ports that were cleared.
   - `startListening()`: Starts listening for unsolicited messages.
+  - `stopListening()`: Pauses unsolicited-message handling without closing active sessions.
+  - `close()`: Permanently removes listeners and closes all API/native sessions. A closed instance cannot be restarted; create a new `PublishPort` instead.
   - `handlePortOpen(sessionIdRaw, messageContent)`: Handles port open requests.
   - `handlePortSend(sessionIdRaw, messageContent)`: Handles port send requests.
   - `handlePortClose(sessionIdRaw, messageContent)`: Handles port close requests.

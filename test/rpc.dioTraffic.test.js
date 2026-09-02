@@ -122,3 +122,33 @@ test('dioTraffic throws JSON-RPC errors', async () => {
     await server.close();
   }
 });
+
+test('nodeRpc clamps huge timeouts and falls back for invalid timeout values', async () => {
+  const originalFetch = global.fetch;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const delays = [];
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ jsonrpc: '2.0', id: 1, result: 'ok' }),
+  });
+  global.setTimeout = (_callback, delayMs) => {
+    delays.push(delayMs);
+    return { fakeTimer: true };
+  };
+  global.clearTimeout = () => {};
+
+  try {
+    const rpc = new DiodeRPC({ host: '127.0.0.1' });
+    for (const timeoutMs of [Number.MAX_SAFE_INTEGER, -1, Number.POSITIVE_INFINITY, Number.NaN]) {
+      assert.equal(await rpc.nodeRpc('test_timer', [], { timeoutMs }), 'ok');
+    }
+  } finally {
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+
+  assert.deepEqual(delays, [0x7fffffff, 30000, 30000, 30000]);
+});

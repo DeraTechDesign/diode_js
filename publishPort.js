@@ -14,6 +14,24 @@ const logger = require('./logger');
 const secp256k1 = require('secp256k1');
 const ethUtil = require('ethereumjs-util');
 
+const MAX_NATIVE_QUEUE_BYTES = 1024 * 1024;
+const MAX_TIMER_MS = 0x7fffffff;
+
+function normalizeTimerMs(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), MAX_TIMER_MS);
+}
+
+function destroySocket(socket, error = undefined) {
+  if (!socket) return;
+  try {
+    if (typeof socket.destroy === 'function') socket.destroy(error);
+    else if (typeof socket.close === 'function') socket.close();
+    else if (typeof socket.end === 'function') socket.end();
+  } catch (_) {}
+}
+
 function normalizeDeviceId(raw) {
   if (!raw) return '';
   let buf = toBufferView(raw);
@@ -38,7 +56,82 @@ function normalizeDeviceId(raw) {
   return '';
 }
 
+function isByteSequence(value, { nonEmpty = false, maxLength = Infinity } = {}) {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) return false;
+  return (!nonEmpty || value.byteLength > 0) && value.byteLength <= maxLength;
+}
+
+function decodeMessageType(raw) {
+  if (typeof raw === 'string') return raw;
+  if (!isByteSequence(raw, { nonEmpty: true })) return null;
+  return toBufferView(raw).toString('utf8');
+}
+
+function isPortField(value) {
+  return (typeof value === 'number' && Number.isInteger(value))
+    || (typeof value === 'string' && value.length > 0)
+    || isByteSequence(value, { nonEmpty: true });
+}
+
+function isUIntField(value) {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0;
+  if (typeof value === 'string') return /^(?:0x[0-9a-f]+|\d+)$/i.test(value);
+  return isByteSequence(value, { maxLength: 6 });
+}
+
+function validatePublisherUnsolicited(message) {
+  if (!Array.isArray(message) || message.length < 2) return { error: 'invalid envelope' };
+  if (!isByteSequence(message[0], { nonEmpty: true })) return { error: 'invalid session id' };
+  const messageContent = message[1];
+  if (!Array.isArray(messageContent) || messageContent.length === 0) {
+    return { error: 'invalid message content' };
+  }
+  const messageType = decodeMessageType(messageContent[0]);
+  if (!messageType) return { error: 'invalid message type' };
+
+  let valid = true;
+  if (messageType === 'portopen') {
+    valid = messageContent.length >= 4
+      && isPortField(messageContent[1])
+      && isByteSequence(messageContent[2], { nonEmpty: true })
+      && isByteSequence(messageContent[3], { nonEmpty: true });
+  } else if (messageType === 'portopen2') {
+    valid = messageContent.length >= 5
+      && isPortField(messageContent[1])
+      && isUIntField(messageContent[2])
+      && isByteSequence(messageContent[3], { nonEmpty: true })
+      && (typeof messageContent[4] === 'string' || isByteSequence(messageContent[4]));
+  } else if (messageType === 'portclose2') {
+    valid = messageContent.length >= 2 && isUIntField(messageContent[1]);
+  } else if (messageType === 'portsend' || messageType === 'data') {
+    valid = messageContent.length >= 3
+      && isByteSequence(messageContent[1], { nonEmpty: true })
+      && isByteSequence(messageContent[2]);
+  } else if (messageType === 'portclose') {
+    valid = messageContent.length >= 2
+      && isByteSequence(messageContent[1], { nonEmpty: true });
+  }
+
+  if (!valid) return { error: `invalid ${messageType} payload` };
+  return { sessionIdRaw: message[0], messageContent, messageType };
+}
+
+function normalizePublishedPort(port) {
+  if ((typeof port !== 'number' && typeof port !== 'string')
+    || (typeof port === 'string' && port.trim() === '')) {
+    throw new TypeError('PublishPort port must be a whole integer from 1 to 65535');
+  }
+  const normalized = typeof port === 'number' ? port : Number(port.trim());
+  if (!Number.isInteger(normalized) || normalized < 1 || normalized > 65535) {
+    throw new RangeError('PublishPort port must be a whole integer from 1 to 65535');
+  }
+  return normalized;
+}
+
 function normalizePublishedPortConfig(config = {}) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new TypeError('PublishPort config must be an object');
+  }
   const hasHost = Object.prototype.hasOwnProperty.call(config, 'host');
   const rawHost = hasHost ? config.host : '127.0.0.1';
   if (typeof rawHost !== 'string') {
@@ -50,34 +143,80 @@ function normalizePublishedPortConfig(config = {}) {
     throw new TypeError('PublishPort config.host must be a non-empty string');
   }
 
-  return {
-    mode: config.mode || 'public',
-    whitelist: Array.isArray(config.whitelist) ? config.whitelist : [],
-    host,
-  };
+  const rawMode = config.mode === undefined ? 'public' : config.mode;
+  if (typeof rawMode !== 'string') {
+    throw new TypeError('PublishPort config.mode must be public or private');
+  }
+  const mode = rawMode.trim().toLowerCase();
+  if (mode !== 'public' && mode !== 'private') {
+    throw new TypeError('PublishPort config.mode must be public or private');
+  }
+
+  let whitelist = [];
+  if (mode === 'private') {
+    const rawWhitelist = config.whitelist === undefined ? [] : config.whitelist;
+    if (!Array.isArray(rawWhitelist)) {
+      throw new TypeError('PublishPort config.whitelist must be an array');
+    }
+    whitelist = Array.from(new Set(rawWhitelist.map((address) => {
+      if (typeof address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(address)) {
+        throw new TypeError('PublishPort whitelist entries must be 20-byte 0x EVM addresses');
+      }
+      return address.toLowerCase();
+    })));
+  }
+
+  return { mode, whitelist, host };
 }
 
 class DiodeSocket extends Duplex {
-  constructor(ref, rpc) {
+  constructor(ref, rpc, timeoutMs = 10000) {
     super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
     this.ref = ref;
     this.rpc = rpc;
+    this.timeoutMs = timeoutMs;
+    this._inboundQueue = [];
+    this._inboundBytes = 0;
+    this._inboundBlocked = false;
   }
 
   _write(chunk, encoding, callback) {
     // Send data to the Diode client via portSend
-    this.rpc.portSend(this.ref, chunk)
+    this.rpc.portSend(this.ref, chunk, { timeoutMs: this.timeoutMs })
       .then(() => callback())
       .catch((err) => callback(err));
   }
 
   _read(size) {
-    // No need to implement this method
+    this._inboundBlocked = false;
+    while (!this._inboundBlocked && this._inboundQueue.length > 0 && !this.destroyed) {
+      const chunk = this._inboundQueue.shift();
+      this._inboundBytes -= chunk.length;
+      this._inboundBlocked = this.push(chunk) === false;
+    }
   }
 
   // Method to push data received from Diode client
   pushData(data) {
-    this.push(data);
+    if (this.destroyed) return false;
+    if (!this._inboundBlocked && this._inboundQueue.length === 0) {
+      this._inboundBlocked = this.push(data) === false;
+      return !this._inboundBlocked;
+    }
+    const copy = Buffer.from(data);
+    this._inboundQueue.push(copy);
+    this._inboundBytes += copy.length;
+    if (this._inboundBytes > MAX_NATIVE_QUEUE_BYTES) {
+      this.destroy(new Error('Diode publish TLS queue limit exceeded'));
+      return false;
+    }
+    return false;
+  }
+
+  _destroy(error, callback) {
+    this._inboundQueue.length = 0;
+    this._inboundBytes = 0;
+    callback(error);
   }
 }
 
@@ -85,11 +224,18 @@ class PublishPort extends EventEmitter {
   constructor(connection, publishedPorts, _certPath = null) {
     super();
     this.connection = connection;
-    this._rpcByConnection = new Map();
+    this._rpcByConnection = new WeakMap();
+    this._trackedConnectionInfos = new Map();
     this.rpc = this._isManager() ? null : this._getRpcFor(connection);
     this._listening = false; // ensure startListening is idempotent
     this.nativeSessions = new Map();
-    this.handshakeTimeoutMs = parseInt(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10) || 10000;
+    this._connectionIds = new WeakMap();
+    this._nextConnectionId = 1;
+    this.handshakeTimeoutMs = normalizeTimerMs(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10000);
+    this.backendConnectTimeoutMs = normalizeTimerMs(process.env.DIODE_BACKEND_CONNECT_TIMEOUT_MS, 5000);
+    this.ioTimeoutMs = normalizeTimerMs(process.env.DIODE_PORT_IO_TIMEOUT_MS, 10000);
+    this.nativeQueueLimitBytes = parseInt(process.env.DIODE_NATIVE_QUEUE_LIMIT_BYTES, 10) || MAX_NATIVE_QUEUE_BYTES;
+    this._closed = false;
     
     // Convert publishedPorts to a Map with configurations
     this.publishedPorts = new Map();
@@ -100,6 +246,7 @@ class PublishPort extends EventEmitter {
     }
     
     this.startListening();
+    this._setupConnectionLifecycle();
     if (this.publishedPorts.size > 0) {
       logger.info(() => `Publishing ports: ${Array.from(this.publishedPorts.keys())}`);
     } else {
@@ -109,7 +256,7 @@ class PublishPort extends EventEmitter {
 
   // Add a single port with configuration
   addPort(port, config = { mode: 'public', whitelist: [] }) {
-    const portNum = parseInt(port, 10);
+    const portNum = normalizePublishedPort(port);
     
     // Normalize the configuration
     const portConfig = normalizePublishedPortConfig(config);
@@ -123,35 +270,14 @@ class PublishPort extends EventEmitter {
   
   // Remove a published port
   removePort(port) {
-    const portNum = parseInt(port, 10);
+    const portNum = normalizePublishedPort(port);
     
     if (!this.publishedPorts.has(portNum)) {
       logger.warn(() => `Port ${portNum} is not published`);
       return false;
     }
     
-    // Close any active connections for this port
-    // This could require tracking active connections by port
-    // For now, let's log about active connections
-    let activeConnections = [];
-    if (this.connection && typeof this.connection.getConnections === 'function') {
-      for (const conn of this.connection.getConnections()) {
-        if (conn && conn.connections) {
-          activeConnections = activeConnections.concat(
-            Array.from(conn.connections.values()).filter(info => info.port === portNum)
-          );
-        }
-      }
-    } else if (this.connection && this.connection.connections) {
-      activeConnections = Array.from(this.connection.connections.values())
-        .filter(conn => conn.port === portNum);
-    }
-      
-    if (activeConnections.length > 0) {
-      logger.warn(() => `Removing port ${portNum} with ${activeConnections.length} active connections`);
-      // We could close these connections, but they'll be rejected naturally on next data transfer
-    }
-    
+    this._cleanupConnections(null, { port: portNum, notifyRemote: true });
     this.publishedPorts.delete(portNum);
     logger.info(() => `Removed published port ${portNum}`);
     
@@ -183,6 +309,7 @@ class PublishPort extends EventEmitter {
   // Clear all published ports
   clearPorts() {
     const portCount = this.publishedPorts.size;
+    this._cleanupConnections(null, { notifyRemote: true });
     this.publishedPorts.clear();
     logger.info(() => `Cleared ${portCount} published ports`);
     return portCount;
@@ -206,34 +333,188 @@ class PublishPort extends EventEmitter {
     return this.publishedPorts.get(port);
   }
 
+  _connectionKey(connection) {
+    if (!connection) return 'unknown';
+    if (connection._managerHostKey) return connection._managerHostKey;
+    try {
+      const serverId = connection.getServerEthereumAddress(true);
+      if (serverId) return Buffer.isBuffer(serverId) ? serverId.toString('hex') : String(serverId).toLowerCase();
+    } catch (_) {}
+    return `${connection.host || 'unknown'}:${connection.port || ''}`;
+  }
+
+  _nativeSessionKey(connection, physicalPort) {
+    if (connection && !this._connectionIds.has(connection)) {
+      this._connectionIds.set(connection, this._nextConnectionId++);
+    }
+    const connectionId = connection ? this._connectionIds.get(connection) : 'unknown';
+    return `${connectionId}:${this._connectionKey(connection)}:${Number(physicalPort)}`;
+  }
+
+  _getNativeSession(connection, physicalPort) {
+    return this.nativeSessions.get(this._nativeSessionKey(connection, physicalPort));
+  }
+
+  _setupConnectionLifecycle() {
+    if (!this.connection || typeof this.connection.on !== 'function') return;
+    this._onDisconnect = (payload) => {
+      const disconnected = payload && payload.connection
+        ? payload.connection
+        : (payload && payload.socket ? payload : (this._isManager() ? null : this.connection));
+      this._cleanupConnections(disconnected, { notifyRemote: false });
+    };
+    this._onEnd = () => this._onDisconnect(this._isManager() ? null : this.connection);
+    this.connection.on('disconnect', this._onDisconnect);
+    this.connection.on('end', this._onEnd);
+  }
+
+  _connectionList(connection = null) {
+    if (connection) return [connection];
+    if (this._isManager()) return this.connection.getConnections();
+    return this.connection ? [this.connection] : [];
+  }
+
+  _cleanupConnectionInfo(connection, ref, info, { notifyRemote = true } = {}) {
+    if (!info) return;
+    this._trackedConnectionInfos.delete(info);
+    if (info._cleaned) return;
+    info._cleaned = true;
+    const rpc = this._getRpcFor(connection);
+    const sockets = new Set([
+      info.diodeSocket,
+      info.tlsSocket,
+      info.socket,
+      info.localSocket,
+    ].filter(Boolean));
+    for (const socket of sockets) destroySocket(socket);
+    let currentInfo;
+    let canInspectCurrent = false;
+    try {
+      if (connection && typeof connection.getConnection === 'function') {
+        canInspectCurrent = true;
+        currentInfo = connection.getConnection(ref);
+      }
+    } catch (_) {}
+    const refWasReused = canInspectCurrent && currentInfo && currentInfo !== info;
+    if (!canInspectCurrent || currentInfo === info) {
+      try { connection.deleteConnection(ref); } catch (_) {}
+    }
+    if (notifyRemote && !refWasReused && rpc && ref && !info._remoteCloseStarted) {
+      info._remoteCloseStarted = true;
+      void Promise.resolve(rpc.portClose(ref, { timeoutMs: this.backendConnectTimeoutMs })).catch(() => {});
+    }
+  }
+
+  _replaceConnectionInfo(connection, ref, info) {
+    let existing;
+    try { existing = connection.getConnection(ref); } catch (_) {}
+    if (existing && existing !== info) {
+      this._cleanupConnectionInfo(connection, ref, existing, { notifyRemote: false });
+    }
+    connection.addConnection(ref, info);
+  }
+
+  _writeBackend(connection, ref, info, data) {
+    const socket = info && (info.socket || info.localSocket);
+    if (!socket || socket.destroyed) return;
+    if (!info._inboundState) {
+      info._inboundState = { blocked: false, draining: false, queued: [], bytes: 0 };
+    }
+    const state = info._inboundState;
+    const scheduleDrain = () => {
+      if (!state.blocked || state.draining || typeof socket.once !== 'function') return;
+      state.draining = true;
+      socket.once('drain', () => {
+        state.draining = false;
+        state.blocked = false;
+        while (!state.blocked && state.queued.length > 0 && !socket.destroyed) {
+          const chunk = state.queued.shift();
+          state.bytes -= chunk.length;
+          state.blocked = socket.write(chunk) === false;
+        }
+        scheduleDrain();
+      });
+    };
+    if (state.blocked) {
+      const copy = Buffer.from(data);
+      state.queued.push(copy);
+      state.bytes += copy.length;
+      if (state.bytes > MAX_NATIVE_QUEUE_BYTES) {
+        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: true });
+        return;
+      }
+      scheduleDrain();
+      return;
+    }
+    state.blocked = socket.write(data) === false;
+    scheduleDrain();
+  }
+
+  _cleanupConnections(connection = null, { port = null, notifyRemote = true } = {}) {
+    for (const [info, tracked] of Array.from(this._trackedConnectionInfos.entries())) {
+      if (connection && tracked.connection !== connection) continue;
+      if (port !== null && info.port !== port) continue;
+      this._cleanupConnectionInfo(tracked.connection, tracked.ref, info, { notifyRemote });
+    }
+    for (const conn of this._connectionList(connection)) {
+      if (!conn || !conn.connections) continue;
+      for (const [refHex, info] of Array.from(conn.connections.entries())) {
+        if (port !== null && info.port !== port) continue;
+        this._cleanupConnectionInfo(conn, Buffer.from(refHex, 'hex'), info, { notifyRemote });
+      }
+    }
+    for (const session of Array.from(this.nativeSessions.values())) {
+      if (connection && session.connection !== connection) continue;
+      if (port !== null && session.port !== port) continue;
+      this._cleanupNativeSession(session);
+    }
+  }
+
+  close() {
+    if (this._closed) return;
+    this._closed = true;
+    this.stopListening();
+    if (this.connection && typeof this.connection.off === 'function') {
+      if (this._onDisconnect) this.connection.off('disconnect', this._onDisconnect);
+      if (this._onEnd) this.connection.off('end', this._onEnd);
+    }
+    this._cleanupConnections(null, { notifyRemote: true });
+  }
+
   startListening() {
+    if (this._closed) return this;
     if (this._listening) return this; // idempotent
     // Listen for unsolicited messages from the connection
     this._onUnsolicited = (message, sourceConnection) => {
-      const connection = sourceConnection || this.connection;
-      if (!connection) {
-        logger.warn(() => 'Received unsolicited message without a valid connection context');
-        return;
-      }
-      const [sessionIdRaw, messageContent] = message;
-      const messageTypeRaw = messageContent[0];
-      const messageType = toBufferView(messageTypeRaw).toString('utf8');
+      try {
+        const connection = sourceConnection || this.connection;
+        if (!connection) {
+          logger.warn(() => 'Received unsolicited message without a valid connection context');
+          return;
+        }
+        const validated = validatePublisherUnsolicited(message);
+        if (validated.error) {
+          logger.warn(() => `Ignoring malformed unsolicited publisher frame: ${validated.error}`);
+          return;
+        }
+        const { sessionIdRaw, messageContent, messageType } = validated;
 
-      if (messageType === 'portopen') {
-        this.handlePortOpen(sessionIdRaw, messageContent, connection);
-      } else if (messageType === 'portopen2') {
-        this.handlePortOpen2(sessionIdRaw, messageContent, connection);
-      } else if (messageType === 'portclose2') {
-        logger.debug(() => 'Received portclose2');
-      } else if (messageType === 'portsend' || messageType === 'data') {
-        // Accept both synonyms for payload delivery
-        this.handlePortSend(sessionIdRaw, messageContent, connection);
-      } else if (messageType === 'portclose') {
-        this.handlePortClose(sessionIdRaw, messageContent, connection);
-      } else {
-        if (messageType !== 'ticket_request' && messageType !== 'response') {
+        if (messageType === 'portopen') {
+          this.handlePortOpen(sessionIdRaw, messageContent, connection);
+        } else if (messageType === 'portopen2') {
+          this.handlePortOpen2(sessionIdRaw, messageContent, connection);
+        } else if (messageType === 'portclose2') {
+          this.handlePortClose2(sessionIdRaw, messageContent, connection);
+        } else if (messageType === 'portsend' || messageType === 'data') {
+          // Accept both synonyms for payload delivery
+          this.handlePortSend(sessionIdRaw, messageContent, connection);
+        } else if (messageType === 'portclose') {
+          this.handlePortClose(sessionIdRaw, messageContent, connection);
+        } else if (messageType !== 'ticket_request' && messageType !== 'response') {
           logger.warn(() => `Unknown unsolicited message type: ${messageType}`);
         }
+      } catch (error) {
+        logger.error(() => `Publisher unsolicited dispatcher failed: ${error}`);
       }
     };
     this.connection.on('unsolicited', this._onUnsolicited);
@@ -251,6 +532,7 @@ class PublishPort extends EventEmitter {
   }
 
   handlePortOpen(sessionIdRaw, messageContent, connection) {
+    if (this._closed) return;
     const rpc = this._getRpcFor(connection);
     // messageContent: ['portopen', portString, ref, deviceId]
     const portStringRaw = messageContent[1];
@@ -280,11 +562,16 @@ class PublishPort extends EventEmitter {
       port = parseInt(portStr, 10);
     }
 
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Invalid port')).catch(() => {});
+      return;
+    }
+
     // Check if the port is published
     if (!this.publishedPorts.has(port)) {
       logger.warn(() => `Port ${port} is not published. Rejecting request.`);
       // Send error response
-      rpc.sendError(sessionId, ref, 'Port is not published');
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Port is not published')).catch(() => {});
       return;
     }
 
@@ -293,7 +580,7 @@ class PublishPort extends EventEmitter {
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
-        rpc.sendError(sessionId, ref, 'Device not whitelisted');
+        void Promise.resolve(rpc.sendError(sessionId, ref, 'Device not whitelisted')).catch(() => {});
         return;
       }
       logger.info(() => `Device ${deviceId} is whitelisted for port ${port}. Accepting request.`);
@@ -312,20 +599,23 @@ class PublishPort extends EventEmitter {
       this.handleUDPConnection(sessionId, ref, port, deviceId, portConfig, connection);
     } else {
       logger.warn(() => `Unsupported protocol: ${protocol}`);
-      rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`);
+      void Promise.resolve(rpc.sendError(sessionId, ref, `Unsupported protocol: ${protocol}`)).catch(() => {});
     }
   }
 
   handleTLSHandshake(sessionId, ref, port, deviceId, connection) {
     const rpc = this._getRpcFor(connection);
-    rpc.sendResponse(sessionId, ref, 'ok');
-
-    const diodeSocket = new DiodeSocket(ref, rpc);
+    if (this._closed) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Publisher is shutting down')).catch(() => {});
+      return;
+    }
     const certPem = connection.getDeviceCertificate();
     if (!certPem) {
       logger.error(() => 'No device certificate available for TLS handshake');
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'No device certificate available')).catch(() => {});
       return;
     }
+    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
 
     const tlsOptions = {
       cert: certPem,
@@ -337,26 +627,52 @@ class PublishPort extends EventEmitter {
       maxVersion: 'TLSv1.2',
     };
 
-    const tlsSocket = new tls.TLSSocket(diodeSocket, {
-      isServer: true,
-      ...tlsOptions,
-    });
+    let tlsSocket;
+    try {
+      tlsSocket = new tls.TLSSocket(diodeSocket, {
+        isServer: true,
+        ...tlsOptions,
+      });
+    } catch (error) {
+      destroySocket(diodeSocket);
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'TLS setup failed')).catch(() => {});
+      return;
+    }
     tlsSocket.setNoDelay(true);
 
-    connection.addConnection(ref, {
+    const connectionInfo = {
       diodeSocket,
       tlsSocket,
       protocol: 'tls',
       port,
       deviceId,
       handshake: true,
+    };
+    this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
+    if (this._closed) {
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+      return;
+    }
+    this._replaceConnectionInfo(connection, ref, connectionInfo);
+    if (this._closed || connectionInfo._cleaned) {
+      destroySocket(tlsSocket);
+      destroySocket(diodeSocket);
+      try {
+        if (typeof connection.getConnection !== 'function' || connection.getConnection(ref) === connectionInfo) {
+          connection.deleteConnection(ref);
+        }
+      } catch (_) {}
+      return;
+    }
+    tlsSocket.on('error', (error) => {
+      logger.error(() => `Native handshake TLS socket error: ${error}`);
     });
 
-    (async () => {
+    const handshakePromise = (async () => {
       let session = null;
       try {
         const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
-        session = this.nativeSessions.get(Number(peerMessage.physicalPort));
+        session = this._getNativeSession(connection, Number(peerMessage.physicalPort));
         if (!session) {
           throw new Error(`No native session for physical port ${peerMessage.physicalPort}`);
         }
@@ -378,7 +694,9 @@ class PublishPort extends EventEmitter {
           privateKey: connection.getPrivateKey()
         });
 
-        nativeCrypto.writeHandshakeMessage(tlsSocket, message);
+        // The handshake ref is closed in finally. Wait until TLS has accepted
+        // and drained the response frame so cleanup cannot truncate it.
+        await nativeCrypto.writeHandshakeMessage(tlsSocket, message);
 
         session.session = nativeCrypto.deriveSessionKeys({
           role: 'publish',
@@ -409,16 +727,23 @@ class PublishPort extends EventEmitter {
         logger.error(() => `TLS handshake failed: ${error}`);
         if (session) {
           session.error = error;
+          this._cleanupNativeSession(session);
         }
       } finally {
-        try { tlsSocket.end(); } catch {}
-        try { rpc.portClose(ref); } catch {}
-        try { connection.deleteConnection(ref); } catch {}
+        this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
       }
     })();
+    // Acknowledge only after the ref and handshake data listeners are ready,
+    // so an immediate first portsend cannot be lost.
+    void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
+      logger.error(() => `Failed to acknowledge native TLS handshake: ${error}`);
+      void handshakePromise.catch(() => {});
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+    });
   }
 
   handlePortOpen2(sessionIdRaw, messageContent, connection) {
+    if (this._closed) return;
     const rpc = this._getRpcFor(connection);
     // messageContent: ['portopen2', portName, physicalPort, sourceDeviceAddress, flags]
     const portNameRaw = messageContent[1];
@@ -450,9 +775,9 @@ class PublishPort extends EventEmitter {
       }
     }
 
-    if (!Number.isFinite(port) || port <= 0) {
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) {
       logger.warn(() => `Invalid port in portopen2: ${portName}`);
-      rpc.sendError(sessionId, physicalPortRef, 'Invalid port');
+      void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Invalid port')).catch(() => {});
       return;
     }
 
@@ -465,7 +790,7 @@ class PublishPort extends EventEmitter {
     // Check if the port is published
     if (!this.publishedPorts.has(port)) {
       logger.warn(() => `Port ${port} is not published. Rejecting request.`);
-      rpc.sendError(sessionId, physicalPortRef, 'Port is not published');
+      void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Port is not published')).catch(() => {});
       return;
     }
 
@@ -474,19 +799,20 @@ class PublishPort extends EventEmitter {
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
-        rpc.sendError(sessionId, physicalPortRef, 'Device not whitelisted');
+        void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Device not whitelisted')).catch(() => {});
         return;
       }
       logger.info(() => `Device ${deviceId} is whitelisted for port ${port}. Accepting request.`);
     }
 
-    if (!physicalPort) {
+    if (!physicalPort || physicalPort > 65535) {
       logger.warn(() => `Invalid physical port in portopen2: ${physicalPortRaw}`);
-      rpc.sendError(sessionId, physicalPortRef, 'Invalid physical port');
+      void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Invalid physical port')).catch(() => {});
       return;
     }
 
-    const existing = this.nativeSessions.get(physicalPort);
+    const sessionKey = this._nativeSessionKey(connection, physicalPort);
+    const existing = this.nativeSessions.get(sessionKey);
     if (existing) {
       this._cleanupNativeSession(existing);
     }
@@ -498,21 +824,29 @@ class PublishPort extends EventEmitter {
       protocol,
       deviceId: deviceId.toLowerCase(),
       connection,
+      sessionKey,
       ready: false,
       session: null,
       relaySocket: null,
       localSocket: null,
       timer: null,
       pendingRelayChunks: [],
+      nativeLease: true,
     };
+    connection._diodeActiveNativeSessions = Number(connection._diodeActiveNativeSessions || 0) + 1;
+    const sessionTimeoutMs = normalizeTimerMs(
+      Math.max(15000, this.handshakeTimeoutMs * 2),
+      20000
+    );
     session.timer = setTimeout(() => {
       if (!session.ready) {
         logger.warn(() => `Handshake timeout for native session on physical port ${physicalPort}`);
         this._cleanupNativeSession(session);
       }
-    }, Math.max(15000, this.handshakeTimeoutMs * 2));
+    }, sessionTimeoutMs);
+    if (typeof session.timer.unref === 'function') session.timer.unref();
 
-    this.nativeSessions.set(physicalPort, session);
+    this.nativeSessions.set(sessionKey, session);
 
     if (protocol === 'udp') {
       this.handleNativeUDPRelay(sessionId, physicalPortRef, session, connection);
@@ -523,9 +857,20 @@ class PublishPort extends EventEmitter {
 
   _cleanupNativeSession(session) {
     if (!session) return;
+    if (session.nativeLease && session.connection) {
+      session.connection._diodeActiveNativeSessions = Math.max(
+        0,
+        Number(session.connection._diodeActiveNativeSessions || 0) - 1
+      );
+      session.nativeLease = false;
+    }
     if (session.timer) {
       clearTimeout(session.timer);
       session.timer = null;
+    }
+    if (session.connectTimer) {
+      clearTimeout(session.connectTimer);
+      session.connectTimer = null;
     }
     if (session.relaySocket) {
       try {
@@ -545,7 +890,27 @@ class PublishPort extends EventEmitter {
         }
       } catch (_) {}
     }
-    this.nativeSessions.delete(session.physicalPort);
+    const sessionKey = session.sessionKey || this._nativeSessionKey(session.connection, session.physicalPort);
+    if (this.nativeSessions.get(sessionKey) === session) {
+      this.nativeSessions.delete(sessionKey);
+    }
+  }
+
+  handlePortClose2(sessionIdRaw, messageContent, connection) {
+    const rpc = this._getRpcFor(connection);
+    const physicalPort = parseUInt(messageContent[1]);
+    if (!Number.isFinite(physicalPort)) {
+      logger.warn(() => 'Received portclose2 with invalid physical port');
+      return;
+    }
+    const session = this._getNativeSession(connection, physicalPort);
+    if (session) {
+      logger.debug(() => `Closing native session ${session.sessionKey}`);
+      this._cleanupNativeSession(session);
+    }
+    void Promise.resolve(
+      rpc.sendResponse(toBufferView(sessionIdRaw), Number(physicalPort), 'ok')
+    ).catch(() => {});
   }
 
   _consumeNativeTCPRelayData(session, data) {
@@ -555,7 +920,16 @@ class PublishPort extends EventEmitter {
     try {
       const messages = nativeCrypto.consumeTcpFrames(session.session, data);
       for (const msg of messages) {
-        session.localSocket.write(msg);
+        if (session.localSocket.write(msg) === false && session.relaySocket) {
+          if (typeof session.relaySocket.pause === 'function') session.relaySocket.pause();
+          if (typeof session.localSocket.once === 'function') {
+            session.localSocket.once('drain', () => {
+              if (session.relaySocket && typeof session.relaySocket.resume === 'function') {
+                session.relaySocket.resume();
+              }
+            });
+          }
+        }
       }
       return true;
     } catch (error) {
@@ -569,6 +943,7 @@ class PublishPort extends EventEmitter {
       return;
     }
     const pending = session.pendingRelayChunks.splice(0, session.pendingRelayChunks.length);
+    session.pendingRelayBytes = 0;
     for (const chunk of pending) {
       if (!this._consumeNativeTCPRelayData(session, chunk)) {
         this._cleanupNativeSession(session);
@@ -584,12 +959,15 @@ class PublishPort extends EventEmitter {
     const sendOk = () => {
       if (responded) return;
       responded = true;
-      rpc.sendResponse(sessionId, physicalPortRef, 'ok');
+      void Promise.resolve(rpc.sendResponse(sessionId, physicalPortRef, 'ok')).catch((error) => {
+        logger.error(() => `Failed to acknowledge native TCP portopen: ${error}`);
+        this._cleanupNativeSession(session);
+      });
     };
     const sendError = (reason) => {
       if (responded) return;
       responded = true;
-      rpc.sendError(sessionId, physicalPortRef, reason);
+      void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, reason)).catch(() => {});
     };
 
     const relayHost = connection.getServerRelayHost();
@@ -608,9 +986,18 @@ class PublishPort extends EventEmitter {
     let localReady = false;
     const maybeReady = () => {
       if (relayReady && localReady) {
+        if (session.connectTimer) {
+          clearTimeout(session.connectTimer);
+          session.connectTimer = null;
+        }
         sendOk();
       }
     };
+    session.connectTimer = setTimeout(() => {
+      sendError('Native relay connection timed out');
+      cleanup();
+    }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
+    if (typeof session.connectTimer.unref === 'function') session.connectTimer.unref();
 
     relaySocket.on('connect', () => {
       relayReady = true;
@@ -640,10 +1027,19 @@ class PublishPort extends EventEmitter {
 
     relaySocket.on('end', cleanup);
     localSocket.on('end', cleanup);
+    relaySocket.on('close', cleanup);
+    localSocket.on('close', cleanup);
 
     relaySocket.on('data', (data) => {
       if (!session.ready || !session.session) {
-        session.pendingRelayChunks.push(Buffer.from(data));
+        const copy = Buffer.from(data);
+        session.pendingRelayBytes = (session.pendingRelayBytes || 0) + copy.length;
+        if (session.pendingRelayBytes > this.nativeQueueLimitBytes) {
+          logger.error(() => `Native TCP pending queue exceeded for ${deviceId}`);
+          cleanup();
+          return;
+        }
+        session.pendingRelayChunks.push(copy);
         return;
       }
       if (!this._consumeNativeTCPRelayData(session, data)) {
@@ -655,7 +1051,12 @@ class PublishPort extends EventEmitter {
       if (!session.ready || !session.session) return;
       try {
         const frame = nativeCrypto.createTcpFrame(session.session, data);
-        relaySocket.write(frame);
+        if (relaySocket.write(frame) === false) {
+          localSocket.pause();
+          relaySocket.once('drain', () => {
+            if (!localSocket.destroyed) localSocket.resume();
+          });
+        }
       } catch (error) {
         logger.error(() => `TCP encrypt error (${deviceId}): ${error}`);
         cleanup();
@@ -670,12 +1071,15 @@ class PublishPort extends EventEmitter {
     const sendOk = () => {
       if (responded) return;
       responded = true;
-      rpc.sendResponse(sessionId, physicalPortRef, 'ok');
+      void Promise.resolve(rpc.sendResponse(sessionId, physicalPortRef, 'ok')).catch((error) => {
+        logger.error(() => `Failed to acknowledge native UDP portopen: ${error}`);
+        this._cleanupNativeSession(session);
+      });
     };
     const sendError = (reason) => {
       if (responded) return;
       responded = true;
-      rpc.sendError(sessionId, physicalPortRef, reason);
+      void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, reason)).catch(() => {});
     };
 
     const relaySocket = dgram.createSocket('udp4');
@@ -685,20 +1089,39 @@ class PublishPort extends EventEmitter {
     let localReady = false;
     const maybeReady = () => {
       if (relayReady && localReady) {
+        if (session.connectTimer) {
+          clearTimeout(session.connectTimer);
+          session.connectTimer = null;
+        }
         sendOk();
       }
     };
+    session.connectTimer = setTimeout(() => {
+      sendError('Native UDP connection timed out');
+      this._cleanupNativeSession(session);
+    }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
+    if (typeof session.connectTimer.unref === 'function') session.connectTimer.unref();
 
     relaySocket.on('message', (msg) => {
       if (!session.ready || !session.session) return;
-      const plaintext = nativeCrypto.parseUdpPacket(session.session, msg);
-      if (!plaintext) return;
-      localSocket.send(plaintext);
+      try {
+        const plaintext = nativeCrypto.parseUdpPacket(session.session, msg);
+        if (!plaintext) return;
+        localSocket.send(plaintext);
+      } catch (error) {
+        logger.error(() => `Native UDP decode failed (${deviceId}): ${error}`);
+        this._cleanupNativeSession(session);
+      }
     });
     localSocket.on('message', (msg) => {
       if (!session.ready || !session.session) return;
-      const packet = nativeCrypto.createUdpPacket(session.session, msg);
-      relaySocket.send(packet);
+      try {
+        const packet = nativeCrypto.createUdpPacket(session.session, msg);
+        relaySocket.send(packet);
+      } catch (error) {
+        logger.error(() => `Native UDP encode failed (${deviceId}): ${error}`);
+        this._cleanupNativeSession(session);
+      }
     });
 
     relaySocket.on('error', (err) => {
@@ -715,7 +1138,11 @@ class PublishPort extends EventEmitter {
       try { localSocket.close(); } catch {}
       this._cleanupNativeSession(session);
     });
+    relaySocket.on('close', () => this._cleanupNativeSession(session));
+    localSocket.on('close', () => this._cleanupNativeSession(session));
 
+    session.relaySocket = relaySocket;
+    session.localSocket = localSocket;
     const relayHost = connection.getServerRelayHost();
     relaySocket.connect(physicalPort, relayHost, () => {
       relayReady = true;
@@ -726,18 +1153,16 @@ class PublishPort extends EventEmitter {
       maybeReady();
     });
 
-    session.relaySocket = relaySocket;
-    session.localSocket = localSocket;
   }
 
-  setupLocalSocketHandlers(localSocket, ref, protocol, rpc, connection) {
+  setupLocalSocketHandlers(localSocket, ref, protocol, rpc, connection, opening = null, connectionInfo = null) {
     if (protocol === 'udp') {
       
     } else {
       localSocket.on('data', (data) => {
         // When data is received from the local service, send it back via Diode
         localSocket.pause();
-        rpc.portSend(ref, data)
+        rpc.portSend(ref, data, { timeoutMs: this.ioTimeoutMs })
           .then(() => {
             if (!localSocket.destroyed) {
               localSocket.resume();
@@ -751,43 +1176,101 @@ class PublishPort extends EventEmitter {
 
       localSocket.on('end', () => {
         logger.info(() => `Local service disconnected`);
-        // Send portclose message to Diode
-        rpc.portClose(ref);
-        connection.deleteConnection(ref);
+        const info = connectionInfo || connection.getConnection(ref);
+        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: true });
       });
 
       localSocket.on('error', (err) => {
         logger.error(() => `Error with local service: ${err}`);
-        // Send portclose message to Diode
-        rpc.portClose(ref);
-        connection.deleteConnection(ref);
+        const failedDuringOpen = !!(opening && !opening.responded);
+        if (failedDuringOpen) {
+          opening.responded = true;
+          void Promise.resolve(rpc.sendError(opening.sessionId, ref, 'Local service connection failed')).catch(() => {});
+        }
+        const info = connectionInfo || connection.getConnection(ref);
+        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: !failedDuringOpen });
       });
     }
   }
 
   handleTCPConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
+    if (this._closed) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Publisher is shutting down')).catch(() => {});
+      return;
+    }
+    const opening = { responded: false, sessionId };
+    let connectTimer = null;
     // Create a TCP connection to the local service on the specified port
-    const localSocket = net.connect({ port, host: portConfig.host }, () => {
-      localSocket.setNoDelay(true);
-      logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
-      // Send success response
-      rpc.sendResponse(sessionId, ref, 'ok');
-    });
+    let localSocket;
+    let connectionInfo = null;
+    try {
+      localSocket = net.connect({ port, host: portConfig.host }, () => {
+        if (this._closed || !connectionInfo || connectionInfo._cleaned || localSocket.destroyed) {
+          destroySocket(localSocket);
+          return;
+        }
+        clearTimeout(connectTimer);
+        localSocket.setNoDelay(true);
+        logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
+        if (!opening.responded) {
+          opening.responded = true;
+          void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
+            logger.error(() => `Failed to acknowledge TCP portopen: ${error}`);
+            this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+          });
+        }
+      });
+    } catch (error) {
+      logger.error(() => `Could not create local TCP backend socket: ${error}`);
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
+      return;
+    }
+
+    connectionInfo = { socket: localSocket, protocol: 'tcp', port, host: portConfig.host, deviceId };
+    this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
+    if (this._closed) {
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+      return;
+    }
 
     // Handle data, end, and error events
-    this.setupLocalSocketHandlers(localSocket, ref, 'tcp', rpc, connection);
+    this.setupLocalSocketHandlers(localSocket, ref, 'tcp', rpc, connection, opening, connectionInfo);
 
     // Store the local socket with the ref using connection's method
-    connection.addConnection(ref, { socket: localSocket, protocol: 'tcp', port, host: portConfig.host, deviceId });
+    this._replaceConnectionInfo(connection, ref, connectionInfo);
+    if (this._closed || connectionInfo._cleaned) {
+      destroySocket(localSocket);
+      try {
+        if (typeof connection.getConnection !== 'function' || connection.getConnection(ref) === connectionInfo) {
+          connection.deleteConnection(ref);
+        }
+      } catch (_) {}
+      return;
+    }
+    connectTimer = setTimeout(() => {
+      if (opening.responded) return;
+      opening.responded = true;
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection timed out')).catch(() => {});
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+    }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
+    if (typeof connectTimer.unref === 'function') connectTimer.unref();
+    localSocket.once('close', () => clearTimeout(connectTimer));
   }
 
   handleTLSConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
-    // Create a DiodeSocket instance
-    const diodeSocket = new DiodeSocket(ref, rpc);
-
+    if (this._closed) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Publisher is shutting down')).catch(() => {});
+      return;
+    }
     const certPem = connection.getDeviceCertificate();
+    if (!certPem) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'No device certificate available')).catch(() => {});
+      return;
+    }
+    // Create a DiodeSocket instance
+    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
 
     // TLS options with your server's certificate and key
     const tlsOptions = {
@@ -801,34 +1284,50 @@ class PublishPort extends EventEmitter {
     };
 
     // Create a TLS socket in server mode using the DiodeSocket
-    const tlsSocket = new tls.TLSSocket(diodeSocket, {
-      isServer: true,
-      ...tlsOptions,
-    });
+    let tlsSocket;
+    try {
+      tlsSocket = new tls.TLSSocket(diodeSocket, {
+        isServer: true,
+        ...tlsOptions,
+      });
+    } catch (error) {
+      logger.error(() => `Could not create publisher TLS socket: ${error}`);
+      destroySocket(diodeSocket);
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'TLS setup failed')).catch(() => {});
+      return;
+    }
     tlsSocket.setNoDelay(true);
+    let responded = false;
+    let connectTimer = null;
     // Connect to the local service (TCP or TLS as needed)
-    const localSocket = net.connect({ port, host: portConfig.host }, () => {
-      logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
-      // Send success response
-      rpc.sendResponse(sessionId, ref, 'ok');
-    });
+    let localSocket;
+    let connectionInfo = null;
+    try {
+      localSocket = net.connect({ port, host: portConfig.host }, () => {
+        if (this._closed || !connectionInfo || connectionInfo._cleaned || localSocket.destroyed) {
+          destroySocket(localSocket);
+          return;
+        }
+        if (connectTimer) clearTimeout(connectTimer);
+        localSocket.setNoDelay(true);
+        logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
+        if (!responded) {
+          responded = true;
+          void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
+            logger.error(() => `Failed to acknowledge TLS portopen: ${error}`);
+            this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+          });
+        }
+      });
+    } catch (error) {
+      logger.error(() => `Could not create local TLS backend socket: ${error}`);
+      destroySocket(tlsSocket);
+      destroySocket(diodeSocket);
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
+      return;
+    }
 
-    // Pipe data between the TLS socket and the local service
-    tlsSocket.pipe(localSocket).pipe(tlsSocket);
-
-    // Handle errors and cleanup
-    tlsSocket.on('error', (err) => {
-      logger.error(() => `TLS Socket error: ${err}`);
-      rpc.portClose(ref);
-      connection.deleteConnection(ref);
-    });
-
-    tlsSocket.on('close', () => {
-      connection.deleteConnection(ref);
-    });
-
-    // Store the connection info using connection's method
-    connection.addConnection(ref, {
+    connectionInfo = {
       diodeSocket,
       tlsSocket,
       localSocket,
@@ -836,13 +1335,74 @@ class PublishPort extends EventEmitter {
       port,
       host: portConfig.host,
       deviceId,
+    };
+    this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
+    if (this._closed) {
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+      return;
+    }
+    this._replaceConnectionInfo(connection, ref, connectionInfo);
+    if (this._closed || connectionInfo._cleaned) {
+      destroySocket(localSocket);
+      destroySocket(tlsSocket);
+      destroySocket(diodeSocket);
+      try {
+        if (typeof connection.getConnection !== 'function' || connection.getConnection(ref) === connectionInfo) {
+          connection.deleteConnection(ref);
+        }
+      } catch (_) {}
+      return;
+    }
+
+    // Pipe data between the TLS socket and the local service
+    tlsSocket.pipe(localSocket).pipe(tlsSocket);
+
+    // Handle errors and cleanup
+    tlsSocket.on('error', (err) => {
+      logger.error(() => `TLS Socket error: ${err}`);
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
     });
+
+    tlsSocket.on('close', () => {
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+    });
+    localSocket.on('error', (err) => {
+      logger.error(() => `Local TLS backend error: ${err}`);
+      const failedDuringOpen = !responded;
+      if (failedDuringOpen) {
+        responded = true;
+        void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
+      }
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: !failedDuringOpen });
+    });
+    localSocket.on('close', () => {
+      if (connectTimer) clearTimeout(connectTimer);
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+    });
+    connectTimer = setTimeout(() => {
+      if (responded) return;
+      responded = true;
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection timed out')).catch(() => {});
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+    }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
+    if (typeof connectTimer.unref === 'function') connectTimer.unref();
   }
 
   handleUDPConnection(sessionId, ref, port, deviceId, portConfig, connection) {
     const rpc = this._getRpcFor(connection);
+    if (this._closed) {
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Publisher is shutting down')).catch(() => {});
+      return;
+    }
     // Create a UDP socket
-    const localSocket = dgram.createSocket('udp4');
+    let localSocket;
+    try {
+      localSocket = dgram.createSocket('udp4');
+    } catch (error) {
+      logger.error(() => `Could not create local UDP backend socket: ${error}`);
+      void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
+      return;
+    }
 
     // Try larger kernel buffers if available
     localSocket.on('listening', () => {
@@ -857,30 +1417,49 @@ class PublishPort extends EventEmitter {
     // Store the remote address and port from the Diode client
     const remoteInfo = { port, address: portConfig.host };
 
-    // Send success response
-    rpc.sendResponse(sessionId, ref, 'ok');
-
     // Store the connection info using connection's method
-    connection.addConnection(ref, {
+    const connectionInfo = {
       socket: localSocket,
       protocol: 'udp',
       remoteInfo,
       port,
       host: portConfig.host,
       deviceId
-    });
+    };
+    this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
+    if (this._closed) {
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+      return;
+    }
+    this._replaceConnectionInfo(connection, ref, connectionInfo);
+    if (this._closed || connectionInfo._cleaned) {
+      destroySocket(localSocket);
+      try {
+        if (typeof connection.getConnection !== 'function' || connection.getConnection(ref) === connectionInfo) {
+          connection.deleteConnection(ref);
+        }
+      } catch (_) {}
+      return;
+    }
 
     logger.info(() => `UDP connection set up for ${portConfig.host}:${port}`);
 
     // Handle messages from the local UDP service
     localSocket.on('message', (msg, rinfo) => {
-      rpc.portSend(ref, msg);
+      void Promise.resolve(rpc.portSend(ref, msg, { timeoutMs: this.ioTimeoutMs })).catch((error) => {
+        logger.error(() => `Error sending UDP data to device: ${error}`);
+        this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+      });
     });
 
     localSocket.on('error', (err) => {
       logger.error(() => `UDP Socket error: ${err}`);
-      rpc.portClose(ref);
-      connection.deleteConnection(ref);
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
+    });
+    // Acknowledge only after routing and error handlers are installed.
+    void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
+      logger.error(() => `Failed to acknowledge UDP portopen: ${error}`);
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
     });
   }
 
@@ -900,8 +1479,7 @@ class PublishPort extends EventEmitter {
 
       if (!this.publishedPorts.has(port)) {
         logger.warn(() => `Port ${port} is not published. Sending portclose.`);
-        rpc.portClose(ref);
-        connection.deleteConnection(ref);
+        this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
         return;
       }
 
@@ -909,8 +1487,7 @@ class PublishPort extends EventEmitter {
       if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
         if (!portConfig.whitelist.includes(deviceId)) {
           logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Sending portclose.`);
-          rpc.portClose(ref);
-          connection.deleteConnection(ref);
+          this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
           return;
         }
       }
@@ -920,7 +1497,8 @@ class PublishPort extends EventEmitter {
         // Since UDP is connectionless, we need to specify the address and port
         localSocket.send(data, remoteInfo.port, remoteInfo.address, (err) => {
           if (err) {
-            console.error(`Error sending UDP data:`, err);
+            logger.error(() => `Error sending UDP data: ${err}`);
+            this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
           }
         });
 
@@ -931,7 +1509,7 @@ class PublishPort extends EventEmitter {
         }
       } else if (protocol === 'tcp') {
         // Write data to the local service
-        localSocket.write(data);
+        this._writeBackend(connection, ref, connectionInfo, data);
       } else if (protocol === 'tls') {
         const { diodeSocket } = connectionInfo;
         // Push data into the DiodeSocket
@@ -943,7 +1521,7 @@ class PublishPort extends EventEmitter {
         logger.debug(() => `No local connection found for ref: ${ref.toString('hex')}, but client socket exists`);
       } else {
         logger.warn(() => `No local connection found for ref ${ref.toString('hex')}. Sending portclose.`);
-        rpc.sendError(sessionId, ref, 'No local connection found');
+        void Promise.resolve(rpc.sendError(sessionId, ref, 'No local connection found')).catch(() => {});
       }
     }
   }
@@ -957,18 +1535,7 @@ class PublishPort extends EventEmitter {
 
     const connectionInfo = connection.getConnection(ref);
     if (connectionInfo) {
-      const { diodeSocket, tlsSocket, socket: localSocket } = connectionInfo;
-      // End all sockets
-      if (diodeSocket) diodeSocket.end();
-      if (tlsSocket) tlsSocket.end();
-      if (localSocket) {
-        if (localSocket.type === 'udp4' || localSocket.type === 'udp6') {
-          localSocket.close();
-        } else {
-          localSocket.end();
-        }
-      }
-      connection.deleteConnection(ref);
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
     }
   }
 }

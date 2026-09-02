@@ -64,6 +64,47 @@ test('ticket too_low response retries once with repaired ticket', async () => {
   assert.equal(retryCount, 1);
 });
 
+test('ticket too_low during initial handshake keeps the transport-ready retry path', async () => {
+  const connection = makeConnection();
+  let syncAllowed = false;
+  let createAllowed = false;
+  let internalRetries = 0;
+
+  connection.fixResponse = () => {};
+  connection._syncMeasuredBytesWithRelay = async (options) => {
+    syncAllowed = options.allowTransportReady === true;
+  };
+  connection.createTicketCommand = async (options) => {
+    createAllowed = options.allowTransportReady === true;
+    return ['ticketv2'];
+  };
+  connection._sendCommandTransportReady = async (command, options) => {
+    internalRetries += 1;
+    assert.deepEqual(command, ['ticketv2']);
+    assert.equal(options.ticketRetryCount, 1);
+    return ['thanks!'];
+  };
+  connection.sendCommand = async () => {
+    throw new Error('public command path would wait for readiness');
+  };
+
+  const resultPromise = new Promise((resolve, reject) => {
+    connection.pendingRequests.set(1, {
+      resolve,
+      reject,
+      commandArray: ['ticketv2'],
+      ticketRetryCount: 0,
+      allowTransportReady: true,
+    });
+  });
+
+  connection._handleData(encodeResponse(1, tooLowResponse()));
+  assert.deepEqual(await resultPromise, ['thanks!']);
+  assert.equal(syncAllowed, true);
+  assert.equal(createAllowed, true);
+  assert.equal(internalRetries, 1);
+});
+
 test('ticket too_low response does not retry recursively', async () => {
   const connection = makeConnection();
   let retryCount = 0;

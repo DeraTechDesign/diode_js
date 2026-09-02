@@ -25,6 +25,7 @@ const RELAY_SCORE_EWMA_WEIGHT = 0.3;
 const RELAY_SCORE_FLUSH_DEBOUNCE_MS = 500;
 const DEFAULT_NETWORK_DISCOVERY_ENDPOINT = 'wss://prenet.diode.io:8443/ws';
 const DEFAULT_NETWORK_DISCOVERY_METHOD = 'dio_network';
+const MAX_NODE_TIMER_MS = 0x7fffffff;
 
 function splitHostPort(input, defaultPort) {
   if (!input || typeof input !== 'string') {
@@ -98,20 +99,31 @@ function normalizeServerIdHex(serverId) {
 }
 
 function isConnected(connection) {
-  return connection && connection.socket && !connection.socket.destroyed;
+  if (!connection || connection._managerReady === false) return false;
+  if (typeof connection.isReady === 'function') {
+    return connection.isReady();
+  }
+  return !!(connection.socket && !connection.socket.destroyed && connection.socket.writable !== false);
 }
 
 function parseBoolean(value, defaultValue) {
   return typeof value === 'boolean' ? value : defaultValue;
 }
 
-function parsePositiveInteger(value, defaultValue, { allowZero = false } = {}) {
+function parsePositiveInteger(
+  value,
+  defaultValue,
+  { allowZero = false, max = MAX_NODE_TIMER_MS } = {}
+) {
   if (!Number.isFinite(value)) {
     return defaultValue;
   }
   const normalized = Math.floor(value);
+  const upperBound = Number.isFinite(max) && max >= 0
+    ? Math.floor(max)
+    : MAX_NODE_TIMER_MS;
   if (allowZero ? normalized >= 0 : normalized > 0) {
-    return normalized;
+    return Math.min(normalized, upperBound);
   }
   return defaultValue;
 }
@@ -177,6 +189,8 @@ class DiodeClientManager extends EventEmitter {
     this._startupCoverageComplete = false;
     this._lastNetworkDiscoveryStats = null;
     this._lastDeviceResolutionTrace = null;
+    this._closed = false;
+    this._lifecycleGeneration = 0;
     this.fleetContract = DEFAULT_FLEET_CONTRACT;
 
     if (options.fleetContract !== undefined) {
@@ -208,6 +222,7 @@ class DiodeClientManager extends EventEmitter {
       startupConcurrency: parsePositiveInteger(relaySelection.startupConcurrency, 2),
       minReadyConnections: parsePositiveInteger(relaySelection.minReadyConnections, 2),
       probeTimeoutMs: parsePositiveInteger(relaySelection.probeTimeoutMs, 1200),
+      deviceLookupTimeoutMs: parsePositiveInteger(relaySelection.deviceLookupTimeoutMs, 3000),
       warmConnectionBudget: parsePositiveInteger(
         relaySelection.warmConnectionBudget,
         Number.isFinite(legacyWarmConnections) ? legacyWarmConnections : 3,
@@ -348,9 +363,18 @@ class DiodeClientManager extends EventEmitter {
           lastProbeLatencyMs: Number.isFinite(record.lastProbeLatencyMs) ? record.lastProbeLatencyMs : null,
           successCount: parsePositiveInteger(record.successCount, 0, { allowZero: true }),
           failureCount: parsePositiveInteger(record.failureCount, 0, { allowZero: true }),
-          lastSuccessAt: parsePositiveInteger(record.lastSuccessAt, 0, { allowZero: true }),
-          lastFailureAt: parsePositiveInteger(record.lastFailureAt, 0, { allowZero: true }),
-          cooldownUntil: parsePositiveInteger(record.cooldownUntil, 0, { allowZero: true }),
+          lastSuccessAt: parsePositiveInteger(record.lastSuccessAt, 0, {
+            allowZero: true,
+            max: Number.MAX_SAFE_INTEGER,
+          }),
+          lastFailureAt: parsePositiveInteger(record.lastFailureAt, 0, {
+            allowZero: true,
+            max: Number.MAX_SAFE_INTEGER,
+          }),
+          cooldownUntil: parsePositiveInteger(record.cooldownUntil, 0, {
+            allowZero: true,
+            max: Number.MAX_SAFE_INTEGER,
+          }),
           discoveredFrom: typeof record.discoveredFrom === 'string' ? record.discoveredFrom : 'seed',
         });
       }
@@ -368,7 +392,7 @@ class DiodeClientManager extends EventEmitter {
   }
 
   _scheduleRelayScoreFlush() {
-    if (!this.scoreCachePath) {
+    if (this._closed || !this.scoreCachePath) {
       return;
     }
     if (this._relayScoreFlushTimer) {
@@ -629,6 +653,7 @@ class DiodeClientManager extends EventEmitter {
     if (typeof provider !== 'function') {
       return [];
     }
+    const controller = new AbortController();
     const context = Object.freeze({
       defaultPort: this.defaultPort,
       keyLocation: this.keyLocation,
@@ -636,15 +661,16 @@ class DiodeClientManager extends EventEmitter {
       explicitHosts: this._hasExplicitHosts,
       initialHosts: this.initialHosts.slice(),
       knownRelayScores: this._getKnownRelayScoreSnapshot(),
+      signal: controller.signal,
     });
 
     const timeoutMs = this.relaySelection.discoveryProviderTimeoutMs;
-    return Promise.race([
-      Promise.resolve().then(() => provider(context)),
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`Discovery provider timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
+    return this._withTimeout(
+      () => provider(context),
+      timeoutMs,
+      'Discovery provider',
+      () => controller.abort()
+    );
   }
 
   _normalizeDiscoveryCandidate(entry, index) {
@@ -800,15 +826,11 @@ class DiodeClientManager extends EventEmitter {
     }
 
     try {
-      const discovered = await Promise.race([
-        Promise.resolve().then(() => this._fetchNetworkDiscoveryNodes()),
-        new Promise((_, reject) => {
-          setTimeout(
-            () => reject(new Error(`Network discovery timed out after ${this.relaySelection.networkDiscovery.timeoutMs}ms`)),
-            this.relaySelection.networkDiscovery.timeoutMs,
-          );
-        }),
-      ]);
+      const discovered = await this._withTimeout(
+        () => this._fetchNetworkDiscoveryNodes(),
+        this.relaySelection.networkDiscovery.timeoutMs,
+        'Network discovery'
+      );
       if (!Array.isArray(discovered)) {
         logger.warn(() => 'Network discovery returned a non-array result. Ignoring discovered nodes.');
         return [];
@@ -1183,28 +1205,53 @@ class DiodeClientManager extends EventEmitter {
       connection.setLocalAddressProvider(() => this._localAddressHintFor(connection));
     }
 
-    connection.on('unsolicited', (message) => {
+    const handlers = {};
+    handlers.unsolicited = (message) => {
       this.emit('unsolicited', message, connection);
-    });
-    connection.on('reconnected', () => {
+    };
+    handlers.reconnected = () => {
+      connection._managerReady = true;
       this._updateServerIdMapping(connection);
       if (this.relaySelection.enabled) {
         this._queueBackgroundProbe(connection, hostKey);
       }
       this.emit('reconnected', connection);
-    });
-    connection.on('reconnecting', (info) => {
+    };
+    handlers.reconnecting = (info) => {
+      connection._managerReady = false;
       this.emit('reconnecting', connection, info);
-    });
-    connection.on('reconnect_failed', () => {
+    };
+    handlers.reconnectFailed = () => {
+      connection._managerReady = false;
       this.emit('reconnect_failed', connection);
-    });
+    };
+    handlers.disconnect = (payload) => {
+      connection._managerReady = false;
+      this.emit('disconnect', payload && payload.connection ? payload : { connection, error: payload || null });
+    };
+    connection.on('unsolicited', handlers.unsolicited);
+    connection.on('reconnected', handlers.reconnected);
+    connection.on('reconnecting', handlers.reconnecting);
+    connection.on('reconnect_failed', handlers.reconnectFailed);
+    connection.on('disconnect', handlers.disconnect);
+    connection._managerEventHandlers = handlers;
   }
 
   _unregisterConnection(connection, hostKey) {
     if (!connection) return;
+    const handlers = connection._managerEventHandlers;
+    if (handlers && typeof connection.off === 'function') {
+      connection.off('unsolicited', handlers.unsolicited);
+      connection.off('reconnected', handlers.reconnected);
+      connection.off('reconnecting', handlers.reconnecting);
+      connection.off('reconnect_failed', handlers.reconnectFailed);
+      connection.off('disconnect', handlers.disconnect);
+      delete connection._managerEventHandlers;
+    }
     if (hostKey) {
-      this.connectionByHost.delete(hostKey);
+      if (this.connectionByHost.get(hostKey) === connection) {
+        this.connectionByHost.delete(hostKey);
+      }
     }
     this.connections = this.connections.filter((item) => item !== connection);
     const removedServerIds = new Set();
@@ -1224,10 +1271,15 @@ class DiodeClientManager extends EventEmitter {
   _closeManagedConnection(connection) {
     if (!connection) return;
     const hostKey = connection._managerHostKey || '';
-    this._unregisterConnection(connection, hostKey);
     try {
       connection.close();
-    } catch (_) {}
+    } catch (_) {
+      // Manager state must still be released when transport teardown throws.
+    } finally {
+      // Keep lifecycle forwarding attached until close() has synchronously
+      // emitted disconnect so BindPort/PublishPort can release relay state.
+      this._unregisterConnection(connection, hostKey);
+    }
   }
 
   _isProtectedHost(hostKey) {
@@ -1237,6 +1289,17 @@ class DiodeClientManager extends EventEmitter {
     const score = this.relayScores.get(hostKey);
     if (score && score.discoveredFrom === 'target') {
       return true;
+    }
+    const connection = this.connectionByHost.get(hostKey);
+    if (connection) {
+      if (typeof connection.hasActiveTunnels === 'function' && connection.hasActiveTunnels()) {
+        return true;
+      }
+      if ((connection.clientSockets && connection.clientSockets.size > 0)
+        || (connection.connections && connection.connections.size > 0)
+        || Number(connection._diodeActiveNativeSessions || 0) > 0) {
+        return true;
+      }
     }
     for (const cached of this.deviceRelayCache.values()) {
       const ttlMs = Number.isFinite(cached.ttlMs) ? cached.ttlMs : this.deviceCacheTtlMs;
@@ -1283,10 +1346,17 @@ class DiodeClientManager extends EventEmitter {
   }
 
   async _ensureConnection(hostEntry) {
+    if (this._closed) {
+      throw new Error('Diode client manager is closed');
+    }
     const hostKey = normalizeHostKey(hostEntry, this.defaultPort);
     const { host, port } = splitHostPort(hostKey, this.defaultPort);
     if (!host) {
       throw new Error(`Invalid host entry: ${hostEntry}`);
+    }
+
+    if (this.pendingConnections.has(hostKey)) {
+      return this.pendingConnections.get(hostKey);
     }
 
     if (this.connectionByHost.has(hostKey)) {
@@ -1295,31 +1365,47 @@ class DiodeClientManager extends EventEmitter {
         return existing;
       }
       if (existing && typeof existing._ensureConnected === 'function') {
+        existing._managerReady = false;
         await existing._ensureConnected();
+        existing._managerReady = typeof existing.isReady === 'function' ? existing.isReady() : true;
       }
+      if (!isConnected(existing)) throw new Error(`Relay ${hostKey} is not ready`);
       return existing;
     }
 
-    if (this.pendingConnections.has(hostKey)) {
-      return this.pendingConnections.get(hostKey);
-    }
-
     const connection = new DiodeConnection(host, port, this.keyLocation);
+    connection._managerReady = false;
     this._registerConnection(connection, hostKey);
+    const generation = this._lifecycleGeneration;
 
     const promise = connection.connect()
       .then(() => {
+        if (this._closed || generation !== this._lifecycleGeneration || this.connectionByHost.get(hostKey) !== connection) {
+          throw new Error('Diode client manager stopped relay connection while connecting');
+        }
+        connection._managerReady = typeof connection.isReady === 'function' ? connection.isReady() : true;
+        if (!isConnected(connection)) {
+          throw new Error(`Relay ${hostKey} did not become ready`);
+        }
         connection._managerConnectedAt = connection._managerConnectedAt || Date.now();
         this._updateServerIdMapping(connection);
         this.emit('connected', connection);
         return connection;
       })
       .catch((error) => {
-        this._unregisterConnection(connection, hostKey);
+        try {
+          connection.close();
+        } catch (_) {
+          // Preserve the original connection error.
+        } finally {
+          this._unregisterConnection(connection, hostKey);
+        }
         throw error;
       })
       .finally(() => {
-        this.pendingConnections.delete(hostKey);
+        if (this.pendingConnections.get(hostKey) === promise) {
+          this.pendingConnections.delete(hostKey);
+        }
       });
 
     this.pendingConnections.set(hostKey, promise);
@@ -1329,19 +1415,18 @@ class DiodeClientManager extends EventEmitter {
   async _probeConnection(connection, hostKey, discoveredFrom, startedAt = Date.now()) {
     const timeoutMs = this.relaySelection.probeTimeoutMs;
     const pingPromise = Promise.resolve()
-      .then(() => this._getRpcFor(connection).ping())
+      .then(() => this._getRpcFor(connection).ping({ timeoutMs }))
       .then((result) => {
         if (!result) {
           throw new Error(`Relay probe failed for ${hostKey}`);
         }
       });
 
-    await Promise.race([
-      pingPromise,
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`Relay probe timed out for ${hostKey}`)), timeoutMs);
-      }),
-    ]);
+    await this._withTimeout(
+      () => pingPromise,
+      timeoutMs,
+      `Relay probe for ${hostKey}`
+    );
 
     const latencyMs = Math.max(1, Date.now() - startedAt);
     this._recordRelayProbeSuccess(hostKey, latencyMs, discoveredFrom);
@@ -1349,6 +1434,9 @@ class DiodeClientManager extends EventEmitter {
   }
 
   async _probeHost(hostEntry, discoveredFrom = 'seed') {
+    if (this._closed) {
+      throw new Error('Diode client manager is closed');
+    }
     const hostKey = normalizeHostKey(hostEntry, this.defaultPort);
     if (!hostKey) {
       throw new Error(`Invalid host entry: ${hostEntry}`);
@@ -1361,22 +1449,20 @@ class DiodeClientManager extends EventEmitter {
     this._lastProbeStartedAt.set(hostKey, startedAt);
     const probePromise = (async () => {
       try {
-        const connection = await Promise.race([
-          this._ensureConnection(hostKey),
-          new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Relay connection timed out for ${hostKey}`)), this.relaySelection.probeTimeoutMs);
-          }),
-        ]);
+        const connection = await this._withTimeout(
+          () => this._ensureConnection(hostKey),
+          this.relaySelection.probeTimeoutMs,
+          `Relay connection for ${hostKey}`,
+          () => {
+            const stalledConnection = this.connectionByHost.get(hostKey);
+            if (stalledConnection) this._closeManagedConnection(stalledConnection);
+            this.pendingConnections.delete(hostKey);
+          }
+        );
         const probedConnection = await this._probeConnection(connection, hostKey, discoveredFrom, startedAt);
         this._pruneIdleConnections();
         return probedConnection;
       } catch (error) {
-        if (String(error && error.message ? error.message : error).includes('Relay connection timed out')) {
-          const stalledConnection = this.connectionByHost.get(hostKey);
-          if (stalledConnection && !isConnected(stalledConnection)) {
-            this._closeManagedConnection(stalledConnection);
-          }
-        }
         this._recordRelayProbeFailure(hostKey, error);
         throw error;
       } finally {
@@ -1389,6 +1475,7 @@ class DiodeClientManager extends EventEmitter {
   }
 
   _recordRelayProbeSuccess(hostKey, latencyMs, discoveredFrom) {
+    if (this._closed) return;
     const now = Date.now();
     const previous = this.relayScores.get(hostKey) || {
       hostKey,
@@ -1422,6 +1509,7 @@ class DiodeClientManager extends EventEmitter {
   }
 
   _recordRelayProbeFailure(hostKey, error) {
+    if (this._closed) return;
     const now = Date.now();
     const previous = this.relayScores.get(hostKey) || {
       hostKey,
@@ -1469,7 +1557,7 @@ class DiodeClientManager extends EventEmitter {
   }
 
   _queueBackgroundProbe(connection, hostKey) {
-    if (!this.relaySelection.enabled || !connection || !hostKey || !isConnected(connection)) {
+    if (this._closed || !this.relaySelection.enabled || !connection || !hostKey || !isConnected(connection)) {
       return;
     }
     if (this.pendingProbes.has(hostKey)) {
@@ -1482,7 +1570,7 @@ class DiodeClientManager extends EventEmitter {
 
     void this._probeHost(hostKey, this.relayScores.get(hostKey)?.discoveredFrom || 'seed')
       .catch((error) => {
-        this._recordRelayProbeFailure(hostKey, error);
+        logger.debug(() => `Background relay probe failed for ${hostKey}: ${error}`);
       });
   }
 
@@ -1547,7 +1635,8 @@ class DiodeClientManager extends EventEmitter {
 
   async _resolveDeviceRelayCandidate(connection, deviceIdBuffer) {
     const rpc = this._getRpcFor(connection);
-    const ticket = await rpc.getObject(deviceIdBuffer);
+    const commandOptions = { timeoutMs: this.relaySelection.deviceLookupTimeoutMs };
+    const ticket = await rpc.getObject(deviceIdBuffer, commandOptions);
     const serverIdHex = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
     if (!serverIdHex) {
       return null;
@@ -1564,7 +1653,7 @@ class DiodeClientManager extends EventEmitter {
     }
 
     const nodeId = Buffer.from(serverIdHex.slice(2), 'hex');
-    const nodeInfo = await rpc.getNode(nodeId);
+    const nodeInfo = await rpc.getNode(nodeId, commandOptions);
     if (!nodeInfo || !nodeInfo.host) {
       return null;
     }
@@ -1620,13 +1709,24 @@ class DiodeClientManager extends EventEmitter {
     return targetLatencyMs >= controlLatencyMs * reconciliation.slowdownFactor;
   }
 
-  async _withTimeout(promiseFactory, timeoutMs, label) {
-    return Promise.race([
-      Promise.resolve().then(() => promiseFactory()),
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
+  async _withTimeout(promiseFactory, timeoutMs, label, onTimeout = null) {
+    const boundedTimeoutMs = parsePositiveInteger(timeoutMs, 1200);
+    let timer = null;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => promiseFactory()),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            if (typeof onTimeout === 'function') {
+              try { onTimeout(); } catch (_) {}
+            }
+            reject(new Error(`${label} timed out after ${boundedTimeoutMs}ms`));
+          }, boundedTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async _reconcileDeviceRelayCandidate(primaryConnection, deviceIdBuffer, initialCandidate, trace = null) {
@@ -1756,6 +1856,9 @@ class DiodeClientManager extends EventEmitter {
   }
 
   async connect() {
+    if (this._closed) {
+      throw new Error('Diode client manager is closed');
+    }
     if (!this.initialHosts || this.initialHosts.length === 0) {
       throw new Error('No Diode hosts configured');
     }
@@ -1873,13 +1976,24 @@ class DiodeClientManager extends EventEmitter {
     this._pruneIdleConnections();
 
     if (backgroundCandidates.length > 0 && this.relaySelection.continueProbingUntestedSeeds) {
-      this._backgroundWarmupPromise = runWithConcurrency(
+      const generation = this._lifecycleGeneration;
+      const warmupPromise = runWithConcurrency(
         backgroundCandidates,
         this.relaySelection.startupConcurrency,
-        (candidate) => this._probeHost(candidate.hostKey, candidate.source)
+        (candidate) => {
+          if (this._closed || generation !== this._lifecycleGeneration) {
+            throw new Error('Diode client manager closed during background warmup');
+          }
+          return this._probeHost(candidate.hostKey, candidate.source);
+        }
       ).catch((error) => {
         logger.debug(() => `Background relay measurement failed: ${error}`);
+      }).finally(() => {
+        if (this._backgroundWarmupPromise === warmupPromise) {
+          this._backgroundWarmupPromise = null;
+        }
       });
+      this._backgroundWarmupPromise = warmupPromise;
     }
 
     return this;
@@ -2022,6 +2136,9 @@ class DiodeClientManager extends EventEmitter {
   }
 
   close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._lifecycleGeneration += 1;
     if (this._relayScoreFlushTimer) {
       clearTimeout(this._relayScoreFlushTimer);
       this._relayScoreFlushTimer = null;
@@ -2030,6 +2147,9 @@ class DiodeClientManager extends EventEmitter {
     for (const connection of this.connections.slice()) {
       this._closeManagedConnection(connection);
     }
+    this.pendingConnections.clear();
+    this.pendingProbes.clear();
+    this.deviceRelayCache.clear();
   }
 }
 

@@ -173,6 +173,22 @@ async function waitFor(predicate, timeoutMs = 1000) {
   assert.equal(predicate(), true);
 }
 
+function malformedUnsolicitedFrames(sessionId, ref) {
+  return [
+    [sessionId, null],
+    [sessionId, 7],
+    [sessionId, []],
+    [sessionId, ['portopen']],
+    [sessionId, ['portopen', '8080', ref]],
+    [sessionId, ['portopen', '8080', 7, Buffer.alloc(20)]],
+    [sessionId, ['portsend']],
+    [sessionId, ['portsend', ref]],
+    [sessionId, ['portsend', ref, 7]],
+    [sessionId, ['portclose']],
+    [sessionId, ['portclose', 7]],
+  ];
+}
+
 test('PublishPort array input defaults host to 127.0.0.1', () => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, [8080]);
@@ -186,12 +202,13 @@ test('PublishPort array input defaults host to 127.0.0.1', () => {
 
 test('PublishPort preserves explicit host in object config', () => {
   const connection = new FakeConnection();
+  const address = `0x${'ab'.repeat(20)}`;
   const publishPort = new PublishPort(connection, {
-    8080: { mode: 'private', whitelist: ['0xabc'], host: ' backend.internal ' },
+    8080: { mode: 'private', whitelist: [address], host: ' backend.internal ' },
   });
 
   assert.deepEqual(publishPort.getPublishedPorts(), {
-    8080: { mode: 'private', whitelist: ['0xabc'], host: 'backend.internal' },
+    8080: { mode: 'private', whitelist: [address], host: 'backend.internal' },
   });
 
   publishPort.stopListening();
@@ -207,6 +224,148 @@ test('PublishPort rejects invalid host values', () => {
   assert.throws(() => {
     new PublishPort(connection, { 8080: { mode: 'public', host: 42 } });
   }, TypeError);
+});
+
+test('PublishPort normalizes private mode and case-insensitive EVM whitelist addresses', () => {
+  const connection = new FakeConnection();
+  const checksummed = '0x52908400098527886E0F7030069857D2E4169EE7';
+  const normalized = checksummed.toLowerCase();
+  const publishPort = new PublishPort(connection, {
+    3001: { mode: ' Private ', whitelist: [checksummed] },
+  });
+  const originalConnect = net.connect;
+  let connectCalled = false;
+  net.connect = () => {
+    connectCalled = true;
+    return new FakeStreamSocket();
+  };
+
+  try {
+    assert.deepEqual(publishPort.getPublishedPorts()[3001], {
+      mode: 'private',
+      whitelist: [normalized],
+      host: '127.0.0.1',
+    });
+    publishPort.handlePortOpen(
+      makeSessionId('20'),
+      ['portopen', '3001', makeRef('20'), Buffer.from(normalized.slice(2), 'hex')],
+      connection
+    );
+    assert.equal(connectCalled, true);
+    assert.equal(connection.sentErrors.length, 0);
+  } finally {
+    net.connect = originalConnect;
+    publishPort.close();
+  }
+});
+
+test('public ports ignore legacy whitelist data that has no authorization semantics', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, {
+    8080: { mode: 'public', whitelist: ['legacy-short-address'] },
+    8081: { mode: 'public', whitelist: 'legacy-non-array' },
+  });
+
+  assert.deepEqual(publishPort.getPublishedPorts(), {
+    8080: { mode: 'public', whitelist: [], host: '127.0.0.1' },
+    8081: { mode: 'public', whitelist: [], host: '127.0.0.1' },
+  });
+  publishPort.close();
+});
+
+test('PublishPort rejects malformed modes, ports, and whitelist addresses', () => {
+  assert.throws(
+    () => new PublishPort(new FakeConnection(), { 8080: { mode: 'privte' } }),
+    /mode must be public or private/
+  );
+
+  for (const port of [0, 65536, 1.5, NaN, '', '8080junk', '1.5']) {
+    assert.throws(
+      () => new PublishPort(new FakeConnection(), [port]),
+      /whole integer/
+    );
+  }
+
+  for (const address of [
+    '52908400098527886E0F7030069857D2E4169EE7',
+    '0x1234',
+    `0x${'gg'.repeat(20)}`,
+    42,
+  ]) {
+    assert.throws(
+      () => new PublishPort(new FakeConnection(), {
+        8080: { mode: 'private', whitelist: [address] },
+      }),
+      /20-byte 0x EVM addresses/
+    );
+  }
+
+  assert.throws(
+    () => new PublishPort(new FakeConnection(), {
+      8080: { mode: 'private', whitelist: 'not-an-array' },
+    }),
+    /whitelist must be an array/
+  );
+});
+
+test('publisher unsolicited dispatcher contains malformed direct and manager relay frames', async (t) => {
+  for (const kind of ['direct', 'manager']) {
+    await t.test(kind, () => {
+      const relay = new FakeConnection();
+      const root = kind === 'direct' ? relay : new EventEmitter();
+      if (kind === 'manager') root.getConnections = () => [relay];
+      const publishPort = new PublishPort(root, [8080]);
+      const frames = malformedUnsolicitedFrames(makeSessionId('21'), makeRef('21'));
+      let applicationListenerCalls = 0;
+      root.on('unsolicited', () => {
+        applicationListenerCalls += 1;
+      });
+
+      try {
+        for (const frame of frames) {
+          assert.doesNotThrow(() => {
+            if (kind === 'direct') root.emit('unsolicited', frame);
+            else root.emit('unsolicited', frame, relay);
+          });
+        }
+        assert.equal(applicationListenerCalls, frames.length);
+        assert.equal(relay.connections.size, 0);
+        assert.equal(publishPort._trackedConnectionInfos.size, 0);
+        assert.equal(publishPort.nativeSessions.size, 0);
+        assert.equal(relay.sentResponses.length, 0);
+        assert.equal(relay.sentErrors.length, 0);
+      } finally {
+        publishPort.close();
+      }
+    });
+  }
+});
+
+test('PublishPort clamps externally configured timers to safe Node.js bounds', () => {
+  const names = [
+    'DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS',
+    'DIODE_BACKEND_CONNECT_TIMEOUT_MS',
+    'DIODE_PORT_IO_TIMEOUT_MS',
+  ];
+  const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+
+  process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS = '999999999999';
+  process.env.DIODE_BACKEND_CONNECT_TIMEOUT_MS = '-1';
+  process.env.DIODE_PORT_IO_TIMEOUT_MS = 'Infinity';
+
+  let publishPort;
+  try {
+    publishPort = new PublishPort(new FakeConnection(), []);
+    assert.equal(publishPort.handshakeTimeoutMs, 0x7fffffff);
+    assert.equal(publishPort.backendConnectTimeoutMs, 5000);
+    assert.equal(publishPort.ioTimeoutMs, 10000);
+  } finally {
+    publishPort?.close();
+    for (const name of names) {
+      if (original[name] === undefined) delete process.env[name];
+      else process.env[name] = original[name];
+    }
+  }
 });
 
 test('TCP publish connects to configured host', () => {
@@ -419,6 +578,97 @@ test('native TCP publish buffers relay data until handshake is ready', () => {
   }
 });
 
+test('native publisher keeps the handshake channel open until its delayed write completes', async () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8448]);
+  const OriginalTlsSocket = tls.TLSSocket;
+  const originals = {
+    readHandshakeMessage: nativeCrypto.readHandshakeMessage,
+    verifyHandshakeMessage: nativeCrypto.verifyHandshakeMessage,
+    createHandshakeMessage: nativeCrypto.createHandshakeMessage,
+    writeHandshakeMessage: nativeCrypto.writeHandshakeMessage,
+    deriveSessionKeys: nativeCrypto.deriveSessionKeys,
+  };
+  const writeGate = deferred();
+  const ref = makeRef('2a');
+  const physicalPort = 41020;
+  const remoteDeviceId = `0x${'11'.repeat(20)}`;
+  const localSocket = new FakeStreamSocket();
+  const relaySocket = new FakeStreamSocket();
+  let tlsSocket;
+  let writeStarted = false;
+
+  const session = {
+    physicalPort,
+    port: 8448,
+    protocol: 'tcp',
+    deviceId: remoteDeviceId,
+    connection,
+    localSocket,
+    relaySocket,
+    ready: false,
+    session: null,
+    timer: null,
+    pendingRelayChunks: [],
+    pendingRelayBytes: 0,
+  };
+  session.sessionKey = publishPort._nativeSessionKey(connection, physicalPort);
+  publishPort.nativeSessions.set(session.sessionKey, session);
+
+  tls.TLSSocket = class extends FakeStreamSocket {
+    constructor() {
+      super();
+      tlsSocket = this;
+    }
+  };
+  nativeCrypto.readHandshakeMessage = async () => ({ physicalPort });
+  nativeCrypto.verifyHandshakeMessage = () => ({
+    ok: true,
+    deviceId: remoteDeviceId,
+    ephPub: Buffer.alloc(33, 2),
+    nonce: Buffer.alloc(16, 3),
+  });
+  nativeCrypto.createHandshakeMessage = () => ({
+    message: { v: 1 },
+    privKey: Buffer.alloc(32, 4),
+    nonce: Buffer.alloc(16, 5),
+  });
+  nativeCrypto.writeHandshakeMessage = () => {
+    writeStarted = true;
+    return writeGate.promise;
+  };
+  nativeCrypto.deriveSessionKeys = () => ({});
+
+  try {
+    publishPort.handleTLSHandshake(
+      makeSessionId('2a'),
+      ref,
+      8448,
+      remoteDeviceId,
+      connection
+    );
+    await waitFor(() => writeStarted);
+
+    assert.equal(connection.getConnection(ref) !== undefined, true);
+    assert.equal(publishPort._trackedConnectionInfos.size, 1);
+    assert.equal(tlsSocket.destroyed, false);
+    assert.equal(session.ready, false);
+    assert.equal(localSocket.resumeCalls, 0);
+
+    writeGate.resolve();
+    await waitFor(() => connection.getConnection(ref) === undefined);
+
+    assert.equal(session.ready, true);
+    assert.equal(localSocket.resumeCalls, 1);
+    assert.equal(tlsSocket.destroyed, true);
+    assert.equal(publishPort._trackedConnectionInfos.size, 0);
+  } finally {
+    tls.TLSSocket = OriginalTlsSocket;
+    Object.assign(nativeCrypto, originals);
+    publishPort.close();
+  }
+});
+
 test('native UDP publish connects local socket to configured host', () => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, {
@@ -508,4 +758,642 @@ test('handlePortOpen rejects non-whitelisted devices before connecting', () => {
   assert.equal(connectCalled, false);
   assert.equal(connection.sentErrors.length, 1);
   assert.equal(connection.sentErrors[0][2], 'Device not whitelisted');
+});
+
+test('TCP publish rejects a portopen when the local backend refuses connection', async () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8082]);
+  const originalConnect = net.connect;
+  let socket;
+
+  net.connect = () => {
+    socket = new FakeStreamSocket();
+    process.nextTick(() => socket.emit('error', new Error('ECONNREFUSED')));
+    return socket;
+  };
+
+  try {
+    const ref = makeRef('0d');
+    publishPort.handleTCPConnection(
+      makeSessionId('0e'),
+      ref,
+      8082,
+      `0x${'11'.repeat(20)}`,
+      publishPort.getPublishedPorts()[8082],
+      connection
+    );
+    await waitFor(() => connection.sentErrors.length === 1);
+
+    assert.equal(connection.sentErrors[0][2], 'Local service connection failed');
+    assert.equal(connection.getConnection(ref), undefined);
+    assert.equal(socket.destroyed, true);
+  } finally {
+    net.connect = originalConnect;
+    publishPort.close();
+  }
+});
+
+test('TLS publish backend failure sends an error and destroys both sides', async () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8444]);
+  const originalConnect = net.connect;
+  const originalTlsSocket = tls.TLSSocket;
+  let localSocket;
+  let tlsSocket;
+
+  net.connect = () => {
+    localSocket = new FakeStreamSocket();
+    process.nextTick(() => localSocket.emit('error', new Error('ECONNREFUSED')));
+    return localSocket;
+  };
+  tls.TLSSocket = class extends FakeTlsSocket {
+    constructor(...args) {
+      super(...args);
+      tlsSocket = this;
+      this.destroyed = false;
+    }
+    destroy() { this.destroyed = true; }
+  };
+
+  try {
+    const ref = makeRef('0f');
+    publishPort.handleTLSConnection(
+      makeSessionId('10'),
+      ref,
+      8444,
+      `0x${'11'.repeat(20)}`,
+      publishPort.getPublishedPorts()[8444],
+      connection
+    );
+    await waitFor(() => connection.sentErrors.length === 1);
+
+    assert.equal(connection.sentErrors[0][2], 'Local service connection failed');
+    assert.equal(connection.getConnection(ref), undefined);
+    assert.equal(localSocket.destroyed, true);
+    assert.equal(tlsSocket.destroyed, true);
+  } finally {
+    net.connect = originalConnect;
+    tls.TLSSocket = originalTlsSocket;
+    publishPort.close();
+  }
+});
+
+test('portopen ACK rejection cleans native and API publisher resources', async (t) => {
+  await t.test('native TCP session and lease', async () => {
+    const connection = new FakeConnection();
+    let ackCalls = 0;
+    connection.RPC.sendResponse = async () => {
+      ackCalls += 1;
+      throw new Error('ACK write failed');
+    };
+    const publishPort = new PublishPort(connection, [8082]);
+    const originalConnect = net.connect;
+    const sockets = [];
+    net.connect = () => {
+      const socket = new FakeStreamSocket();
+      sockets.push(socket);
+      return socket;
+    };
+
+    try {
+      const session = {
+        physicalPort: 41010,
+        port: 8082,
+        host: '127.0.0.1',
+        protocol: 'tcp',
+        deviceId: `0x${'11'.repeat(20)}`,
+        connection,
+        ready: false,
+        session: null,
+        pendingRelayChunks: [],
+        nativeLease: true,
+      };
+      session.sessionKey = publishPort._nativeSessionKey(connection, session.physicalPort);
+      connection._diodeActiveNativeSessions = 1;
+      publishPort.nativeSessions.set(session.sessionKey, session);
+
+      publishPort.handleNativeTCPRelay(makeSessionId('1a'), session.physicalPort, session, connection);
+      sockets[0].emit('connect');
+      sockets[1].emit('connect');
+
+      await waitFor(() => !publishPort.nativeSessions.has(session.sessionKey));
+      assert.equal(ackCalls, 1);
+      assert.equal(connection._diodeActiveNativeSessions, 0);
+      assert.equal(session.nativeLease, false);
+      assert.equal(sockets[0].destroyed, true);
+      assert.equal(sockets[1].destroyed, true);
+    } finally {
+      net.connect = originalConnect;
+      publishPort.close();
+    }
+  });
+
+  await t.test('native UDP session and lease', async () => {
+    const connection = new FakeConnection();
+    let ackCalls = 0;
+    connection.RPC.sendResponse = async () => {
+      ackCalls += 1;
+      throw new Error('ACK write failed');
+    };
+    const publishPort = new PublishPort(connection, [5356]);
+    const originalCreateSocket = dgram.createSocket;
+    const sockets = [];
+    dgram.createSocket = () => {
+      const socket = new FakeDatagramSocket();
+      sockets.push(socket);
+      return socket;
+    };
+
+    try {
+      const session = {
+        physicalPort: 41011,
+        port: 5356,
+        host: '127.0.0.1',
+        protocol: 'udp',
+        deviceId: `0x${'11'.repeat(20)}`,
+        connection,
+        ready: false,
+        session: null,
+        nativeLease: true,
+      };
+      session.sessionKey = publishPort._nativeSessionKey(connection, session.physicalPort);
+      connection._diodeActiveNativeSessions = 1;
+      publishPort.nativeSessions.set(session.sessionKey, session);
+
+      publishPort.handleNativeUDPRelay(makeSessionId('1b'), session.physicalPort, session, connection);
+
+      await waitFor(() => !publishPort.nativeSessions.has(session.sessionKey));
+      assert.equal(ackCalls, 1);
+      assert.equal(connection._diodeActiveNativeSessions, 0);
+      assert.equal(session.nativeLease, false);
+      assert.equal(sockets[0].closed, true);
+      assert.equal(sockets[1].closed, true);
+    } finally {
+      dgram.createSocket = originalCreateSocket;
+      publishPort.close();
+    }
+  });
+
+  await t.test('API TCP connection', async () => {
+    const connection = new FakeConnection();
+    let ackCalls = 0;
+    connection.RPC.sendResponse = async () => {
+      ackCalls += 1;
+      throw new Error('ACK write failed');
+    };
+    const publishPort = new PublishPort(connection, [8083]);
+    const originalConnect = net.connect;
+    let localSocket;
+    let onConnect;
+    net.connect = (_options, callback) => {
+      localSocket = new FakeStreamSocket();
+      onConnect = callback;
+      return localSocket;
+    };
+
+    try {
+      const ref = makeRef('1c');
+      publishPort.handleTCPConnection(
+        makeSessionId('1c'),
+        ref,
+        8083,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[8083],
+        connection
+      );
+      onConnect();
+
+      await waitFor(() => connection.getConnection(ref) === undefined);
+      assert.equal(ackCalls, 1);
+      assert.equal(localSocket.destroyed, true);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.portCloseCalls.length, 0);
+    } finally {
+      net.connect = originalConnect;
+      publishPort.close();
+    }
+  });
+
+  await t.test('API TLS connection', async () => {
+    const connection = new FakeConnection();
+    let ackCalls = 0;
+    connection.RPC.sendResponse = async () => {
+      ackCalls += 1;
+      throw new Error('ACK write failed');
+    };
+    const publishPort = new PublishPort(connection, [8449]);
+    const originalConnect = net.connect;
+    const OriginalTlsSocket = tls.TLSSocket;
+    let localSocket;
+    let tlsSocket;
+    let diodeSocket;
+    let onConnect;
+    tls.TLSSocket = class extends FakeStreamSocket {
+      constructor(socket) {
+        super();
+        diodeSocket = socket;
+        tlsSocket = this;
+      }
+    };
+    net.connect = (_options, callback) => {
+      localSocket = new FakeStreamSocket();
+      onConnect = callback;
+      return localSocket;
+    };
+
+    try {
+      const ref = makeRef('1d');
+      publishPort.handleTLSConnection(
+        makeSessionId('1d'),
+        ref,
+        8449,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[8449],
+        connection
+      );
+      onConnect();
+
+      await waitFor(() => connection.getConnection(ref) === undefined);
+      assert.equal(ackCalls, 1);
+      assert.equal(localSocket.destroyed, true);
+      assert.equal(tlsSocket.destroyed, true);
+      assert.equal(diodeSocket.destroyed, true);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.portCloseCalls.length, 0);
+    } finally {
+      net.connect = originalConnect;
+      tls.TLSSocket = OriginalTlsSocket;
+      publishPort.close();
+    }
+  });
+});
+
+test('reused API ref replaces the old mapping and ignores its late socket error', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8084]);
+  const originalConnect = net.connect;
+  const sockets = [];
+  const callbacks = [];
+  net.connect = (_options, callback) => {
+    const socket = new FakeStreamSocket();
+    sockets.push(socket);
+    callbacks.push(callback);
+    return socket;
+  };
+
+  try {
+    const ref = makeRef('24');
+    const args = [
+      makeSessionId('24'),
+      ref,
+      8084,
+      `0x${'11'.repeat(20)}`,
+      publishPort.getPublishedPorts()[8084],
+      connection,
+    ];
+    publishPort.handleTCPConnection(...args);
+    callbacks[0]();
+    const oldInfo = connection.getConnection(ref);
+
+    publishPort.handleTCPConnection(...args);
+    const newInfo = connection.getConnection(ref);
+
+    assert.notEqual(newInfo, oldInfo);
+    assert.equal(sockets[0].destroyed, true);
+    assert.equal(sockets[1].destroyed, false);
+    assert.equal(publishPort._trackedConnectionInfos.size, 1);
+    assert.equal(connection.portCloseCalls.length, 0);
+
+    sockets[0].emit('error', new Error('late old backend error'));
+
+    assert.equal(connection.getConnection(ref), newInfo);
+    assert.equal(sockets[1].destroyed, false);
+    assert.equal(publishPort._trackedConnectionInfos.size, 1);
+    assert.equal(connection.portCloseCalls.length, 0);
+  } finally {
+    net.connect = originalConnect;
+    publishPort.close();
+  }
+});
+
+test('close during backend socket allocation cannot leave late TCP or TLS sockets', async (t) => {
+  await t.test('TCP', () => {
+    const connection = new FakeConnection();
+    const publishPort = new PublishPort(connection, [8086]);
+    const originalConnect = net.connect;
+    let localSocket;
+
+    net.connect = () => {
+      localSocket = new FakeStreamSocket();
+      publishPort.close();
+      return localSocket;
+    };
+
+    try {
+      publishPort.handleTCPConnection(
+        makeSessionId('14'),
+        makeRef('14'),
+        8086,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[8086],
+        connection
+      );
+
+      assert.equal(localSocket.destroyed, true);
+      assert.equal(connection.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.sentResponses.length, 0);
+      assert.equal(connection.portCloseCalls.length, 1);
+    } finally {
+      net.connect = originalConnect;
+      publishPort.close();
+    }
+  });
+
+  await t.test('TLS', () => {
+    const connection = new FakeConnection();
+    const publishPort = new PublishPort(connection, [8446]);
+    const originalConnect = net.connect;
+    const OriginalTlsSocket = tls.TLSSocket;
+    let localSocket;
+    let tlsSocket;
+    let diodeSocket;
+
+    tls.TLSSocket = class extends FakeStreamSocket {
+      constructor(socket) {
+        super();
+        diodeSocket = socket;
+        tlsSocket = this;
+      }
+    };
+    net.connect = () => {
+      localSocket = new FakeStreamSocket();
+      publishPort.close();
+      return localSocket;
+    };
+
+    try {
+      publishPort.handleTLSConnection(
+        makeSessionId('15'),
+        makeRef('15'),
+        8446,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[8446],
+        connection
+      );
+
+      assert.equal(localSocket.destroyed, true);
+      assert.equal(tlsSocket.destroyed, true);
+      assert.equal(diodeSocket.destroyed, true);
+      assert.equal(connection.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.sentResponses.length, 0);
+      assert.equal(connection.portCloseCalls.length, 1);
+    } finally {
+      net.connect = originalConnect;
+      tls.TLSSocket = OriginalTlsSocket;
+      publishPort.close();
+    }
+  });
+});
+
+test('publisher tracking closes TLS-handshake and UDP sockets after manager relay removal', async (t) => {
+  await t.test('TLS handshake', () => {
+    const relay = new FakeConnection();
+    let managerConnections = [relay];
+    const manager = new EventEmitter();
+    manager.getConnections = () => managerConnections;
+    const publishPort = new PublishPort(manager, [8447]);
+    const OriginalTlsSocket = tls.TLSSocket;
+    let tlsSocket;
+    let diodeSocket;
+
+    tls.TLSSocket = class extends FakeStreamSocket {
+      constructor(socket) {
+        super();
+        diodeSocket = socket;
+        tlsSocket = this;
+      }
+
+      destroy(error) {
+        if (this.destroyed) return;
+        super.destroy(error);
+        this.emit('close');
+      }
+    };
+
+    try {
+      const ref = makeRef('16');
+      publishPort.handleTLSHandshake(
+        makeSessionId('16'),
+        ref,
+        8447,
+        `0x${'11'.repeat(20)}`,
+        relay
+      );
+      assert.equal(relay.getConnection(ref) !== undefined, true);
+      assert.equal(publishPort._trackedConnectionInfos.size, 1);
+
+      managerConnections = [];
+      publishPort.close();
+
+      assert.equal(tlsSocket.destroyed, true);
+      assert.equal(diodeSocket.destroyed, true);
+      assert.equal(relay.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(relay.portCloseCalls.length, 1);
+    } finally {
+      tls.TLSSocket = OriginalTlsSocket;
+      publishPort.close();
+    }
+  });
+
+  await t.test('UDP', () => {
+    const relay = new FakeConnection();
+    let managerConnections = [relay];
+    const manager = new EventEmitter();
+    manager.getConnections = () => managerConnections;
+    const publishPort = new PublishPort(manager, {
+      5354: { mode: 'public', host: '127.0.0.1' },
+    });
+    const originalCreateSocket = dgram.createSocket;
+    let localSocket;
+
+    dgram.createSocket = () => {
+      localSocket = new FakeDatagramSocket();
+      return localSocket;
+    };
+
+    try {
+      const ref = makeRef('17');
+      publishPort.handleUDPConnection(
+        makeSessionId('17'),
+        ref,
+        5354,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[5354],
+        relay
+      );
+      assert.equal(relay.getConnection(ref) !== undefined, true);
+      assert.equal(publishPort._trackedConnectionInfos.size, 1);
+
+      managerConnections = [];
+      publishPort.close();
+
+      assert.equal(localSocket.closed, true);
+      assert.equal(relay.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(relay.portCloseCalls.length, 1);
+    } finally {
+      dgram.createSocket = originalCreateSocket;
+      publishPort.close();
+    }
+  });
+});
+
+test('close during TLS-handshake or UDP socket allocation destroys late resources', async (t) => {
+  await t.test('TLS handshake', () => {
+    const connection = new FakeConnection();
+    const publishPort = new PublishPort(connection, [8448]);
+    const OriginalTlsSocket = tls.TLSSocket;
+    let tlsSocket;
+    let diodeSocket;
+
+    tls.TLSSocket = class extends FakeStreamSocket {
+      constructor(socket) {
+        super();
+        diodeSocket = socket;
+        tlsSocket = this;
+        publishPort.close();
+      }
+    };
+
+    try {
+      publishPort.handleTLSHandshake(
+        makeSessionId('18'),
+        makeRef('18'),
+        8448,
+        `0x${'11'.repeat(20)}`,
+        connection
+      );
+
+      assert.equal(tlsSocket.destroyed, true);
+      assert.equal(diodeSocket.destroyed, true);
+      assert.equal(connection.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.sentResponses.length, 0);
+      assert.equal(connection.portCloseCalls.length, 1);
+    } finally {
+      tls.TLSSocket = OriginalTlsSocket;
+      publishPort.close();
+    }
+  });
+
+  await t.test('UDP', () => {
+    const connection = new FakeConnection();
+    const publishPort = new PublishPort(connection, [5355]);
+    const originalCreateSocket = dgram.createSocket;
+    let localSocket;
+
+    dgram.createSocket = () => {
+      localSocket = new FakeDatagramSocket();
+      publishPort.close();
+      return localSocket;
+    };
+
+    try {
+      publishPort.handleUDPConnection(
+        makeSessionId('19'),
+        makeRef('19'),
+        5355,
+        `0x${'11'.repeat(20)}`,
+        publishPort.getPublishedPorts()[5355],
+        connection
+      );
+
+      assert.equal(localSocket.closed, true);
+      assert.equal(connection.connections.size, 0);
+      assert.equal(publishPort._trackedConnectionInfos.size, 0);
+      assert.equal(connection.sentResponses.length, 0);
+      assert.equal(connection.portCloseCalls.length, 1);
+    } finally {
+      dgram.createSocket = originalCreateSocket;
+      publishPort.close();
+    }
+  });
+});
+
+test('startListening cannot reopen a closed publisher', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, []);
+  assert.equal(connection.listenerCount('unsolicited'), 1);
+
+  publishPort.close();
+  publishPort.startListening();
+
+  assert.equal(connection.listenerCount('unsolicited'), 0);
+  assert.equal(publishPort._listening, false);
+});
+
+test('portclose for TLS destroys the separately stored localSocket', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8445]);
+  const ref = makeRef('11');
+  const localSocket = new FakeStreamSocket();
+  const tlsSocket = new FakeStreamSocket();
+  const diodeSocket = new FakeStreamSocket();
+  connection.addConnection(ref, {
+    localSocket,
+    tlsSocket,
+    diodeSocket,
+    protocol: 'tls',
+    port: 8445,
+  });
+
+  publishPort.handlePortClose(makeSessionId('12'), ['portclose', ref], connection);
+
+  assert.equal(localSocket.destroyed, true);
+  assert.equal(tlsSocket.destroyed, true);
+  assert.equal(diodeSocket.destroyed, true);
+  assert.equal(connection.getConnection(ref), undefined);
+  publishPort.close();
+});
+
+test('portclose2 is scoped to the relay connection as well as physical port', () => {
+  const manager = new EventEmitter();
+  manager.getConnections = () => [];
+  const publishPort = new PublishPort(manager, {});
+  const relayA = new FakeConnection();
+  const relayB = new FakeConnection();
+  const physicalPort = 41000;
+  const sessionA = {
+    sessionKey: publishPort._nativeSessionKey(relayA, physicalPort),
+    connection: relayA,
+    physicalPort,
+    port: 8080,
+    relaySocket: new FakeStreamSocket(),
+    localSocket: new FakeStreamSocket(),
+    nativeLease: true,
+  };
+  const sessionB = {
+    sessionKey: publishPort._nativeSessionKey(relayB, physicalPort),
+    connection: relayB,
+    physicalPort,
+    port: 8080,
+    relaySocket: new FakeStreamSocket(),
+    localSocket: new FakeStreamSocket(),
+    nativeLease: true,
+  };
+  relayA._diodeActiveNativeSessions = 1;
+  relayB._diodeActiveNativeSessions = 1;
+  publishPort.nativeSessions.set(sessionA.sessionKey, sessionA);
+  publishPort.nativeSessions.set(sessionB.sessionKey, sessionB);
+
+  publishPort.handlePortClose2(makeSessionId('13'), ['portclose2', physicalPort], relayA);
+
+  assert.equal(publishPort.nativeSessions.has(sessionA.sessionKey), false);
+  assert.equal(publishPort.nativeSessions.has(sessionB.sessionKey), true);
+  assert.equal(sessionA.localSocket.destroyed, true);
+  assert.equal(sessionB.localSocket.destroyed, false);
+  publishPort.close();
 });
