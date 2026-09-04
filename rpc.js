@@ -10,6 +10,8 @@ const {
 const logger = require('./logger');
 
 const MAX_NODE_TIMER_MS = 0x7fffffff;
+const TICKET_CHAIN_PREFIX = 'glmr:';
+const TICKET_EPOCH_DURATION_SECONDS = 2592000;
 
 function normalizeTimerMs(value, fallback) {
     if (!Number.isFinite(value) || value <= 0) return fallback;
@@ -189,8 +191,9 @@ class DiodeRPC {
       return `${protocol}://${formattedHost}:${rpcPort}/`;
     }
   
-    _getBlockPeakWithSender(sendCommand) {
-        return sendCommand(['getblockpeak']).then((responseData) => {
+    _getBlockPeakWithSender(sendCommand, options = {}) {
+        const command = options.command || 'getblockpeak';
+        return sendCommand([command]).then((responseData) => {
           // responseData is an array containing [blockNumber]
           const blockNumberRaw = responseData[0];
           let blockNumber;
@@ -208,6 +211,7 @@ class DiodeRPC {
           return blockNumber;
         }).catch((error) => {
           logger.error(() => `Error during get block peak: ${error}`);
+          if (options.suppressErrors === false) throw error;
           return;
         });
       }
@@ -216,11 +220,13 @@ class DiodeRPC {
       return this._getBlockPeakWithSender((command) => this.connection.sendCommand(command, options));
     }
 
-    _getBlockHeaderWithSender(index, sendCommand) {
-      return sendCommand(['getblockheader', index]).then((responseData) => {
+    _getBlockHeaderWithSender(index, sendCommand, options = {}) {
+      const command = options.command || 'getblockheader';
+      return sendCommand([command, index]).then((responseData) => {
         return responseData[0]; // block_header
       }).catch((error) => {
         logger.error(() => `Error during get block header: ${error}`);
+        if (options.suppressErrors === false) throw error;
         return;
       });
     }
@@ -438,12 +444,20 @@ class DiodeRPC {
           return this.epochCache.epoch;
         }
         logger.debug(() => `Fetching new epoch. Expiry: ${this.epochCache.expiry}, Current time: ${currentTime}`);
-        const blockPeak = await this._getBlockPeakWithSender(sendCommand);
-        const blockHeader = await this._getBlockHeaderWithSender(blockPeak, sendCommand);
+        // Tickets are submitted for Moonbeam (chain id 1284), so their epoch
+        // must come from Moonbeam too. Unprefixed block commands query Diode
+        // L1, whose timestamp can cross an epoch boundary before Moonbeam.
+        const blockPeak = await this._getBlockPeakWithSender(sendCommand, {
+          command: `${TICKET_CHAIN_PREFIX}getblockpeak`,
+          suppressErrors: false,
+        });
+        const blockHeader = await this._getBlockHeaderWithSender(blockPeak, sendCommand, {
+          command: `${TICKET_CHAIN_PREFIX}getblockheader`,
+          suppressErrors: false,
+        });
     
-        // Assuming blockHeader is an object with a timestamp property
-        const timestamp = this.parseTimestamp(blockHeader);
-        const epochDuration = 2592000; // 30 days in seconds
+        const timestamp = this.parseTimestamp(blockHeader, { fallbackToCurrentTime: false });
+        const epochDuration = TICKET_EPOCH_DURATION_SECONDS;
         const epoch = Math.floor(timestamp / epochDuration);
     
         // Calculate the time left for the next epoch
@@ -460,7 +474,7 @@ class DiodeRPC {
         return this._getEpochWithSender((command) => this.connection.sendCommand(command, options));
       }
     
-      parseTimestamp(blockHeader) {
+      parseTimestamp(blockHeader, options = {}) {
         // Search for the timestamp field by name (robust to Buffer/Uint8Array)
         if (Array.isArray(blockHeader)) {
           for (const field of blockHeader) {
@@ -487,6 +501,9 @@ class DiodeRPC {
           }
         }
         // Fallback
+        if (options.fallbackToCurrentTime === false) {
+          throw new DiodeRPCError('ticket epoch', 'block header did not contain a valid timestamp');
+        }
         logger.warn(() => 'Could not find or parse timestamp in block header, using current time');
         return Math.floor(Date.now() / 1000);
       }
