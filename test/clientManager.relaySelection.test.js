@@ -116,6 +116,7 @@ class TestClientManager extends DiodeClientManager {
     }
     connection._managerConnectedAt = connection._managerConnectedAt || Date.now();
     this._updateServerIdMapping(connection);
+    this.emit('connected', connection);
     return connection;
   }
 
@@ -204,6 +205,8 @@ test('manager clamps configurable and direct timeout values to Node timer bounds
     relaySelection: {
       scoreCachePath: null,
       probeTimeoutMs: Number.MAX_SAFE_INTEGER,
+      connectionTimeoutMs: Number.MAX_SAFE_INTEGER,
+      targetConnectTimeoutMs: Number.MAX_SAFE_INTEGER,
       deviceLookupTimeoutMs: Number.POSITIVE_INFINITY,
       discoveryProviderTimeoutMs: -1,
       backgroundProbeIntervalMs: Number.MAX_SAFE_INTEGER,
@@ -213,6 +216,8 @@ test('manager clamps configurable and direct timeout values to Node timer bounds
   });
 
   assert.equal(manager.relaySelection.probeTimeoutMs, 0x7fffffff);
+  assert.equal(manager.relaySelection.connectionTimeoutMs, 0x7fffffff);
+  assert.equal(manager.relaySelection.targetConnectTimeoutMs, 0x7fffffff);
   assert.equal(manager.relaySelection.deviceLookupTimeoutMs, 3000);
   assert.equal(manager.relaySelection.discoveryProviderTimeoutMs, 1500);
   assert.equal(manager.relaySelection.backgroundProbeIntervalMs, 0x7fffffff);
@@ -271,6 +276,124 @@ test('background probe failures are counted once', async () => {
 
   assert.equal(manager.relayScores.get(hostKey).failureCount, 1);
   manager.close();
+});
+
+test('on-demand relay handshake can take longer than the latency probe deadline', async () => {
+  const hostKey = 'slow-handshake:41046';
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    relaySelection: {
+      scoreCachePath: null,
+      probeTimeoutMs: 25,
+      targetConnectTimeoutMs: 500,
+      networkDiscovery: { enabled: false },
+    },
+  }, new Map([[hostKey, { connectDelayMs: 75, pingDelayMs: 1 }]]));
+  try {
+    const connection = await manager._probeHost(hostKey, 'target');
+    assert.equal(connection.socket.destroyed, false);
+    assert.equal(manager.relayScores.get(hostKey).discoveredFrom, 'target');
+  } finally {
+    manager.close();
+  }
+});
+
+test('seed handshakes use the setup budget rather than the ping deadline', async () => {
+  const hostKey = 'seed-with-slow-handshake:41046';
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    hosts: [hostKey],
+    relaySelection: {
+      scoreCachePath: null,
+      probeTimeoutMs: 25,
+      connectionTimeoutMs: 500,
+    },
+  }, new Map([[hostKey, { connectDelayMs: 75, pingDelayMs: 1 }]]));
+  try {
+    await manager.connect();
+    assert.equal(manager.getNearestConnection()._managerHostKey, hostKey);
+    await manager._startupWorkPromise;
+    assert.equal(manager.relayScores.get(hostKey).successCount, 1);
+  } finally {
+    manager.close();
+  }
+});
+
+test('latency ranking measures ping RTT without cold TLS and ticket handshake time', async () => {
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    relaySelection: { scoreCachePath: null, networkDiscovery: { enabled: false } },
+  });
+  const originalNow = Date.now;
+  let now = originalNow();
+  const connection = new FakeConnection('cold:41046');
+  connection.RPC.ping = async () => { now += 20; return true; };
+  manager._ensureConnection = async () => {
+    now += 1000;
+    manager._registerConnection(connection, 'cold:41046');
+    return connection;
+  };
+  Date.now = () => now;
+  try {
+    await manager._probeHost('cold:41046', 'target');
+    assert.equal(manager.relayScores.get('cold:41046').lastProbeLatencyMs, 20);
+  } finally {
+    Date.now = originalNow;
+    manager.close();
+  }
+});
+
+test('parallel device requests share one ticket lookup and keep a usable cache', async () => {
+  let ticketLookups = 0;
+  let finishLookup;
+  const lookup = new Promise((resolve) => { finishLookup = resolve; });
+  const serverId = '0x11223344';
+  const primary = new FakeConnection('primary:41046', {
+    serverEthereumAddress: serverId,
+    getObject: async () => {
+      ticketLookups += 1;
+      await lookup;
+      return { serverIdHex: serverId };
+    },
+  });
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    relaySelection: { scoreCachePath: null, enabled: false },
+  });
+  manager._registerConnection(primary, 'primary:41046');
+  manager._updateServerIdMapping(primary);
+  try {
+    const connections = Array.from({ length: 24 }, (_, index) => (
+      manager.getConnectionForDevice(index % 2 === 0 ? '0xabcd' : Buffer.from('abcd', 'hex'))
+    ));
+    assert.equal(ticketLookups, 1);
+    assert.equal(manager.pendingDeviceResolutions.size, 1);
+    finishLookup();
+    const resolved = await Promise.all(connections);
+    assert.equal(resolved.every((connection) => connection === primary), true);
+    assert.equal(manager.pendingDeviceResolutions.size, 0);
+    assert.equal(await manager.getConnectionForDevice('0xabcd'), primary);
+    assert.equal(ticketLookups, 1);
+  } finally {
+    finishLookup();
+    manager.close();
+  }
+});
+
+test('a failed device lookup can be retried after a relay becomes available', async () => {
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    relaySelection: { scoreCachePath: null, enabled: false },
+  });
+  try {
+    await assert.rejects(manager.getConnectionForDevice('0xabcd'), /No connected relay/);
+    assert.equal(manager.pendingDeviceResolutions.size, 0);
+    const primary = new FakeConnection('primary:41046');
+    manager._registerConnection(primary, 'primary:41046');
+    assert.equal(await manager.getConnectionForDevice('0xabcd'), primary);
+  } finally {
+    manager.close();
+  }
 });
 
 test('late probe completion cannot mutate scores or schedule a flush after manager close', () => {
@@ -373,7 +496,7 @@ test('unknown relays rank behind known-good relays and ahead of cooldown relays'
   manager.close();
 });
 
-test('connect probes all explicit hosts before resolving', async () => {
+test('startup covers all explicit hosts in the background', async () => {
   const tempDir = makeTempDir();
   const keyLocation = path.join(tempDir, 'keys.json');
   const manager = new TestClientManager({
@@ -393,11 +516,89 @@ test('connect probes all explicit hosts before resolving', async () => {
 
   const startedAt = Date.now();
   await manager.connect();
+  assert.equal(manager._startupCoverageComplete, false);
+  await manager._startupWorkPromise;
   const elapsedMs = Date.now() - startedAt;
 
   assert.ok(elapsedMs >= 50, `expected bounded startup probe wait, got ${elapsedMs}ms`);
   assert.deepEqual(manager.ensureCalls.sort(), ['fail:41046', 'fast:41046', 'unused:41046']);
   manager.close();
+});
+
+test('connect becomes ready while another relay is still establishing its handshake', async () => {
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    hosts: ['healthy:41046', 'unreachable:41046'],
+    relaySelection: { scoreCachePath: null, warmConnectionBudget: 1 },
+  });
+  const ensureConnection = manager._ensureConnection.bind(manager);
+  let rejectUnreachable;
+  const unreachable = new Promise((_, reject) => { rejectUnreachable = reject; });
+  manager._ensureConnection = (hostKey) => (
+    hostKey === 'unreachable:41046' ? unreachable : ensureConnection(hostKey)
+  );
+  try {
+    assert.equal(await manager.connect(), manager);
+    assert.equal(manager.getNearestConnection()._managerHostKey, 'healthy:41046');
+    assert.equal(manager._startupCoverageComplete, false);
+    rejectUnreachable(new Error('unreachable relay'));
+    await manager._startupWorkPromise;
+    assert.equal(manager._startupCoverageComplete, true);
+    assert.equal(manager.getConnections().length, 1);
+  } finally {
+    rejectUnreachable(new Error('test cleanup'));
+    manager.close();
+  }
+});
+
+test('startup rejects when every relay handshake fails', async () => {
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    hosts: ['failed:41046'],
+    relaySelection: { scoreCachePath: null },
+  }, new Map([['failed:41046', { connectError: new Error('relay unavailable') }]]));
+  try {
+    await assert.rejects(manager.connect(), /Failed to connect to any Diode hosts/);
+    assert.equal(manager.listenerCount('connected'), 0);
+  } finally {
+    manager.close();
+  }
+});
+
+test('a failed latency measurement does not discard an authenticated relay or stall pruning', async () => {
+  const hostKey = 'authenticated:41046';
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    hosts: [hostKey],
+    relaySelection: { scoreCachePath: null },
+  }, new Map([[hostKey, { pingResult: false }]]));
+  try {
+    await manager.connect();
+    await manager._startupWorkPromise;
+    assert.equal(manager._startupCoverageComplete, true);
+    assert.equal(manager.getNearestConnection()._managerHostKey, hostKey);
+    assert.equal(manager.relayScores.get(hostKey).failureCount, 1);
+  } finally {
+    manager.close();
+  }
+});
+
+test('closing during startup rejects readiness without waiting for connection deadlines', async () => {
+  const manager = new TestClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    hosts: ['pending:41046'],
+    relaySelection: { scoreCachePath: null },
+  });
+  let failConnection;
+  const pending = new Promise((_, reject) => { failConnection = reject; });
+  manager._ensureConnection = () => pending;
+  const ready = manager.connect();
+  const rejected = assert.rejects(ready, /closed during startup/);
+  manager.close();
+  await rejected;
+  failConnection(new Error('test cleanup'));
+  await assert.rejects(manager._startupWorkPromise);
+  assert.equal(manager.listenerCount('connected'), 0);
 });
 
 test('getNearestConnection returns the lowest-latency connected relay', () => {
@@ -790,6 +991,7 @@ test('default mode probes all default seeds before final pruning', async () => {
   ]));
 
   await manager.connect();
+  await manager._startupWorkPromise;
 
   assert.deepEqual(new Set(manager.ensureCalls), new Set([
     'as1.prenet.diode.io:41046',
@@ -975,7 +1177,7 @@ test('explicit hosts skip built-in network discovery', async () => {
   manager.close();
 });
 
-test('startup waits for required seeds plus bounded network sample', async () => {
+test('background startup coverage includes required seeds plus bounded network sample', async () => {
   const tempDir = makeTempDir();
   const keyLocation = path.join(tempDir, 'keys.json');
   const manager = new TestClientManager({
@@ -996,6 +1198,7 @@ test('startup waits for required seeds plus bounded network sample', async () =>
   ]), networkSnapshot);
 
   await manager.connect();
+  await manager._startupWorkPromise;
 
   assert.ok(manager.ensureCalls.includes('144.126.157.138:41046'));
   assert.equal(manager._lastNetworkDiscoveryStats.startupProbeCount, 1);
@@ -1021,6 +1224,7 @@ test('live network discovery reduces startup seed coverage to one seed per regio
   ]), networkSnapshot);
 
   await manager.connect();
+  await manager._startupWorkPromise;
 
   assert.deepEqual(new Set(manager.ensureCalls), new Set([
     'as1.prenet.diode.io:41046',
@@ -1586,6 +1790,30 @@ test('idle pruning never closes a relay with active tunnel state', () => {
   assert.equal(active.closeCount, 0);
   assert.equal(manager.getConnections().includes(active), true);
   manager.close();
+});
+
+test('idle pruning preserves an in-flight portopen before a tunnel ref exists', () => {
+  const manager = new DiodeClientManager({
+    keyLocation: path.join(makeTempDir(), 'keys.json'),
+    relaySelection: { scoreCachePath: null, warmConnectionBudget: 1 },
+  });
+  const fast = new FakeConnection('fast:41046');
+  const opening = new FakeConnection('opening:41046');
+  opening.pendingRequests = new Map([[1, { commandArray: ['portopen'] }]]);
+  manager._registerConnection(fast, 'fast:41046');
+  manager._registerConnection(opening, 'opening:41046');
+  manager._recordRelayProbeSuccess('fast:41046', 5, 'seed');
+  manager._recordRelayProbeSuccess('opening:41046', 100, 'seed');
+  manager._startupCoverageComplete = true;
+  try {
+    manager._pruneIdleConnections();
+    assert.equal(opening.closeCount, 0);
+    opening.pendingRequests.clear();
+    manager._pruneIdleConnections();
+    assert.equal(opening.closeCount, 1);
+  } finally {
+    manager.close();
+  }
 });
 
 test('manager readiness follows connection readiness and forwards disconnect context', async () => {

@@ -3,7 +3,8 @@ const tls = require('tls');
 const dgram = require('dgram');
 const { Buffer } = require('buffer');
 const { toBufferView } = require('./utils');
-const { Duplex } = require('stream');
+const DiodeSocket = require('./diodeSocket');
+const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBackpressure');
 const EventEmitter = require('events');
 const DiodeRPC = require('./rpc');
 const nativeCrypto = require('./nativeCrypto');
@@ -74,20 +75,28 @@ function scheduleSocketDrain(socket, state) {
       state.bytes -= chunk.length;
       state.blocked = socket.write(chunk) === false;
     }
+    updateRelayBackpressure(state.connection, state, state.bytes);
+    if (state.ending && !state.blocked && state.queued.length === 0) socket.end();
     scheduleSocketDrain(socket, state);
   });
 }
 
-function writeWithBoundedBackpressure(socket, data) {
+function writeWithBoundedBackpressure(socket, data, connection = null) {
   if (!socket || socket.destroyed) return false;
   let state = socket[SOCKET_BACKPRESSURE_STATE];
   if (!state) {
-    state = { blocked: false, queued: [], bytes: 0, draining: false };
+    state = {
+      blocked: false, queued: [], bytes: 0, draining: false, connection,
+      relayReadTimeoutMs: socket._diodeOwner?.ioTimeoutMs,
+      onRelayReadStall: (error) => destroySocket(socket, error),
+    };
     socket[SOCKET_BACKPRESSURE_STATE] = state;
+    if (typeof socket.once === 'function') socket.once('close', () => releaseRelayBackpressure(state));
   }
   if (state.blocked) {
     const copy = Buffer.from(data);
     state.bytes += copy.length;
+    updateRelayBackpressure(state.connection, state, state.bytes);
     if (state.bytes > MAX_SOCKET_QUEUE_BYTES) {
       destroySocket(socket, new Error('Diode inbound socket queue limit exceeded'));
       return false;
@@ -102,56 +111,14 @@ function writeWithBoundedBackpressure(socket, data) {
   return !state.blocked;
 }
 
-// Custom Duplex stream to handle the Diode connection
-class DiodeSocket extends Duplex {
-  constructor(ref, rpc, timeoutMs = 10000) {
-    super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
-    this.ref = ref;
-    this.rpc = rpc;
-    this.timeoutMs = timeoutMs;
-    this._inboundQueue = [];
-    this._inboundBytes = 0;
-    this._inboundBlocked = false;
-  }
-
-  _write(chunk, encoding, callback) {
-    // Send data to the remote device via portSend
-    this.rpc.portSend(this.ref, chunk, { timeoutMs: this.timeoutMs })
-      .then(() => callback())
-      .catch((err) => callback(err));
-  }
-
-  _read(size) {
-    this._inboundBlocked = false;
-    while (!this._inboundBlocked && this._inboundQueue.length > 0 && !this.destroyed) {
-      const chunk = this._inboundQueue.shift();
-      this._inboundBytes -= chunk.length;
-      this._inboundBlocked = this.push(chunk) === false;
-    }
-  }
-
-  // Method to push data received from the remote device
-  pushData(data) {
-    if (this.destroyed) return false;
-    if (!this._inboundBlocked && this._inboundQueue.length === 0) {
-      this._inboundBlocked = this.push(data) === false;
-      return !this._inboundBlocked;
-    }
-    const copy = Buffer.from(data);
-    this._inboundQueue.push(copy);
-    this._inboundBytes += copy.length;
-    if (this._inboundBytes > MAX_SOCKET_QUEUE_BYTES) {
-      this.destroy(new Error('Diode TLS inbound queue limit exceeded'));
-      return false;
-    }
-    return false;
-  }
-
-  _destroy(err, callback) {
-    this._inboundQueue.length = 0;
-    this._inboundBytes = 0;
-    this.push(null);
-    callback(err);
+function endSocketWhenDrained(socket) {
+  const state = socket && socket[SOCKET_BACKPRESSURE_STATE];
+  if (!socket || socket.destroyed) return;
+  if (state && (state.blocked || state.queued.length > 0)) {
+    state.ending = true;
+    scheduleSocketDrain(socket, state);
+  } else {
+    socket.end();
   }
 }
 
@@ -201,7 +168,11 @@ class BindPort extends EventEmitter {
     this.handshakeTimeoutMs = normalizeTimerMs(process.env.DIODE_NATIVE_HANDSHAKE_TIMEOUT_MS, 10000);
     this.portOpenTimeoutMs = normalizeTimerMs(process.env.DIODE_PORTOPEN_TIMEOUT_MS, 5000);
     this.ioTimeoutMs = normalizeTimerMs(process.env.DIODE_PORT_IO_TIMEOUT_MS, 10000);
-    this.relayResolveTimeoutMs = normalizeTimerMs(process.env.DIODE_RELAY_RESOLVE_TIMEOUT_MS, this.portOpenTimeoutMs);
+    const targetConnectMs = Number(connection?.relaySelection?.targetConnectTimeoutMs || 10000);
+    this.relayResolveTimeoutMs = normalizeTimerMs(
+      process.env.DIODE_RELAY_RESOLVE_TIMEOUT_MS,
+      normalizeTimerMs(Math.max(this.portOpenTimeoutMs, targetConnectMs + this.portOpenTimeoutMs), 15000)
+    );
     this.nativeQueueLimitBytes = parseInt(process.env.DIODE_NATIVE_QUEUE_LIMIT_BYTES, 10) || MAX_SOCKET_QUEUE_BYTES;
     this.udpSessionIdleTimeoutMs = normalizeTimerMs(process.env.DIODE_UDP_SESSION_IDLE_TIMEOUT_MS, 300000);
     this._activeContexts = new Set();
@@ -307,6 +278,21 @@ class BindPort extends EventEmitter {
     if (typeof context.idleTimer.unref === 'function') context.idleTimer.unref();
   }
 
+  _endContextFromRemote(context) {
+    if (!context || context.closed || context.remoteEnded) return;
+    context.remoteEnded = true;
+    const wrapper = context.clientSocketWrapper;
+    if (context.udp || !wrapper) {
+      this._closeContext(context, { notifyRemote: false });
+    } else if (wrapper.diodeSocket) {
+      // Preserve queued ciphertext and decrypted plaintext until the client
+      // consumes them. A relay EOF is not a reset of the local TCP socket.
+      wrapper.diodeSocket.endReadable();
+    } else {
+      endSocketWhenDrained(wrapper);
+    }
+  }
+
   _acquireNativeLease(context) {
     if (!context || context.closed || context.nativeLease || !context.physicalPort || !context.connection) return;
     context.nativeLease = true;
@@ -368,6 +354,7 @@ class BindPort extends EventEmitter {
       try { context.cleanup(); } catch (_) {}
     }
     for (const socket of context.sockets || []) {
+      releaseRelayBackpressure(socket[SOCKET_BACKPRESSURE_STATE]);
       destroySocket(socket);
     }
 
@@ -533,7 +520,7 @@ class BindPort extends EventEmitter {
       tlsSocket,
       end: () => {
         try { tlsSocket.end(); } catch {}
-        try { diodeSocket._destroy(null, () => {}); } catch {}
+        try { diodeSocket.destroy(); } catch {}
       }
     };
 
@@ -702,7 +689,7 @@ class BindPort extends EventEmitter {
               clientSocket._diodeOwner._touchContext(clientSocket._diodeContext);
             }
             if (clientSocket.diodeSocket) clientSocket.diodeSocket.pushData(data);
-            else writeWithBoundedBackpressure(clientSocket, data);
+            else writeWithBoundedBackpressure(clientSocket, data, connection);
             return;
           }
 
@@ -710,7 +697,7 @@ class BindPort extends EventEmitter {
             const dataRef = toBufferView(messageContent[1]);
             const clientSocket = connection.getClientSocket(dataRef);
             if (clientSocket && clientSocket._diodeOwner && clientSocket._diodeContext) {
-              clientSocket._diodeOwner._closeContext(clientSocket._diodeContext, { notifyRemote: false });
+              clientSocket._diodeOwner._endContextFromRemote(clientSocket._diodeContext);
             } else {
               destroySocket(clientSocket && (clientSocket.tlsSocket || clientSocket.diodeSocket || clientSocket));
               try { connection.deleteClientSocket(dataRef); } catch (_) {}
@@ -1164,12 +1151,23 @@ class BindPort extends EventEmitter {
         const closeRemoteRef = async () => {
           if (remoteCleanupStarted) return;
           remoteCleanupStarted = true;
-          this._closeContext(context);
+          this._closeContext(context, { notifyRemote: !context.remoteEnded });
         };
 
-        clientSocket.once('close', () => {
+        const finishClientWrites = () => {
+          if (!context.finishWrites) return closeRemoteRef();
+          if (!context.finishingWrites) {
+            context.finishingWrites = Promise.resolve().then(() => context.finishWrites())
+              .catch((error) => logger.debug(() => `Bind write shutdown: ${error.message}`))
+              .finally(closeRemoteRef);
+          }
+          return context.finishingWrites;
+        };
+
+        clientSocket.once('close', (hadError) => {
           clientClosed = true;
-          closeRemoteRef();
+          if (!hadError && clientSocket.readableEnded) finishClientWrites();
+          else closeRemoteRef();
         });
         clientSocket.once('error', (err) => {
           logger.error(() => `Client socket error: ${err}`);
@@ -1416,7 +1414,7 @@ class BindPort extends EventEmitter {
           // For tls protocol, create a proper tls connection
           try {
             // Create a DiodeSocket to handle communication with the device
-            const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
+            const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs, connection);
             
             // Get the device certificate for tls
             const certPem = connection.getDeviceCertificate();
@@ -1450,7 +1448,7 @@ class BindPort extends EventEmitter {
             // Handle tls socket errors
             tlsSocket.on('error', (err) => {
               logger.error(() => `tls Socket error: ${err}`);
-              clientSocket.destroy();
+              closeRemoteRef();
             });
             
             // Store reference to the diodeSocket so we can push data to it
@@ -1459,10 +1457,11 @@ class BindPort extends EventEmitter {
               tlsSocket,
               end: () => {
                 try { tlsSocket.end(); } catch {}
-                try { diodeSocket._destroy(null, () => {}); } catch {}
+                try { diodeSocket.destroy(); } catch {}
               }
             };
             tlsSocketWrapper = socketWrapper;
+            context.finishWrites = () => diodeSocket.finishTlsWrites(tlsSocket);
             socketWrapper._diodeOwner = this;
             socketWrapper._diodeContext = context;
             context.sockets.add(tlsSocket);
@@ -1484,7 +1483,8 @@ class BindPort extends EventEmitter {
               if (!clientSocket.destroyed) {
                 clientSocket.end();
               }
-              closeRemoteRef();
+              // The local socket's close event cleans up after its buffered
+              // plaintext has drained. Errors still destroy the context.
             });
             
           } catch (error) {
@@ -1503,32 +1503,31 @@ class BindPort extends EventEmitter {
           context.clientSocketWrapper = clientSocket;
           this._replaceClientSocket(connection, ref, clientSocket);
           
-          // Handle data from client to device
-          clientSocket.on('data', (data) => {
-            clientSocket.pause();
-            try {
-              rpc.portSend(ref, data, { timeoutMs: this.ioTimeoutMs })
-                .then(() => {
-                  if (!clientSocket.destroyed) {
-                    clientSocket.resume();
-                  }
-                })
-                .catch((error) => {
-                  logger.error(() => `Error sending data to device: ${error}`);
-                  clientSocket.destroy();
-                });
-            } catch (error) {
-              logger.error(() => `Error sending data to device: ${error}`);
-              clientSocket.destroy();
+          // Raw TCP uses the same bounded send window as TLS. Keep inbound
+          // routing on the client socket while pipe applies outbound pressure.
+          const sendSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
+          context.sendSocket = sendSocket;
+          context.sockets.add(sendSocket);
+          let finishPromise;
+          context.finishWrites = () => {
+            if (!finishPromise) {
+              finishPromise = new Promise((resolve, reject) => {
+                sendSocket.end((error) => error ? reject(error) : resolve());
+              });
             }
+            return finishPromise;
+          };
+          sendSocket.on('error', (error) => {
+            logger.error(() => `Error sending data to device: ${error}`);
+            this._closeContext(context);
           });
-          clientSocket.resume();
+          clientSocket.pipe(sendSocket);
         }
 
         // Handle client socket closure (common for all protocols)
         clientSocket.once('end', () => {
           logger.info(() => 'Client disconnected');
-          closeRemoteRef();
+          finishClientWrites();
         });
       });
       server._diodeClosed = false;

@@ -107,4 +107,14 @@ test('network discovery timeout safely closes a still-connecting WebSocket', asy
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(FakeWebSocket.instances.length, 1);
   assert.equal(FakeWebSocket.instances[0].closed, true);
+  assert.equal(FakeWebSocket.instances[0].options.autoSelectFamily, false);
+});
+
+test('discovery avoids multi-address racing without forcing IPv4 for explicit IPv6 endpoints', async () => {
+  const { fetchNetworkDirectory, FakeWebSocket } = loadWithFakeWebSocket();
+  const endpoint = 'ws://[2001:db8::1]:8443/ws';
+  assert.deepEqual(await fetchNetworkDirectory({ endpoint }), []);
+  assert.equal(FakeWebSocket.instances[0].endpoint, endpoint);
+  assert.equal(FakeWebSocket.instances[0].options.autoSelectFamily, false);
+  assert.equal(FakeWebSocket.instances[0].options.family, undefined);
 });

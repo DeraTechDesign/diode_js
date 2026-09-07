@@ -6,7 +6,8 @@ const dgram = require('dgram');
 const fs = require('fs');
 const { Buffer } = require('buffer');
 const EventEmitter = require('events');
-const { Duplex } = require('stream');
+const DiodeSocket = require('./diodeSocket');
+const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBackpressure');
 const DiodeRPC = require('./rpc');
 const { makeReadable, parseUInt, toBufferView } = require('./utils');
 const nativeCrypto = require('./nativeCrypto');
@@ -169,57 +170,6 @@ function normalizePublishedPortConfig(config = {}) {
   return { mode, whitelist, host };
 }
 
-class DiodeSocket extends Duplex {
-  constructor(ref, rpc, timeoutMs = 10000) {
-    super({ readableHighWaterMark: 256 * 1024, writableHighWaterMark: 256 * 1024, allowHalfOpen: false });
-    this.ref = ref;
-    this.rpc = rpc;
-    this.timeoutMs = timeoutMs;
-    this._inboundQueue = [];
-    this._inboundBytes = 0;
-    this._inboundBlocked = false;
-  }
-
-  _write(chunk, encoding, callback) {
-    // Send data to the Diode client via portSend
-    this.rpc.portSend(this.ref, chunk, { timeoutMs: this.timeoutMs })
-      .then(() => callback())
-      .catch((err) => callback(err));
-  }
-
-  _read(size) {
-    this._inboundBlocked = false;
-    while (!this._inboundBlocked && this._inboundQueue.length > 0 && !this.destroyed) {
-      const chunk = this._inboundQueue.shift();
-      this._inboundBytes -= chunk.length;
-      this._inboundBlocked = this.push(chunk) === false;
-    }
-  }
-
-  // Method to push data received from Diode client
-  pushData(data) {
-    if (this.destroyed) return false;
-    if (!this._inboundBlocked && this._inboundQueue.length === 0) {
-      this._inboundBlocked = this.push(data) === false;
-      return !this._inboundBlocked;
-    }
-    const copy = Buffer.from(data);
-    this._inboundQueue.push(copy);
-    this._inboundBytes += copy.length;
-    if (this._inboundBytes > MAX_NATIVE_QUEUE_BYTES) {
-      this.destroy(new Error('Diode publish TLS queue limit exceeded'));
-      return false;
-    }
-    return false;
-  }
-
-  _destroy(error, callback) {
-    this._inboundQueue.length = 0;
-    this._inboundBytes = 0;
-    callback(error);
-  }
-}
-
 class PublishPort extends EventEmitter {
   constructor(connection, publishedPorts, _certPath = null) {
     super();
@@ -379,9 +329,11 @@ class PublishPort extends EventEmitter {
     this._trackedConnectionInfos.delete(info);
     if (info._cleaned) return;
     info._cleaned = true;
+    releaseRelayBackpressure(info._inboundState);
     const rpc = this._getRpcFor(connection);
     const sockets = new Set([
       info.diodeSocket,
+      info.sendSocket,
       info.tlsSocket,
       info.socket,
       info.localSocket,
@@ -399,7 +351,7 @@ class PublishPort extends EventEmitter {
     if (!canInspectCurrent || currentInfo === info) {
       try { connection.deleteConnection(ref); } catch (_) {}
     }
-    if (notifyRemote && !refWasReused && rpc && ref && !info._remoteCloseStarted) {
+    if (notifyRemote && !info._remoteEnded && !refWasReused && rpc && ref && !info._remoteCloseStarted) {
       info._remoteCloseStarted = true;
       void Promise.resolve(rpc.portClose(ref, { timeoutMs: this.backendConnectTimeoutMs })).catch(() => {});
     }
@@ -418,7 +370,11 @@ class PublishPort extends EventEmitter {
     const socket = info && (info.socket || info.localSocket);
     if (!socket || socket.destroyed) return;
     if (!info._inboundState) {
-      info._inboundState = { blocked: false, draining: false, queued: [], bytes: 0 };
+      info._inboundState = {
+        blocked: false, draining: false, queued: [], bytes: 0,
+        relayReadTimeoutMs: this.ioTimeoutMs,
+        onRelayReadStall: (error) => destroySocket(socket, error),
+      };
     }
     const state = info._inboundState;
     const scheduleDrain = () => {
@@ -432,6 +388,8 @@ class PublishPort extends EventEmitter {
           state.bytes -= chunk.length;
           state.blocked = socket.write(chunk) === false;
         }
+        updateRelayBackpressure(connection, state, state.bytes);
+        if (state.ending && !state.blocked && state.queued.length === 0) socket.end();
         scheduleDrain();
       });
     };
@@ -439,6 +397,7 @@ class PublishPort extends EventEmitter {
       const copy = Buffer.from(data);
       state.queued.push(copy);
       state.bytes += copy.length;
+      updateRelayBackpressure(connection, state, state.bytes);
       if (state.bytes > MAX_NATIVE_QUEUE_BYTES) {
         this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: true });
         return;
@@ -615,7 +574,7 @@ class PublishPort extends EventEmitter {
       void Promise.resolve(rpc.sendError(sessionId, ref, 'No device certificate available')).catch(() => {});
       return;
     }
-    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
+    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs, connection);
 
     const tlsOptions = {
       cert: certPem,
@@ -1159,25 +1118,30 @@ class PublishPort extends EventEmitter {
     if (protocol === 'udp') {
       
     } else {
-      localSocket.on('data', (data) => {
-        // When data is received from the local service, send it back via Diode
-        localSocket.pause();
-        rpc.portSend(ref, data, { timeoutMs: this.ioTimeoutMs })
-          .then(() => {
-            if (!localSocket.destroyed) {
-              localSocket.resume();
-            }
-          })
-          .catch((error) => {
-            logger.error(() => `Error sending data to device: ${error}`);
-            localSocket.destroy();
-          });
+      const info = connectionInfo || connection.getConnection(ref);
+      const sendSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
+      if (info) info.sendSocket = sendSocket;
+      const cleanup = (notifyRemote = true) => {
+        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote });
+        destroySocket(sendSocket);
+        destroySocket(localSocket);
+      };
+      let finishing = false;
+      const finishWrites = () => {
+        if (finishing) return;
+        finishing = true;
+        // The backend may close with a final response still in the send window.
+        // _final waits for every relay ACK before the ref can be closed.
+        sendSocket.end(() => cleanup());
+      };
+      sendSocket.on('error', (error) => {
+        logger.error(() => `Error sending data to device: ${error}`);
+        cleanup();
       });
-
-      localSocket.on('end', () => {
-        logger.info(() => `Local service disconnected`);
-        const info = connectionInfo || connection.getConnection(ref);
-        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: true });
+      localSocket.on('end', finishWrites);
+      localSocket.on('close', (hadError) => {
+        if (hadError || localSocket.readableAborted) cleanup();
+        else finishWrites();
       });
 
       localSocket.on('error', (err) => {
@@ -1187,9 +1151,9 @@ class PublishPort extends EventEmitter {
           opening.responded = true;
           void Promise.resolve(rpc.sendError(opening.sessionId, ref, 'Local service connection failed')).catch(() => {});
         }
-        const info = connectionInfo || connection.getConnection(ref);
-        this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: !failedDuringOpen });
+        cleanup(!failedDuringOpen);
       });
+      localSocket.pipe(sendSocket);
     }
   }
 
@@ -1205,7 +1169,7 @@ class PublishPort extends EventEmitter {
     let localSocket;
     let connectionInfo = null;
     try {
-      localSocket = net.connect({ port, host: portConfig.host }, () => {
+      localSocket = net.connect({ port, host: portConfig.host, autoSelectFamily: false }, () => {
         if (this._closed || !connectionInfo || connectionInfo._cleaned || localSocket.destroyed) {
           destroySocket(localSocket);
           return;
@@ -1270,7 +1234,7 @@ class PublishPort extends EventEmitter {
       return;
     }
     // Create a DiodeSocket instance
-    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs);
+    const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs, connection);
 
     // TLS options with your server's certificate and key
     const tlsOptions = {
@@ -1303,7 +1267,7 @@ class PublishPort extends EventEmitter {
     let localSocket;
     let connectionInfo = null;
     try {
-      localSocket = net.connect({ port, host: portConfig.host }, () => {
+      localSocket = net.connect({ port, host: portConfig.host, autoSelectFamily: false }, () => {
         if (this._closed || !connectionInfo || connectionInfo._cleaned || localSocket.destroyed) {
           destroySocket(localSocket);
           return;
@@ -1364,7 +1328,9 @@ class PublishPort extends EventEmitter {
     });
 
     tlsSocket.on('close', () => {
-      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+      // Node must drain decrypted bytes queued for the backend before the
+      // local socket's close handler releases the connection resources.
+      if (!localSocket.destroyed) localSocket.end();
     });
     localSocket.on('error', (err) => {
       logger.error(() => `Local TLS backend error: ${err}`);
@@ -1375,9 +1341,15 @@ class PublishPort extends EventEmitter {
       }
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: !failedDuringOpen });
     });
-    localSocket.on('close', () => {
+    localSocket.on('close', (hadError) => {
       if (connectTimer) clearTimeout(connectTimer);
-      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+      if (!hadError && localSocket.readableEnded && !connectionInfo._cleaned) {
+        void diodeSocket.finishTlsWrites(tlsSocket)
+          .catch((error) => logger.debug(() => `Publish TLS write shutdown: ${error.message}`))
+          .finally(() => this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded }));
+      } else {
+        this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+      }
     });
     connectTimer = setTimeout(() => {
       if (responded) return;
@@ -1535,7 +1507,19 @@ class PublishPort extends EventEmitter {
 
     const connectionInfo = connection.getConnection(ref);
     if (connectionInfo) {
-      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+      connectionInfo._remoteEnded = true;
+      if (connectionInfo.protocol === 'tls' && typeof connectionInfo.diodeSocket?.endReadable === 'function') {
+        connectionInfo.diodeSocket.endReadable();
+      } else if (connectionInfo.protocol === 'tcp' && connectionInfo.socket) {
+        const state = connectionInfo._inboundState;
+        if (state && (state.blocked || state.queued.length > 0)) {
+          state.ending = true;
+        } else {
+          connectionInfo.socket.end();
+        }
+      } else {
+        this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
+      }
     }
   }
 }

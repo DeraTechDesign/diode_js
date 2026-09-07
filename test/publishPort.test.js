@@ -4,6 +4,7 @@ const EventEmitter = require('events');
 const net = require('net');
 const tls = require('tls');
 const dgram = require('dgram');
+const { PassThrough } = require('node:stream');
 
 const PublishPort = require('../publishPort');
 const nativeCrypto = require('../nativeCrypto');
@@ -395,31 +396,47 @@ test('TCP publish connects to configured host', () => {
   }
 
   assert.equal(connectCalls.length, 1);
-  assert.deepEqual(connectCalls[0], { port: 8080, host: '192.168.1.10' });
+  assert.deepEqual(connectCalls[0], { port: 8080, host: '192.168.1.10', autoSelectFamily: false });
 });
 
-test('TCP publish pauses local service socket while portSend is in flight', async () => {
+for (const payloadBytes of [128 * 1024, 1024 * 1024]) {
+test(`TCP publish pipelines a bounded window and flushes ${payloadBytes} final backend bytes before closing`, async (t) => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, [8080]);
-  const localSocket = new FakeStreamSocket();
+  const localSocket = new PassThrough();
   const send = deferred();
   connection.RPC.portSend = async (...args) => {
     connection.portSendCalls.push(args);
     return send.promise;
   };
 
-  publishPort.setupLocalSocketHandlers(localSocket, makeRef('04'), 'tcp', connection.RPC, connection);
-  localSocket.emit('data', Buffer.from('hello'));
+  const ref = makeRef('04');
+  const info = { socket: localSocket, protocol: 'tcp' };
+  connection.addConnection(ref, info);
+  publishPort.setupLocalSocketHandlers(localSocket, ref, 'tcp', connection.RPC, connection);
+  t.after(() => {
+    send.resolve();
+    info.sendSocket.destroy();
+    localSocket.destroy();
+    publishPort.stopListening();
+  });
+  const payload = Buffer.alloc(payloadBytes);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  localSocket.end(payload);
 
-  await waitFor(() => connection.portSendCalls.length === 1);
-  assert.equal(localSocket.pauseCalls, 1);
-  assert.equal(localSocket.resumeCalls, 0);
+  await waitFor(() => connection.portSendCalls.length > 1);
+  if (payloadBytes > 256 * 1024) assert.equal(localSocket.isPaused(), true);
+  else await waitFor(() => localSocket.readableEnded);
+  assert.ok(connection.portSendCalls.length <= 16);
+  assert.ok(info.sendSocket._sendingBytes <= 256 * 1024);
+  assert.equal(connection.portCloseCalls.length, 0);
 
   send.resolve();
-  await waitFor(() => localSocket.resumeCalls === 1);
-
-  publishPort.stopListening();
+  await waitFor(() => connection.portCloseCalls.length === 1);
+  assert.deepEqual(Buffer.concat(connection.portSendCalls.map(([, frame]) => frame)), payload);
+  assert.equal(connection.getConnection(ref), undefined);
 });
+}
 
 test('TLS publish backend socket connects to configured host', () => {
   const connection = new FakeConnection();
@@ -451,7 +468,7 @@ test('TLS publish backend socket connects to configured host', () => {
   }
 
   assert.equal(connectCalls.length, 1);
-  assert.deepEqual(connectCalls[0], { port: 8443, host: 'backend.internal' });
+  assert.deepEqual(connectCalls[0], { port: 8443, host: 'backend.internal', autoSelectFamily: false });
 });
 
 test('UDP publish stores and sends to configured host', () => {
@@ -728,7 +745,7 @@ test('handlePortOpen preserves localhost default when host is omitted', () => {
     publishPort.stopListening();
   }
 
-  assert.deepEqual(connectCalls[0], { port: 8081, host: '127.0.0.1' });
+  assert.deepEqual(connectCalls[0], { port: 8081, host: '127.0.0.1', autoSelectFamily: false });
 });
 
 test('handlePortOpen rejects non-whitelisted devices before connecting', () => {

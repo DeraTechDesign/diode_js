@@ -178,6 +178,7 @@ class DiodeClientManager extends EventEmitter {
     this.serverIdToConnection = new Map();
     this.pendingConnections = new Map();
     this.pendingProbes = new Map();
+    this.pendingDeviceResolutions = new Map();
     this.deviceRelayCache = new Map();
     this.relayScores = new Map();
     this._rpcByConnection = new Map();
@@ -185,6 +186,10 @@ class DiodeClientManager extends EventEmitter {
     this._rrIndex = 0;
     this._relayScoreFlushTimer = null;
     this._backgroundWarmupPromise = null;
+    this._startupWorkPromise = null;
+    this._startupWorkActive = false;
+    this._startupReadyPromise = null;
+    this._rejectStartupReady = null;
     this._lastProbeStartedAt = new Map();
     this._startupCoverageComplete = false;
     this._lastNetworkDiscoveryStats = null;
@@ -219,9 +224,11 @@ class DiodeClientManager extends EventEmitter {
     const legacyWarmConnections = parsePositiveInteger(relaySelection.desiredWarmConnections, NaN);
     return {
       enabled: parseBoolean(relaySelection.enabled, true),
-      startupConcurrency: parsePositiveInteger(relaySelection.startupConcurrency, 2),
+      startupConcurrency: parsePositiveInteger(relaySelection.startupConcurrency, 3),
       minReadyConnections: parsePositiveInteger(relaySelection.minReadyConnections, 2),
       probeTimeoutMs: parsePositiveInteger(relaySelection.probeTimeoutMs, 1200),
+      connectionTimeoutMs: parsePositiveInteger(relaySelection.connectionTimeoutMs, 5000),
+      targetConnectTimeoutMs: parsePositiveInteger(relaySelection.targetConnectTimeoutMs, 10000),
       deviceLookupTimeoutMs: parsePositiveInteger(relaySelection.deviceLookupTimeoutMs, 3000),
       warmConnectionBudget: parsePositiveInteger(
         relaySelection.warmConnectionBudget,
@@ -1300,6 +1307,14 @@ class DiodeClientManager extends EventEmitter {
         || Number(connection._diodeActiveNativeSessions || 0) > 0) {
         return true;
       }
+      // Opening a tunnel is already active use even before the relay returns
+      // its ref and BindPort/PublishPort can register the socket.
+      if (connection.pendingRequests) {
+        for (const request of connection.pendingRequests.values()) {
+          const command = request && request.commandArray && request.commandArray[0];
+          if (command === 'portopen' || command === 'portopen2') return true;
+        }
+      }
     }
     for (const cached of this.deviceRelayCache.values()) {
       const ttlMs = Number.isFinite(cached.ttlMs) ? cached.ttlMs : this.deviceCacheTtlMs;
@@ -1451,7 +1466,9 @@ class DiodeClientManager extends EventEmitter {
       try {
         const connection = await this._withTimeout(
           () => this._ensureConnection(hostKey),
-          this.relaySelection.probeTimeoutMs,
+          discoveredFrom === 'target'
+            ? this.relaySelection.targetConnectTimeoutMs
+            : this.relaySelection.connectionTimeoutMs,
           `Relay connection for ${hostKey}`,
           () => {
             const stalledConnection = this.connectionByHost.get(hostKey);
@@ -1459,7 +1476,9 @@ class DiodeClientManager extends EventEmitter {
             this.pendingConnections.delete(hostKey);
           }
         );
-        const probedConnection = await this._probeConnection(connection, hostKey, discoveredFrom, startedAt);
+        // Rank network RTT rather than DNS/TLS/ticket setup time; a cold
+        // connection to a nearby relay must not look slower than a warm one.
+        const probedConnection = await this._probeConnection(connection, hostKey, discoveredFrom, Date.now());
         this._pruneIdleConnections();
         return probedConnection;
       } catch (error) {
@@ -1591,7 +1610,7 @@ class DiodeClientManager extends EventEmitter {
   }
 
   _setDeviceCacheEntry(deviceIdHex, entry) {
-    if (this.deviceCacheTtlMs <= 0 || !deviceIdHex || !entry) {
+    if (this._closed || this.deviceCacheTtlMs <= 0 || !deviceIdHex || !entry) {
       return;
     }
     this.deviceRelayCache.set(deviceIdHex, {
@@ -1855,7 +1874,42 @@ class DiodeClientManager extends EventEmitter {
     return bestCandidate;
   }
 
-  async connect() {
+  connect() {
+    if (this._closed) return Promise.reject(new Error('Diode client manager is closed'));
+    if (this._startupReadyPromise) return this._startupReadyPromise;
+    if (this._connectedConnections().length > 0) return Promise.resolve(this);
+
+    // One completed TLS/ticket handshake is enough to use the network. Keep
+    // measuring the remaining relays in the background; pruning still waits
+    // for startup coverage, preserving region diversity and active tunnels.
+    let onConnected;
+    const ready = new Promise((resolve, reject) => {
+      this._rejectStartupReady = reject;
+      onConnected = (connection) => {
+        if (!this._closed && isConnected(connection)) resolve(this);
+      };
+      this.on('connected', onConnected);
+      const work = this._startupWorkActive
+        ? this._startupWorkPromise
+        : this._connectAndWarmRelays();
+      if (!this._startupWorkActive) {
+        this._startupWorkPromise = work;
+        this._startupWorkActive = true;
+        const finishWork = () => { this._startupWorkActive = false; };
+        work.then(finishWork, finishWork);
+      }
+      work.then(resolve, reject);
+    });
+    const result = ready.finally(() => {
+      this.off('connected', onConnected);
+      this._rejectStartupReady = null;
+      if (this._startupReadyPromise === result) this._startupReadyPromise = null;
+    });
+    this._startupReadyPromise = result;
+    return result;
+  }
+
+  async _connectAndWarmRelays() {
     if (this._closed) {
       throw new Error('Diode client manager is closed');
     }
@@ -1867,6 +1921,7 @@ class DiodeClientManager extends EventEmitter {
       const results = await Promise.allSettled(
         this.initialHosts.map((host) => this._ensureConnection(host))
       );
+      if (this._closed) throw new Error('Diode client manager closed during startup');
 
       const success = results.some((result) => result.status === 'fulfilled');
       if (!success) {
@@ -1894,7 +1949,8 @@ class DiodeClientManager extends EventEmitter {
       );
 
       const successes = results.filter((result) => result.status === 'fulfilled');
-      if (successes.length === 0) {
+      if (this._closed) throw new Error('Diode client manager closed during startup');
+      if (successes.length === 0 && this._connectedConnections().length === 0) {
         const errorMessages = results
           .filter((result) => result.status === 'rejected')
           .map((result) => result.reason && result.reason.message ? result.reason.message : String(result.reason));
@@ -1915,6 +1971,7 @@ class DiodeClientManager extends EventEmitter {
     );
     const candidatesPromise = this._buildStartupCandidates();
     const [bootstrapResults, candidates] = await Promise.all([bootstrapCoveragePromise, candidatesPromise]);
+    if (this._closed) throw new Error('Diode client manager closed during startup');
 
     const startupNetworkCandidates = this._selectStartupNetworkCandidates(candidates);
     const useReducedSeedCoverage = (
@@ -1965,7 +2022,8 @@ class DiodeClientManager extends EventEmitter {
     const results = [...bootstrapResults, ...additionalRequiredResults, ...networkResults];
 
     const successes = results.filter((result) => result.status === 'fulfilled');
-    if (successes.length === 0) {
+    if (this._closed) throw new Error('Diode client manager closed during startup');
+    if (successes.length === 0 && this._connectedConnections().length === 0) {
       const errorMessages = results
         .filter((result) => result.status === 'rejected')
         .map((result) => result.reason && result.reason.message ? result.reason.message : String(result.reason));
@@ -2000,6 +2058,25 @@ class DiodeClientManager extends EventEmitter {
   }
 
   async getConnectionForDevice(deviceId) {
+    if (this._closed) throw new Error('Diode client manager is closed');
+    const deviceIdBuffer = normalizeAddress(deviceId);
+    if (!deviceIdBuffer) throw new Error('Invalid device ID');
+    const key = deviceIdBuffer.toString('hex');
+    const existing = this.pendingDeviceResolutions.get(key);
+    if (existing) return existing;
+
+    // Applications often open several TCP sockets together. Share the device
+    // ticket/node lookup and relay handshake while keeping their tunnels distinct.
+    const resolution = this._getConnectionForDevice(deviceIdBuffer).finally(() => {
+      if (this.pendingDeviceResolutions.get(key) === resolution) {
+        this.pendingDeviceResolutions.delete(key);
+      }
+    });
+    this.pendingDeviceResolutions.set(key, resolution);
+    return resolution;
+  }
+
+  async _getConnectionForDevice(deviceId) {
     const deviceIdBuffer = normalizeAddress(deviceId);
     if (!deviceIdBuffer) {
       throw new Error('Invalid device ID');
@@ -2139,6 +2216,10 @@ class DiodeClientManager extends EventEmitter {
     if (this._closed) return;
     this._closed = true;
     this._lifecycleGeneration += 1;
+    if (this._rejectStartupReady) {
+      this._rejectStartupReady(new Error('Diode client manager closed during startup'));
+      this._rejectStartupReady = null;
+    }
     if (this._relayScoreFlushTimer) {
       clearTimeout(this._relayScoreFlushTimer);
       this._relayScoreFlushTimer = null;
@@ -2149,6 +2230,7 @@ class DiodeClientManager extends EventEmitter {
     }
     this.pendingConnections.clear();
     this.pendingProbes.clear();
+    this.pendingDeviceResolutions.clear();
     this.deviceRelayCache.clear();
   }
 }

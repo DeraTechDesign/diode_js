@@ -56,6 +56,9 @@ function fetchNetworkDirectory(options = {}) {
     };
 
     socket = new WebSocket(endpoint, {
+      // Avoid the Node 20.11 multi-address cancellation assertion when the
+      // directory deadline closes a socket that is still connecting.
+      autoSelectFamily: false,
       handshakeTimeout: timeoutMs,
       origin: 'https://diode.io',
     });

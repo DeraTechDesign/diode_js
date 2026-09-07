@@ -3,6 +3,7 @@ const tls = require('tls');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
+const { isRelayInputPaused } = require('./relayBackpressure');
 const {
   makeReadable,
   parseRequestId,
@@ -133,6 +134,7 @@ class DiodeConnection extends EventEmitter {
     this._lastDisconnectedGeneration = -1;
     this._lifecycleGeneration = 0;
     this._deferredUnsolicited = new Set();
+    this._queuedUnsolicited = [];
     
     // Add maps for storing client sockets and connections
     this.clientSockets = new Map(); // For BindPort
@@ -274,6 +276,10 @@ class DiodeConnection extends EventEmitter {
       // Generate a temporary certificate valid for 1 month.
       this.certPem = generateCert(this.keyPair.prvKeyObj, this.keyPair.pubKeyObj);
       const options = {
+        // Node 20.11's multi-address connector can assert when a timed-out
+        // probe destroys the socket. Keep cancellation on the single-address
+        // path, including on older packaged runtimes. Explicit IPv6 still works.
+        autoSelectFamily: false,
         cert: this.certPem,
         key: this.certPem,
         rejectUnauthorized: false,
@@ -504,6 +510,7 @@ class DiodeConnection extends EventEmitter {
     this.receiveBuffer = Buffer.alloc(0);
     for (const immediate of this._deferredUnsolicited) clearImmediate(immediate);
     this._deferredUnsolicited.clear();
+    this._queuedUnsolicited.length = 0;
     this._rejectPendingRequests(error);
 
     const clientSockets = Array.from(this.clientSockets.values());
@@ -704,13 +711,21 @@ class DiodeConnection extends EventEmitter {
     // A relay may coalesce a portopen response and the first portsend into one
     // TLS data event. Promise continuations need to finish registering the new
     // ref before the unsolicited payload is delivered.
+    this._queuedUnsolicited.push({ message, generation });
+    this._scheduleUnsolicitedDrain();
+  }
+
+  _scheduleUnsolicitedDrain() {
+    if (this._deferredUnsolicited.size > 0 || this._queuedUnsolicited.length === 0 || isRelayInputPaused(this)) return;
     const immediate = setImmediate(() => {
       this._deferredUnsolicited.delete(immediate);
-      if (
-        generation !== this._socketGeneration ||
-        generation === this._lastDisconnectedGeneration
-      ) return;
-      this.emit('unsolicited', message);
+      // The physical socket is already paused. Stop the current decoded batch
+      // too, preserving byte order without delivering more to a blocked reader.
+      while (this._queuedUnsolicited.length > 0 && !isRelayInputPaused(this)) {
+        const { message, generation } = this._queuedUnsolicited.shift();
+        if (generation !== this._socketGeneration || generation === this._lastDisconnectedGeneration) continue;
+        this.emit('unsolicited', message);
+      }
     });
     this._deferredUnsolicited.add(immediate);
   }

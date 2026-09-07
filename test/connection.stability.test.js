@@ -9,6 +9,7 @@ const { RLP } = require('@ethereumjs/rlp');
 
 const DiodeConnection = require('../connection');
 const DiodeRPC = require('../rpc');
+const { updateRelayBackpressure, releaseRelayBackpressure } = require('../relayBackpressure');
 
 function makeConnection() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'diode-connection-stability-'));
@@ -57,6 +58,67 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+test('decoded unsolicited batch stops at relay pressure and resumes in byte order', async () => {
+  const connection = makeConnection();
+  const socket = prepareTransport(connection);
+  socket.pause = () => {};
+  socket.resume = () => {};
+  const consumer = {};
+  const received = [];
+  connection.on('unsolicited', (message) => {
+    received.push(message);
+    if (message === 1) updateRelayBackpressure(connection, consumer, 256 * 1024);
+  });
+  try {
+    for (const message of [1, 2, 3]) connection._deferUnsolicited(message);
+    assert.equal(connection._deferredUnsolicited.size, 1, 'one callback for the decoded batch');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(received, [1]);
+    assert.equal(connection._queuedUnsolicited.length, 2);
+    assert.equal(connection._deferredUnsolicited.size, 0, 'paused dispatch must not spin');
+    releaseRelayBackpressure(consumer);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(received, [1, 2, 3]);
+    assert.equal(connection._queuedUnsolicited.length, 0);
+    updateRelayBackpressure(connection, consumer, 256 * 1024);
+    connection._deferUnsolicited(4);
+    connection.close();
+    releaseRelayBackpressure(consumer);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(received, [1, 2, 3], 'disconnect discards the old generation batch');
+    assert.equal(connection._queuedUnsolicited.length, 0);
+  } finally {
+    releaseRelayBackpressure(consumer);
+    connection.close();
+  }
+});
+
+test('relay TLS disables multi-address racing and preserves an explicit IPv6 host', async () => {
+  const originalConnect = tls.connect;
+  const connection = makeConnection();
+  connection.host = '2001:db8::1';
+  const socket = makeWritableSocket();
+  let connectOptions;
+  tls.connect = (port, host, options) => {
+    assert.equal(host, '2001:db8::1');
+    assert.equal(port, 41046);
+    connectOptions = options;
+    return socket;
+  };
+  try {
+    const connecting = connection.connect();
+    const rejected = assert.rejects(connecting, { code: 'DIODE_DISCONNECTED' });
+    assert.equal(connectOptions.autoSelectFamily, false);
+    assert.equal(connectOptions.family, undefined, 'must not force IPv4 on IPv6 relays');
+    connection.close();
+    await rejected;
+    assert.equal(socket.destroyed, true);
+  } finally {
+    connection.close();
+    tls.connect = originalConnect;
+  }
+});
 
 test('coalesced portopen response defers first portsend until ref registration completes', async () => {
   const connection = makeConnection();

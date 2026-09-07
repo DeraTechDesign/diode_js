@@ -1,5 +1,35 @@
 # DiodeJs
 
+### API transport stability
+
+API TCP and TLS streams use an ordered send window capped at 256 KiB and 16
+unacknowledged frames per direction. This avoids waiting a full relay round trip
+for every write while preserving Node stream backpressure. Frames remain below
+the 65,535-byte wire limit; failed stream data is never replayed. Graceful EOF
+drains queued data on both endpoints before closing the remote ref. Errors,
+relay disconnects, access revocation, and explicit disposal still tear down the
+session immediately.
+
+Slow local readers apply receive pressure at 256 KiB of queued data and release
+it below 128 KiB, keeping the existing 1 MiB queue limit. API tunnels multiplex
+one relay TCP socket, so a paused reader can briefly delay other tunnels on that
+relay. Every blocked consumer must drain or close before reads resume. A reader
+making no queue progress for the I/O timeout (10 seconds by default) is closed;
+progressing readers refresh that deadline. Disconnects discard the old relay's
+queued frames and cannot resume a replacement socket.
+
+The transport uses JavaScript with Node's built-in streams, TCP, and TLS. No new
+native addon or `portopen2` transport is required. Run
+`node scripts/benchmark-api-tls.js` for a local real-TLS comparison with simulated
+40/80 ms relay acknowledgment latency. Its results are not public-network speed
+measurements. `node --test test/apiTls.integration.test.js` checks client-first
+binary traffic, backpressure, EOF in both directions, and asynchronous failures
+for API TCP and TLS.
+
+To verify the existing crypto dependencies' JavaScript fallbacks, run
+`node --require ./test/fixtures/no-native-addons.cjs --test test/apiTls.integration.test.js`.
+This blocks loading `.node` addons while exercising the same real TCP/TLS tests.
+
 ## Overview
 `diodejs` is a JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.
 
@@ -93,9 +123,9 @@ If `fleetContract` is omitted, tickets continue using the default contract `0x60
 
 You can connect to multiple Diode relays and automatically route binds to the relay where the target device is connected.
 
-`DiodeClientManager` now ranks relays by observed latency. On startup it probes the required candidate set, persists relay scores to disk, and prefers the lowest-latency connected relay for control-plane RPC calls. It does not ping the full network at startup.
+`DiodeClientManager` ranks relays by observed ping latency, excluding DNS, TLS, and ticket setup time. `connect()` resolves as soon as one relay completes its authenticated handshake. Remaining candidate measurements continue in the background, persist relay scores to disk, and improve the preferred relay for control-plane RPC calls. Idle pruning waits for startup coverage and preserves active tunnels and pending tunnel opens.
 
-When neither `host` nor `hosts` is specified, the manager starts from the default seed pool, any discovery-provider candidates, built-in `dio_network` candidates, and previously successful non-provider relays saved in `relay-scores.json`. Without live network discovery it probes all default seeds once. When live network discovery returns usable relays, startup resolves from a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues measuring the remaining seeds in the background while keeping region diversity in the warm set. If you pass `host` or `hosts`, startup stays constrained to those configured relays unless you explicitly opt into using the discovery provider alongside them.
+When neither `host` nor `hosts` is specified, the manager starts from the default seed pool, any discovery-provider candidates, built-in `dio_network` candidates, and previously successful non-provider relays saved in `relay-scores.json`. Without live network discovery it probes all default seeds once. When live network discovery returns usable relays, coverage uses a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues measuring the remaining seeds while keeping region diversity in the warm set. If you pass `host` or `hosts`, startup stays constrained to those configured relays unless you explicitly opt into using the discovery provider alongside them.
 
 ```javascript
 const { DiodeClientManager, BindPort } = require('diodejs');
@@ -118,9 +148,11 @@ You can tune relay selection if needed:
 const client = new DiodeClientManager({
   keyLocation: './db/keys.json',
   relaySelection: {
-    startupConcurrency: 2,
+    startupConcurrency: 3,
     minReadyConnections: 2,
     probeTimeoutMs: 1200,
+    connectionTimeoutMs: 5000,
+    targetConnectTimeoutMs: 10000,
     warmConnectionBudget: 3,
     probeAllInitialCandidates: true,
     continueProbingUntestedSeeds: true,
@@ -368,9 +400,11 @@ main();
   - `options.deviceCacheTtlMs` (number, optional): Cache TTL for device relay resolution (default: `30000`).
   - `options.relaySelection` (object, optional): Relay ranking and probing options.
     - `enabled` (boolean, optional): Enables smart relay ranking. Defaults to `true`.
-    - `startupConcurrency` (number, optional): Parallel startup probe limit. Defaults to `2`.
+    - `startupConcurrency` (number, optional): Parallel startup probe limit. Defaults to `3`, allowing one seed from each default region to begin together.
     - `minReadyConnections` (number, optional): Minimum target connection count for the startup probe set. Defaults to `2`.
     - `probeTimeoutMs` (number, optional): Ping timeout for relay probes. Defaults to `1200`.
+    - `connectionTimeoutMs` (number, optional): DNS/TLS/ticket setup timeout for startup and background relay probes. Defaults to `5000`.
+    - `targetConnectTimeoutMs` (number, optional): Setup timeout for a relay resolved from a target device ticket. Defaults to `10000`.
     - `warmConnectionBudget` (number, optional): Maximum number of idle control relays to keep after startup coverage completes. Defaults to `3`.
     - `probeAllInitialCandidates` (boolean, optional): Probes all initial configured/default candidates once before final startup ranking is trusted. Defaults to `true`.
     - `continueProbingUntestedSeeds` (boolean, optional): Continues probing untested candidates after startup coverage completes. Defaults to `true`.
@@ -399,10 +433,10 @@ main();
     - `scoreCachePath` (string|null, optional): Relay score cache file. Defaults to `./db/relay-scores.json` next to `keyLocation`. Set to `null` to disable persistence.
 
 - **Methods**:
-  - `connect()`: Probes the required initial relays, merges provider and optional `dio_network` candidates, ranks the successful relays by latency, trims the warm relay set, and returns a promise. In live network discovery mode this starts from a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues probing the remaining seeds in the background.
+  - `connect()`: Returns a promise that resolves with the manager when the first relay completes its TLS and ticket handshake. Remaining seed/provider/network measurements continue in the background; idle pruning waits for the required coverage to finish. Failed latency measurements do not discard an otherwise authenticated relay. Rejects if no relay can connect.
   - `setFleetContract(address)`: Updates the fleet contract used for future ticket generation on managed connections. Accepts a 20-byte EVM address hex string and returns the manager instance.
   - `getNearestConnection()`: Returns the preferred connected relay. With relay selection enabled, this is the lowest-latency scored relay.
-  - `getConnectionForDevice(deviceId)`: Resolves and returns a relay connection for the device. Returns a promise.
+  - `getConnectionForDevice(deviceId)`: Resolves and returns a relay connection for the device. Returns a promise. Concurrent requests for the same device share the ticket/node lookup and relay handshake; each bind still opens its own tunnel.
   - `getConnections()`: Returns a list of active connections.
   - `close()`: Closes all managed connections.
 

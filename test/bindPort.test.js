@@ -401,7 +401,8 @@ test('API bind closes ref when local TCP client disconnects after portopen retur
   }
 });
 
-test('API bind pauses local TCP socket while portSend is in flight', async () => {
+for (const payloadBytes of [128 * 1024, 1024 * 1024]) {
+test(`API TCP bind pipelines a bounded send window and flushes ${payloadBytes} final bytes before closing`, async () => {
   const calls = [];
   const send = deferred();
   const ref = makeRef('12131415');
@@ -433,20 +434,35 @@ test('API bind pauses local TCP socket while portSend is in flight', async () =>
     await once(client, 'connect');
     await waitFor(() => relay.hasClientSocket(ref));
 
-    client.write(Buffer.from('hello'));
-    await waitFor(() => portSendCalls.length === 1);
+    const payload = Buffer.alloc(payloadBytes);
+    for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+    client.end(payload);
+    await waitFor(() => portSendCalls.length > 1);
 
     const acceptedSocket = relay.getClientSocket(ref);
-    assert.equal(acceptedSocket.isPaused(), true);
+    if (payloadBytes > 256 * 1024) {
+      await waitFor(() => acceptedSocket.isPaused());
+      assert.equal(acceptedSocket.isPaused(), true);
+    } else {
+      await waitFor(() => acceptedSocket.readableEnded);
+    }
+    assert.ok(portSendCalls.length <= 16);
+    assert.ok(portSendCalls.reduce((bytes, [, frame]) => bytes + frame.length, 0) <= 256 * 1024);
+    assert.equal(relay.portCloseCalls.length, 0, 'outstanding frames keep the ref alive');
 
     send.resolve();
-    await waitFor(() => acceptedSocket.isPaused() === false);
+    await waitFor(() => relay.portCloseCalls.length === 1);
+    assert.deepEqual(Buffer.concat(portSendCalls.map(([, frame]) => frame)), payload);
+    assert.equal(relay.hasClientSocket(ref), false);
 
     client.destroy();
   } finally {
+    send.resolve();
+    bind.closeAllServers();
     server.close();
   }
 });
+}
 
 test('API portopen deadline advances to the next relay when one hangs', async () => {
   const calls = [];
