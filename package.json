@@ -1,6 +1,6 @@
 {
   "name": "diodejs",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "A JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.",
   "main": "index.js",
   "files": [
@@ -11,6 +11,7 @@
     "index.js",
     "logger.js",
     "nativeCrypto.js",
+    "nativeTcpBridge.js",
     "networkDiscoveryClient.js",
     "publishPort.js",
     "rpc.js",

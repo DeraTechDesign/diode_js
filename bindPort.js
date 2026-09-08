@@ -8,6 +8,7 @@ const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBa
 const EventEmitter = require('events');
 const DiodeRPC = require('./rpc');
 const nativeCrypto = require('./nativeCrypto');
+const { bridgeNativeTcp } = require('./nativeTcpBridge');
 const logger = require('./logger');
 
 const BIND_PORT_LISTENER_STATE = Symbol.for('diodejs.bindPort.listenerState');
@@ -447,7 +448,15 @@ class BindPort extends EventEmitter {
     return candidates;
   }
 
-  async _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
+  _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
+    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, false);
+  }
+
+  _openNativePortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
+    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, true);
+  }
+
+  async _openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, native) {
     let candidates = await this._getApiRelayCandidates(deviceId, deviceIdHex);
     let clearedCache = false;
     let lastError = null;
@@ -459,17 +468,19 @@ class BindPort extends EventEmitter {
 
       try {
         const ref = await this._withTimeout(
-          () => rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+          () => native
+            ? rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs })
+            : rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
           this.portOpenTimeoutMs,
-          `portopen ${formattedTargetPort} via ${relayKey}`
+          `${native ? 'portopen2' : 'portopen'} ${formattedTargetPort} via ${relayKey}`
         );
-        if (ref) {
+        if (native ? Number.isInteger(ref) && ref > 0 && ref <= 65535 : ref) {
           if (index > 0) {
             logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
           }
-          return { connection, rpc, ref };
+          return native ? { connection, rpc, physicalPort: ref } : { connection, rpc, ref };
         }
-        lastError = new Error(`portopen returned no ref via ${relayKey}`);
+        lastError = new Error(`${native ? 'portopen2 returned no valid port' : 'portopen returned no ref'} via ${relayKey}`);
       } catch (error) {
         lastError = error;
       }
@@ -524,6 +535,18 @@ class BindPort extends EventEmitter {
       }
     };
 
+    // The secure/read/write helpers install temporary error listeners. Keep
+    // one for the full channel lifetime, including the final relay ACK wait.
+    tlsSocket.on('error', (error) => {
+      logger.error(() => `Native handshake TLS socket error: ${error}`);
+      if (context) this._closeContext(context);
+      destroySocket(tlsSocket);
+      destroySocket(diodeSocket);
+      try {
+        if (connection.getClientSocket(ref) === socketWrapper) connection.deleteClientSocket(ref);
+      } catch (_) {}
+    });
+
     if (context) context.clientSocketWrapper = socketWrapper;
     this._replaceClientSocket(connection, ref, socketWrapper);
     if (context) {
@@ -577,6 +600,7 @@ class BindPort extends EventEmitter {
     let tlsSocket;
     let diodeSocket;
     let socketWrapper;
+    let handshakeComplete = false;
     try {
       if (context && context.closed) throw new Error('Native handshake was cancelled');
       ({ tlsSocket, socketWrapper } = await this._openTlsHandshakeChannel(
@@ -597,9 +621,11 @@ class BindPort extends EventEmitter {
         privateKey: connection.getPrivateKey()
       });
 
-      await nativeCrypto.writeHandshakeMessage(tlsSocket, message);
-
-      const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
+      const reading = nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
+      const [, peerMessage] = await Promise.all([
+        nativeCrypto.writeHandshakeMessage(tlsSocket, message),
+        reading,
+      ]);
       if (context && context.closed) throw new Error('Native handshake was cancelled');
       const verification = nativeCrypto.verifyHandshakeMessage(peerMessage, {
         expectedRole: 'publish',
@@ -621,9 +647,14 @@ class BindPort extends EventEmitter {
         physicalPort,
       });
 
+      handshakeComplete = true;
       return session;
     } finally {
-      try { if (tlsSocket) tlsSocket.end(); } catch {}
+      // TLS write callbacks can precede relay ACKs. Flush the authenticated
+      // exchange and close_notify before releasing its API ref.
+      if (handshakeComplete && diodeSocket && tlsSocket && !diodeSocket.destroyed) {
+        try { await diodeSocket.finishTlsWrites(tlsSocket); } catch (_) {}
+      }
       let currentWrapper;
       try { currentWrapper = connection.getClientSocket(ref); } catch {}
       const expectedWrapper = socketWrapper || (context && context.clientSocketWrapper);
@@ -640,6 +671,8 @@ class BindPort extends EventEmitter {
         if (tlsSocket) context.sockets.delete(tlsSocket);
         if (diodeSocket) context.sockets.delete(diodeSocket);
       }
+      destroySocket(tlsSocket);
+      destroySocket(diodeSocket);
     }
   }
   
@@ -838,17 +871,10 @@ class BindPort extends EventEmitter {
       let physicalPort;
       let relayInfo = null;
       try {
-        connection = await this._resolveConnectionForDevice(deviceId);
-        if (!connection) throw new Error(`No relay connection available for device ${deviceIdHex}`);
-        if (server._diodeClosed) throw new Error('UDP bind server closed during relay resolution');
-        rpc = this._getRpcFor(connection);
         const flags = config.flags || 'rwu';
-        physicalPort = await this._withTimeout(
-          () => rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
-          this.portOpenTimeoutMs,
-          `portopen2 ${formattedTargetPort}`
-        );
-        if (!physicalPort) throw new Error(`portopen2 ${formattedTargetPort} returned no port`);
+        ({ connection, rpc, physicalPort } = await this._openNativePortWithRelayFallback(
+          deviceId, deviceIdHex, formattedTargetPort, flags
+        ));
         if (server._diodeClosed) {
           throw new Error('UDP bind server closed during portopen2');
         }
@@ -1126,7 +1152,7 @@ class BindPort extends EventEmitter {
       this.servers.set(parseInt(localPort), server);
     } else {
       // For TCP and tls protocols, use TCP server locally
-      const server = net.createServer(async (clientSocket) => {
+      const server = net.createServer({ allowHalfOpen: useNative }, async (clientSocket) => {
         logger.info(() => `Client connected to local server on port ${localPort}`);
         clientSocket.setNoDelay(true);
         // Do not consume application bytes until a remote ref and all routing
@@ -1174,41 +1200,20 @@ class BindPort extends EventEmitter {
         });
 
         if (useNative) {
-          try {
-            connection = await this._resolveConnectionForDevice(deviceId);
-          } catch (error) {
-            logger.error(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
-            clientSocket.destroy();
-            return;
-          }
-          if (!connection) {
-            logger.error(() => `No relay connection available for device ${deviceIdHex}`);
-            clientSocket.destroy();
-            return;
-          }
-          rpc = this._getRpcFor(connection);
-          context.connection = connection;
-          context.rpc = rpc;
-
           // Open a new native relay port on the device for this client
           let physicalPort;
           try {
             const flags = config.flags || 'rw';
-            physicalPort = await this._withTimeout(
-              () => rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
-              this.portOpenTimeoutMs,
-              `portopen2 ${formattedTargetPort}`
-            );
-            if (!physicalPort) {
-              logger.error(() => `Error opening portopen2 ${formattedTargetPort} on deviceId: ${deviceIdHex}`);
-              clientSocket.destroy();
-              return;
-            }
+            ({ connection, rpc, physicalPort } = await this._openNativePortWithRelayFallback(
+              deviceId, deviceIdHex, formattedTargetPort, flags
+            ));
           } catch (error) {
             logger.error(() => `Error opening portopen2 ${formattedTargetPort} on device: ${error}`);
             clientSocket.destroy();
             return;
           }
+          context.connection = connection;
+          context.rpc = rpc;
           context.physicalPort = physicalPort;
           this._acquireNativeLease(context);
           if (clientClosed || context.closed || clientSocket.destroyed) {
@@ -1219,66 +1224,27 @@ class BindPort extends EventEmitter {
           const relayHost = connection.getServerRelayHost();
           let relaySocket;
           try {
-            relaySocket = net.connect({ host: relayHost, port: physicalPort });
+            relaySocket = net.connect({ host: relayHost, port: physicalPort, allowHalfOpen: true, autoSelectFamily: false });
           } catch (error) {
             logger.error(() => `Could not create native relay socket: ${error}`);
             this._closeContext(context);
             return;
           }
           relaySocket.setNoDelay(true);
+          relaySocket.pause();
           context.sockets.add(relaySocket);
 
           let session = null;
-          const pendingRelayChunks = [];
-          let pendingRelayBytes = 0;
-          const pendingChunks = [];
-          let pendingBytes = 0;
-          let relayWriteBlocked = false;
-
-          const onRelayDrain = () => {
-            relayWriteBlocked = false;
-            if (!context.closed && !clientSocket.destroyed) clientSocket.resume();
-          };
-
+          let bridge = null;
           const cleanup = () => {
-            relaySocket.off('drain', onRelayDrain);
             this._closeContext(context);
           };
-
-          relaySocket.on('data', (data) => {
-            if (!session) {
-              const copy = Buffer.from(data);
-              pendingRelayBytes += copy.length;
-              if (pendingRelayBytes > this.nativeQueueLimitBytes) {
-                logger.error(() => 'Native TCP pre-handshake relay queue limit exceeded');
-                cleanup();
-                return;
-              }
-              pendingRelayChunks.push(copy);
-              return;
-            }
-            try {
-              const messages = nativeCrypto.consumeTcpFrames(session, data);
-              for (const msg of messages) {
-                if (!writeWithBoundedBackpressure(clientSocket, msg)) {
-                  relaySocket.pause();
-                  clientSocket.once('drain', () => {
-                    if (!relaySocket.destroyed) relaySocket.resume();
-                  });
-                }
-              }
-            } catch (error) {
-              logger.error(() => `TCP decrypt error: ${error}`);
-              cleanup();
-            }
-          });
 
           relaySocket.on('error', (err) => {
             logger.error(() => `Relay socket error: ${err}`);
             cleanup();
           });
-          relaySocket.on('end', cleanup);
-          relaySocket.on('close', cleanup);
+          relaySocket.on('close', () => { if (!bridge) cleanup(); });
 
           try {
             await new Promise((resolve, reject) => {
@@ -1339,50 +1305,17 @@ class BindPort extends EventEmitter {
             return;
           }
 
-          while (pendingRelayChunks.length > 0 && !context.closed) {
-            const encrypted = pendingRelayChunks.shift();
-            pendingRelayBytes -= encrypted.length;
-            try {
-              const messages = nativeCrypto.consumeTcpFrames(session, encrypted);
-              for (const msg of messages) writeWithBoundedBackpressure(clientSocket, msg);
-            } catch (error) {
-              logger.error(() => `TCP decrypt error: ${error}`);
-              cleanup();
-              return;
-            }
-          }
-
-          clientSocket.on('data', (data) => {
-            if (!session) {
-              const copy = Buffer.from(data);
-              pendingBytes += copy.length;
-              if (pendingBytes > this.nativeQueueLimitBytes) {
-                logger.error(() => 'Native TCP pre-connect queue limit exceeded');
-                cleanup();
-                return;
-              }
-              pendingChunks.push(copy);
-              return;
-            }
-            try {
-              const frame = nativeCrypto.createTcpFrame(session, data);
-              if (relaySocket.write(frame) === false && !relayWriteBlocked) {
-                relayWriteBlocked = true;
-                clientSocket.pause();
-                relaySocket.once('drain', onRelayDrain);
-              }
-            } catch (error) {
-              logger.error(() => `Error sending TCP frame: ${error}`);
-              cleanup();
-            }
+          // Both sockets stayed paused during authentication. Stream pipes now
+          // bound each direction and propagate FIN after queued bytes drain.
+          bridge = bridgeNativeTcp({
+            localSocket: clientSocket,
+            relaySocket,
+            session,
+            onClose: cleanup,
+            onError: (error) => logger.error(() => `Native TCP stream failed: ${error}`),
           });
-          clientSocket.on('error', (err) => {
-            logger.error(() => `Client socket error: ${err}`);
-            cleanup();
-          });
-          clientSocket.on('end', cleanup);
-          clientSocket.on('close', cleanup);
-          clientSocket.resume();
+          context.cleanup = () => bridge.destroy();
+          context.finishWrites = () => bridge.closed;
 
           return;
         }

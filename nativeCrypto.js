@@ -6,7 +6,6 @@ const DOMAIN = Buffer.from('diode-pp2-v1', 'utf8');
 const UDP_MAGIC = Buffer.from('DUD1', 'utf8');
 const MAX_HANDSHAKE_BYTES = 64 * 1024;
 const MAX_TCP_FRAME_BYTES = 1024 * 1024;
-const MAX_TCP_BUFFER_BYTES = MAX_TCP_FRAME_BYTES + 64 * 1024;
 // Maximum IPv4 UDP payload: 65,535-byte IP packet - 20-byte IPv4 header -
 // 8-byte UDP header. The encrypted envelope must fit inside this value.
 const MAX_UDP_PACKET_BYTES = 65507;
@@ -199,7 +198,9 @@ function buildNonce(salt, counter) {
 function encryptAead(key, nonce, plaintext, aad) {
   const cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
   if (aad) cipher.setAAD(aad);
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const body = cipher.update(plaintext);
+  const tail = cipher.final();
+  const ciphertext = tail.length ? Buffer.concat([body, tail]) : body;
   const tag = cipher.getAuthTag();
   return { ciphertext, tag };
 }
@@ -208,8 +209,9 @@ function decryptAead(key, nonce, ciphertext, tag, aad) {
   const decipher = crypto.createDecipheriv('chacha20-poly1305', key, nonce, { authTagLength: 16 });
   if (aad) decipher.setAAD(aad);
   decipher.setAuthTag(tag);
-  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return plaintext;
+  const plaintext = decipher.update(ciphertext);
+  const tail = decipher.final();
+  return tail.length ? Buffer.concat([plaintext, tail]) : plaintext;
 }
 
 function createTcpFrame(session, plaintext) {
@@ -221,13 +223,14 @@ function createTcpFrame(session, plaintext) {
   }
   const counter = session.txCounter++;
   const nonce = buildNonce(session.txSalt, counter);
-  const lenBuf = Buffer.alloc(4);
-  lenBuf.writeUInt32BE(plaintext.length, 0);
-  const counterBuf = Buffer.alloc(8);
-  counterBuf.writeBigUInt64BE(counter, 0);
-  const aad = Buffer.concat([lenBuf, counterBuf]);
+  const frame = Buffer.allocUnsafe(12 + plaintext.length + 16);
+  frame.writeUInt32BE(plaintext.length, 0);
+  frame.writeBigUInt64BE(counter, 4);
+  const aad = frame.subarray(0, 12);
   const { ciphertext, tag } = encryptAead(session.txKey, nonce, plaintext, aad);
-  return Buffer.concat([lenBuf, counterBuf, ciphertext, tag]);
+  ciphertext.copy(frame, 12);
+  tag.copy(frame, 12 + ciphertext.length);
+  return frame;
 }
 
 function consumeTcpFrames(session, data) {
@@ -235,28 +238,25 @@ function consumeTcpFrames(session, data) {
   if (!Buffer.isBuffer(data) && !(data instanceof Uint8Array)) {
     throw new TypeError('TCP frame data must be a Buffer or Uint8Array');
   }
-  if (session.rxBuffer.length + data.length > MAX_TCP_BUFFER_BYTES) {
+  const input = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  const reset = () => {
     session.rxBuffer = Buffer.alloc(0);
-    throw new RangeError('TCP receive buffer limit exceeded');
-  }
-  let buffer = Buffer.concat([session.rxBuffer, data]);
-  while (buffer.length >= 12) {
-    const len = buffer.readUInt32BE(0);
+    session._rxFrameStorage = null;
+  };
+  const frameSize = (header) => {
+    const len = header.readUInt32BE(0);
     if (len > MAX_TCP_FRAME_BYTES) {
-      session.rxBuffer = Buffer.alloc(0);
       throw new RangeError(`TCP frame exceeds ${MAX_TCP_FRAME_BYTES} bytes`);
     }
-    const counter = buffer.readBigUInt64BE(4);
-    const frameLength = 12 + len + 16;
-    if (buffer.length < frameLength) break;
-    if (counter < session.rxCounter) {
-      buffer = buffer.slice(frameLength);
-      continue;
-    }
+    return 12 + len + 16;
+  };
+  const decode = (frame) => {
+    const counter = frame.readBigUInt64BE(4);
+    if (counter < session.rxCounter) return;
     const nonce = buildNonce(session.rxSalt, counter);
-    const aad = buffer.slice(0, 12);
-    const ciphertext = buffer.slice(12, 12 + len);
-    const tag = buffer.slice(12 + len, frameLength);
+    const aad = frame.subarray(0, 12);
+    const ciphertext = frame.subarray(12, frame.length - 16);
+    const tag = frame.subarray(frame.length - 16);
     try {
       const plaintext = decryptAead(session.rxKey, nonce, ciphertext, tag, aad);
       messages.push(plaintext);
@@ -264,9 +264,62 @@ function consumeTcpFrames(session, data) {
     } catch (error) {
       throw new Error('TCP decrypt failed');
     }
-    buffer = buffer.slice(frameLength);
+  };
+  let offset = 0;
+  try {
+    while (offset < input.length) {
+      const pending = session.rxBuffer;
+      if (pending.length > 0) {
+        // Allocate at most one bounded frame, then fill it in place. Repeated
+        // small TCP reads no longer copy the entire accumulated ciphertext.
+        let storage = session._rxFrameStorage;
+        if (!storage) {
+          storage = Buffer.allocUnsafe(pending.length < 12 ? 12 : frameSize(pending));
+          pending.copy(storage);
+        }
+        let filled = pending.length;
+        if (filled < 12) {
+          const count = Math.min(12 - filled, input.length - offset);
+          input.copy(storage, filled, offset, offset + count);
+          filled += count;
+          offset += count;
+          if (filled === 12) {
+            const expanded = Buffer.allocUnsafe(frameSize(storage));
+            storage.copy(expanded, 0, 0, 12);
+            storage = expanded;
+          }
+        }
+        if (filled >= 12) {
+          const count = Math.min(storage.length - filled, input.length - offset);
+          input.copy(storage, filled, offset, offset + count);
+          filled += count;
+          offset += count;
+        }
+        session._rxFrameStorage = storage;
+        session.rxBuffer = storage.subarray(0, filled);
+        if (filled < 12 || filled < storage.length) break;
+        decode(storage);
+        reset();
+      } else {
+        const remaining = input.length - offset;
+        const size = remaining < 12 ? 12 : frameSize(input.subarray(offset));
+        if (remaining >= size) {
+          // Complete frames are decrypted directly from the current TCP read.
+          decode(input.subarray(offset, offset + size));
+          offset += size;
+        } else {
+          const storage = Buffer.allocUnsafe(size);
+          input.copy(storage, 0, offset);
+          session._rxFrameStorage = storage;
+          session.rxBuffer = storage.subarray(0, remaining);
+          break;
+        }
+      }
+    }
+  } catch (error) {
+    reset();
+    throw error;
   }
-  session.rxBuffer = buffer;
   return messages;
 }
 

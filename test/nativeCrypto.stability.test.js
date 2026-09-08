@@ -130,3 +130,41 @@ test('native handshake verifier rejects malformed cryptographic fields', () => {
     { ok: false, reason: 'Invalid ephemeral key' }
   );
 });
+
+test('native TCP frames preserve wire bytes and bounded buffering across arbitrary fragmentation', () => {
+  const payload = Buffer.alloc(8193);
+  for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
+  for (const fragmentBytes of [1, 4, 11, 12, 13, 257, 16384]) {
+    const { tx, rx } = makeUdpPair();
+    const frame = nativeCrypto.createTcpFrame(tx, payload);
+    const messages = [];
+    for (let offset = 0; offset < frame.length; offset += fragmentBytes) {
+      const chunk = Buffer.from(frame.subarray(offset, offset + fragmentBytes));
+      messages.push(...nativeCrypto.consumeTcpFrames(rx, chunk));
+      chunk.fill(0); // Partial data must not retain a caller-owned mutable view.
+      assert.ok(rx.rxBuffer.length <= payload.length + 28);
+    }
+    assert.deepEqual(messages, [payload]);
+    assert.equal(rx.rxBuffer.length, 0);
+    assert.equal(rx.rxCounter, 1n);
+  }
+});
+
+test('native TCP accepts batches larger than one frame limit while bounding each frame', () => {
+  const { tx, rx } = makeUdpPair();
+  const payloads = [Buffer.alloc(1024 * 1024, 3), Buffer.alloc(1024 * 1024, 7), Buffer.alloc(0)];
+  const batch = Buffer.concat(payloads.map((payload) => nativeCrypto.createTcpFrame(tx, payload)));
+  assert.deepEqual(nativeCrypto.consumeTcpFrames(rx, batch), payloads);
+  assert.equal(rx.rxBuffer.length, 0);
+  assert.equal(rx.rxCounter, 3n);
+});
+
+test('native TCP rejects tampering without accepting plaintext or advancing receive state', () => {
+  const { tx, rx } = makeUdpPair();
+  const frame = nativeCrypto.createTcpFrame(tx, Buffer.from('authenticated payload'));
+  frame[frame.length - 1] ^= 1;
+  nativeCrypto.consumeTcpFrames(rx, frame.subarray(0, 14));
+  assert.throws(() => nativeCrypto.consumeTcpFrames(rx, frame.subarray(14)), /TCP decrypt failed/);
+  assert.equal(rx.rxBuffer.length, 0);
+  assert.equal(rx.rxCounter, 0n);
+});

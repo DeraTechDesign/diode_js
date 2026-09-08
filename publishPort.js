@@ -11,6 +11,7 @@ const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBa
 const DiodeRPC = require('./rpc');
 const { makeReadable, parseUInt, toBufferView } = require('./utils');
 const nativeCrypto = require('./nativeCrypto');
+const { bridgeNativeTcp } = require('./nativeTcpBridge');
 const logger = require('./logger');
 const secp256k1 = require('secp256k1');
 const ethUtil = require('ethereumjs-util');
@@ -629,21 +630,34 @@ class PublishPort extends EventEmitter {
 
     const handshakePromise = (async () => {
       let session = null;
+      const ensureCurrent = () => {
+        if (this._closed || connectionInfo._cleaned || !session || session._cleaned
+          || this._getNativeSession(connection, session.physicalPort) !== session) {
+          throw new Error('Native session closed during handshake');
+        }
+      };
       try {
         const peerMessage = await nativeCrypto.readHandshakeMessage(tlsSocket, this.handshakeTimeoutMs);
-        session = this._getNativeSession(connection, Number(peerMessage.physicalPort));
-        if (!session) {
+        const candidate = this._getNativeSession(connection, Number(peerMessage.physicalPort));
+        if (!candidate || candidate._cleaned) {
           throw new Error(`No native session for physical port ${peerMessage.physicalPort}`);
         }
+        if (candidate.ready || candidate.handshakeInProgress) throw new Error('Native session handshake already established or in progress');
+        if (candidate.port !== port) throw new Error('Native handshake target port mismatch');
 
         const verification = nativeCrypto.verifyHandshakeMessage(peerMessage, {
           expectedRole: 'bind',
-          expectedDeviceId: session.deviceId,
-          expectedPhysicalPort: session.physicalPort,
+          expectedDeviceId: candidate.deviceId,
+          expectedPhysicalPort: candidate.physicalPort,
         });
         if (!verification.ok) {
           throw new Error(`Handshake verification failed: ${verification.reason}`);
         }
+        session = candidate;
+        session.handshakeInProgress = true;
+        session.handshakeRef = ref;
+        session.handshakeInfo = connectionInfo;
+        ensureCurrent();
 
         const localDeviceId = connection.getEthereumAddress().toLowerCase();
         const { message, privKey, nonce } = nativeCrypto.createHandshakeMessage({
@@ -656,6 +670,8 @@ class PublishPort extends EventEmitter {
         // The handshake ref is closed in finally. Wait until TLS has accepted
         // and drained the response frame so cleanup cannot truncate it.
         await nativeCrypto.writeHandshakeMessage(tlsSocket, message);
+        await diodeSocket.finishTlsWrites(tlsSocket);
+        ensureCurrent();
 
         session.session = nativeCrypto.deriveSessionKeys({
           role: 'publish',
@@ -673,9 +689,6 @@ class PublishPort extends EventEmitter {
           session.timer = null;
         }
 
-        if (session.localSocket && typeof session.localSocket.resume === 'function') {
-          session.localSocket.resume();
-        }
         this._flushNativeTCPRelayPending(session);
 
         if (session.protocol === 'udp' && session.relaySocket && session.session) {
@@ -689,6 +702,11 @@ class PublishPort extends EventEmitter {
           this._cleanupNativeSession(session);
         }
       } finally {
+        if (session && session.handshakeInfo === connectionInfo) {
+          session.handshakeInfo = null;
+          session.handshakeRef = null;
+          session.handshakeInProgress = false;
+        }
         this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
       }
     })();
@@ -815,7 +833,17 @@ class PublishPort extends EventEmitter {
   }
 
   _cleanupNativeSession(session) {
-    if (!session) return;
+    if (!session || session._cleaned) return;
+    session._cleaned = true;
+    session.ready = false;
+    if (session.bridge) session.bridge.destroy();
+    if (session.handshakeInfo) {
+      this._cleanupConnectionInfo(session.connection, session.handshakeRef, session.handshakeInfo, { notifyRemote: true });
+      session.handshakeInfo = null;
+      session.handshakeRef = null;
+    }
+    if (session.pendingRelayChunks) session.pendingRelayChunks.length = 0;
+    session.pendingRelayBytes = 0;
     if (session.nativeLease && session.connection) {
       session.connection._diodeActiveNativeSessions = Math.max(
         0,
@@ -872,43 +900,17 @@ class PublishPort extends EventEmitter {
     ).catch(() => {});
   }
 
-  _consumeNativeTCPRelayData(session, data) {
-    if (!session || !session.session || !session.localSocket) {
-      return true;
-    }
-    try {
-      const messages = nativeCrypto.consumeTcpFrames(session.session, data);
-      for (const msg of messages) {
-        if (session.localSocket.write(msg) === false && session.relaySocket) {
-          if (typeof session.relaySocket.pause === 'function') session.relaySocket.pause();
-          if (typeof session.localSocket.once === 'function') {
-            session.localSocket.once('drain', () => {
-              if (session.relaySocket && typeof session.relaySocket.resume === 'function') {
-                session.relaySocket.resume();
-              }
-            });
-          }
-        }
-      }
-      return true;
-    } catch (error) {
-      logger.error(() => `TCP decrypt error (${session.deviceId}): ${error}`);
-      return false;
-    }
-  }
-
   _flushNativeTCPRelayPending(session) {
-    if (!session || session.protocol !== 'tcp' || !Array.isArray(session.pendingRelayChunks)) {
+    if (!session || session._cleaned || session.protocol !== 'tcp' || !session.ready || !session.session || session.bridge) {
       return;
     }
-    const pending = session.pendingRelayChunks.splice(0, session.pendingRelayChunks.length);
-    session.pendingRelayBytes = 0;
-    for (const chunk of pending) {
-      if (!this._consumeNativeTCPRelayData(session, chunk)) {
-        this._cleanupNativeSession(session);
-        return;
-      }
-    }
+    session.bridge = bridgeNativeTcp({
+      localSocket: session.localSocket,
+      relaySocket: session.relaySocket,
+      session: session.session,
+      onError: (error) => logger.error(() => `Native TCP stream error (${session.deviceId}): ${error}`),
+      onClose: () => this._cleanupNativeSession(session),
+    });
   }
 
   handleNativeTCPRelay(sessionId, physicalPortRef, session, connection) {
@@ -929,22 +931,37 @@ class PublishPort extends EventEmitter {
       void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, reason)).catch(() => {});
     };
 
-    const relayHost = connection.getServerRelayHost();
-    const relaySocket = net.connect({ host: relayHost, port: physicalPort }, () => {
-      relaySocket.setNoDelay(true);
-    });
-    const localSocket = net.connect({ port, host }, () => {
-      localSocket.setNoDelay(true);
-    });
-    localSocket.pause();
-
-    session.relaySocket = relaySocket;
-    session.localSocket = localSocket;
+    let relaySocket;
+    let localSocket;
+    const cleanup = () => this._cleanupNativeSession(session);
+    try {
+      const relayHost = connection.getServerRelayHost();
+      relaySocket = net.connect({ host: relayHost, port: physicalPort, allowHalfOpen: true, autoSelectFamily: false });
+      session.relaySocket = relaySocket;
+      relaySocket.pause();
+      if (this._closed || session._cleaned) {
+        destroySocket(relaySocket);
+        cleanup();
+        return;
+      }
+      localSocket = net.connect({ port, host, allowHalfOpen: true, autoSelectFamily: false });
+      session.localSocket = localSocket;
+      localSocket.pause();
+      if (this._closed || session._cleaned) {
+        destroySocket(localSocket);
+        cleanup();
+        return;
+      }
+    } catch (error) {
+      sendError('Native TCP socket setup failed');
+      cleanup();
+      return;
+    }
 
     let relayReady = false;
     let localReady = false;
     const maybeReady = () => {
-      if (relayReady && localReady) {
+      if (!this._closed && !session._cleaned && relayReady && localReady) {
         if (session.connectTimer) {
           clearTimeout(session.connectTimer);
           session.connectTimer = null;
@@ -959,19 +976,15 @@ class PublishPort extends EventEmitter {
     if (typeof session.connectTimer.unref === 'function') session.connectTimer.unref();
 
     relaySocket.on('connect', () => {
+      relaySocket.setNoDelay(true);
       relayReady = true;
       maybeReady();
     });
     localSocket.on('connect', () => {
+      localSocket.setNoDelay(true);
       localReady = true;
       maybeReady();
     });
-
-    const cleanup = () => {
-      if (!relaySocket.destroyed) relaySocket.destroy();
-      if (!localSocket.destroyed) localSocket.destroy();
-      this._cleanupNativeSession(session);
-    };
 
     relaySocket.on('error', (err) => {
       logger.error(() => `Relay socket error (${deviceId}): ${err}`);
@@ -984,43 +997,11 @@ class PublishPort extends EventEmitter {
       cleanup();
     });
 
-    relaySocket.on('end', cleanup);
-    localSocket.on('end', cleanup);
-    relaySocket.on('close', cleanup);
-    localSocket.on('close', cleanup);
-
-    relaySocket.on('data', (data) => {
-      if (!session.ready || !session.session) {
-        const copy = Buffer.from(data);
-        session.pendingRelayBytes = (session.pendingRelayBytes || 0) + copy.length;
-        if (session.pendingRelayBytes > this.nativeQueueLimitBytes) {
-          logger.error(() => `Native TCP pending queue exceeded for ${deviceId}`);
-          cleanup();
-          return;
-        }
-        session.pendingRelayChunks.push(copy);
-        return;
-      }
-      if (!this._consumeNativeTCPRelayData(session, data)) {
-        cleanup();
-      }
-    });
-
-    localSocket.on('data', (data) => {
-      if (!session.ready || !session.session) return;
-      try {
-        const frame = nativeCrypto.createTcpFrame(session.session, data);
-        if (relaySocket.write(frame) === false) {
-          localSocket.pause();
-          relaySocket.once('drain', () => {
-            if (!localSocket.destroyed) localSocket.resume();
-          });
-        }
-      } catch (error) {
-        logger.error(() => `TCP encrypt error (${deviceId}): ${error}`);
-        cleanup();
-      }
-    });
+    // Before authentication, paused Node sockets retain only their bounded
+    // receive buffers. After authentication the bridge owns EOF and drainage.
+    const onPreHandshakeClose = () => { if (!session.bridge) cleanup(); };
+    relaySocket.on('close', onPreHandshakeClose);
+    localSocket.on('close', onPreHandshakeClose);
   }
 
   handleNativeUDPRelay(sessionId, physicalPortRef, session, connection) {
@@ -1041,13 +1022,33 @@ class PublishPort extends EventEmitter {
       void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, reason)).catch(() => {});
     };
 
-    const relaySocket = dgram.createSocket('udp4');
-    const localSocket = dgram.createSocket('udp4');
+    let relaySocket;
+    let localSocket;
+    try {
+      relaySocket = dgram.createSocket('udp4');
+      session.relaySocket = relaySocket;
+      if (this._closed || session._cleaned) {
+        destroySocket(relaySocket);
+        this._cleanupNativeSession(session);
+        return;
+      }
+      localSocket = dgram.createSocket('udp4');
+      session.localSocket = localSocket;
+      if (this._closed || session._cleaned) {
+        destroySocket(localSocket);
+        this._cleanupNativeSession(session);
+        return;
+      }
+    } catch (error) {
+      sendError('Native UDP socket setup failed');
+      this._cleanupNativeSession(session);
+      return;
+    }
 
     let relayReady = false;
     let localReady = false;
     const maybeReady = () => {
-      if (relayReady && localReady) {
+      if (!this._closed && !session._cleaned && relayReady && localReady) {
         if (session.connectTimer) {
           clearTimeout(session.connectTimer);
           session.connectTimer = null;
@@ -1100,17 +1101,20 @@ class PublishPort extends EventEmitter {
     relaySocket.on('close', () => this._cleanupNativeSession(session));
     localSocket.on('close', () => this._cleanupNativeSession(session));
 
-    session.relaySocket = relaySocket;
-    session.localSocket = localSocket;
-    const relayHost = connection.getServerRelayHost();
-    relaySocket.connect(physicalPort, relayHost, () => {
-      relayReady = true;
-      maybeReady();
-    });
-    localSocket.connect(port, host, () => {
-      localReady = true;
-      maybeReady();
-    });
+    try {
+      const relayHost = connection.getServerRelayHost();
+      relaySocket.connect(physicalPort, relayHost, () => {
+        relayReady = true;
+        maybeReady();
+      });
+      localSocket.connect(port, host, () => {
+        localReady = true;
+        maybeReady();
+      });
+    } catch (error) {
+      sendError('Native UDP socket connection failed');
+      this._cleanupNativeSession(session);
+    }
 
   }
 

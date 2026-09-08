@@ -1,5 +1,28 @@
 # DiodeJs
 
+### Native TCP/UDP transport
+
+Native transport (`transport: "native"`) uses `portopen2` and the existing
+authenticated, encrypted native wire protocol. It runs with Node's built-in
+TCP/UDP/streams/crypto APIs and the existing cryptography packages' JavaScript
+fallbacks; the transport choice does not require a native addon.
+
+Native TCP now uses bounded stream backpressure in both directions, preserves
+half-close responses and final buffered bytes, and flushes its TLS handshake
+before releasing the handshake channel. Native opens can retry another relay
+without switching transport or replaying application data. TCP frame processing
+avoids repeated copies of fragmented ciphertext. Existing identity signatures,
+publish whitelists, authenticated encryption, and UDP replay checks remain.
+
+Native supports TCP and UDP. API remains the default and handles the library's
+TLS protocol. Select the transport explicitly; application protocols such as
+RDP and SQL are carried inside the selected stream.
+
+Run `node scripts/benchmark-native-framing.js` for the controlled receive-codec
+benchmark. It compares copying/decryption with 0.5.2 and does not measure public
+network performance. Native integration tests run with addons disabled using
+`node --require ./test/fixtures/no-native-addons.cjs --test test/nativeTcp.integration.test.js`.
+
 ### API transport stability
 
 API TCP and TLS streams use an ordered send window capped at 256 KiB and 16

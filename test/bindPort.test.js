@@ -4,6 +4,7 @@ const EventEmitter = require('events');
 const net = require('net');
 const dgram = require('dgram');
 const { once } = require('events');
+const { Duplex } = require('node:stream');
 
 const BindPort = require('../bindPort');
 const nativeCrypto = require('../nativeCrypto');
@@ -464,6 +465,40 @@ test(`API TCP bind pipelines a bounded send window and flushes ${payloadBytes} f
 });
 }
 
+// Native pipes need real readable buffering and writable backpressure. Keep
+// the lightweight EventEmitter fake above for tests that never attach pipes.
+class NativeStreamSocket extends Duplex {
+  constructor(input = null) {
+    super({ allowHalfOpen: true, readableHighWaterMark: 64 * 1024, writableHighWaterMark: 64 * 1024 });
+    this.connected = false;
+    this.writes = [];
+    this.input = input;
+    this.inputOffset = 0;
+    this.holdWrites = false;
+    this.pendingWrite = null;
+  }
+
+  setNoDelay() {}
+  _read() {
+    if (!this.input || this.inputOffset >= this.input.length) return;
+    const end = Math.min(this.inputOffset + 64 * 1024, this.input.length);
+    const chunk = this.input.subarray(this.inputOffset, end);
+    this.inputOffset = end;
+    this.push(chunk);
+  }
+  _write(data, _encoding, callback) {
+    this.writes.push(Buffer.from(data));
+    if (this.holdWrites) this.pendingWrite = callback;
+    else callback();
+  }
+  releaseWrites() {
+    this.holdWrites = false;
+    const callback = this.pendingWrite;
+    this.pendingWrite = null;
+    if (callback) callback();
+  }
+}
+
 test('API portopen deadline advances to the next relay when one hangs', async () => {
   const calls = [];
   const never = deferred();
@@ -581,12 +616,13 @@ test('native TCP connects relay before handshake and preserves immediate banner 
   const server = bind.servers.get(0);
   await once(server, 'listening');
   const handler = server.listeners('connection')[0];
-  const clientSocket = new FakeStreamSocket();
-  const relaySocket = new FakeStreamSocket();
+  const clientSocket = new NativeStreamSocket();
+  const relaySocket = new NativeStreamSocket();
   const originalConnect = net.connect;
   const originalConsume = nativeCrypto.consumeTcpFrames;
 
-  net.connect = () => {
+  net.connect = (options) => {
+    assert.equal(options.allowHalfOpen, true);
     queueMicrotask(() => {
       relaySocket.connected = true;
       relaySocket.emit('connect');
@@ -596,15 +632,18 @@ test('native TCP connects relay before handshake and preserves immediate banner 
   nativeCrypto.consumeTcpFrames = (_session, encrypted) => [Buffer.from(encrypted)];
   bind._performNativeHandshake = async () => {
     assert.equal(relaySocket.connected, true);
-    relaySocket.emit('data', Buffer.from('SSH-2.0-immediate\r\n'));
+    assert.equal(relaySocket.isPaused(), true, 'relay bytes wait for authentication');
+    relaySocket.push(Buffer.from('SSH-2.0-immediate\r\n'));
+    assert.equal(clientSocket.writes.length, 0, 'paused relay preserves the banner until the bridge is ready');
     return {};
   };
 
   try {
     await handler(clientSocket);
+    await waitFor(() => clientSocket.writes.length === 1);
     assert.equal(clientSocket.writes.length, 1);
     assert.equal(clientSocket.writes[0].toString(), 'SSH-2.0-immediate\r\n');
-    assert.equal(clientSocket.resumeCalls, 1);
+    assert.equal(clientSocket.isPaused(), false);
   } finally {
     net.connect = originalConnect;
     nativeCrypto.consumeTcpFrames = originalConsume;
@@ -612,7 +651,7 @@ test('native TCP connects relay before handshake and preserves immediate banner 
   }
 });
 
-test('native TCP pauses the client until a backpressured relay write drains', async () => {
+test('native TCP bounds queued data while a relay write is blocked and resumes after drain', async () => {
   const relay = makeNativeRelay();
   const manager = new FakeManager({ relays: [relay], resolvedRelay: relay, nearestRelay: relay });
   const bind = new BindPort(manager, {
@@ -627,12 +666,11 @@ test('native TCP pauses the client until a backpressured relay write drains', as
   const server = bind.servers.get(0);
   await once(server, 'listening');
   const handler = server.listeners('connection')[0];
-  const clientSocket = new FakeStreamSocket();
-  const relaySocket = new FakeStreamSocket();
-  relaySocket.write = (data) => {
-    relaySocket.writes.push(Buffer.from(data));
-    return false;
-  };
+  const payload = Buffer.alloc(8 * 1024 * 1024);
+  for (let index = 0; index < payload.length; index += 1) payload[index] = index % 251;
+  const clientSocket = new NativeStreamSocket(payload);
+  const relaySocket = new NativeStreamSocket();
+  relaySocket.holdWrites = true;
   const originalConnect = net.connect;
   const originalCreateTcpFrame = nativeCrypto.createTcpFrame;
 
@@ -644,22 +682,22 @@ test('native TCP pauses the client until a backpressured relay write drains', as
     return relaySocket;
   };
   bind._performNativeHandshake = async () => ({});
-  nativeCrypto.createTcpFrame = (_session, data) => Buffer.from(`frame:${data}`);
+  nativeCrypto.createTcpFrame = (_session, data) => Buffer.from(data);
 
   try {
     await handler(clientSocket);
-    assert.equal(clientSocket.resumeCalls, 1, 'client starts after native handshake');
-    const pauseCallsBeforeBackpressure = clientSocket.pauseCalls;
-
-    clientSocket.emit('data', Buffer.from('payload'));
+    await waitFor(() => clientSocket.isPaused() && relaySocket.pendingWrite !== null);
+    const acceptedBytes = clientSocket.inputOffset;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(clientSocket.inputOffset, acceptedBytes, 'blocked downstream stops reading the client');
+    assert.ok(acceptedBytes <= 1024 * 1024, 'the pipeline buffers a bounded part of the 8 MiB source');
+    assert.ok(relaySocket.writableLength <= 128 * 1024, 'relay socket writes remain bounded');
     assert.equal(relaySocket.writes.length, 1);
-    assert.equal(relaySocket.writes[0].toString(), 'frame:payload');
-    assert.equal(clientSocket.pauseCalls, pauseCallsBeforeBackpressure + 1);
-    assert.equal(clientSocket.resumeCalls, 1);
 
-    relaySocket.emit('drain');
-    assert.equal(clientSocket.resumeCalls, 2);
-    assert.equal(relaySocket.listenerCount('drain'), 0);
+    relaySocket.releaseWrites();
+    await waitFor(() => relaySocket.writes.reduce((bytes, chunk) => bytes + chunk.length, 0) === payload.length);
+    assert.deepEqual(Buffer.concat(relaySocket.writes), payload, 'draining resumes the full ordered upload');
+    assert.equal(clientSocket.isPaused(), false);
   } finally {
     nativeCrypto.createTcpFrame = originalCreateTcpFrame;
     net.connect = originalConnect;

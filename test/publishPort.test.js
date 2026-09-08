@@ -8,6 +8,7 @@ const { PassThrough } = require('node:stream');
 
 const PublishPort = require('../publishPort');
 const nativeCrypto = require('../nativeCrypto');
+const DiodeSocket = require('../diodeSocket');
 
 class FakeStreamSocket extends EventEmitter {
   constructor() {
@@ -18,6 +19,7 @@ class FakeStreamSocket extends EventEmitter {
     this.writes = [];
     this.pauseCalls = 0;
     this.resumeCalls = 0;
+    this.pipeCalls = [];
   }
 
   setNoDelay() {}
@@ -35,6 +37,7 @@ class FakeStreamSocket extends EventEmitter {
     this.destroyed = true;
   }
   pipe(destination) {
+    this.pipeCalls.push(destination);
     return destination;
   }
 }
@@ -534,17 +537,16 @@ test('native TCP publish connects local socket to configured host', () => {
   }
 
   assert.equal(connectCalls.length, 2);
-  assert.deepEqual(connectCalls[0], { host: 'relay.example', port: 41000 });
-  assert.deepEqual(connectCalls[1], { port: 8089, host: '10.0.0.8' });
+  assert.deepEqual(connectCalls[0], { host: 'relay.example', port: 41000, allowHalfOpen: true, autoSelectFamily: false });
+  assert.deepEqual(connectCalls[1], { port: 8089, host: '10.0.0.8', allowHalfOpen: true, autoSelectFamily: false });
 });
 
-test('native TCP publish buffers relay data until handshake is ready', () => {
+test('native TCP publisher pauses both sockets until authenticated bridge setup', () => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, {
     8089: { mode: 'public', host: '10.0.0.8' },
   });
   const originalConnect = net.connect;
-  const originalConsumeTcpFrames = nativeCrypto.consumeTcpFrames;
   const sockets = [];
 
   net.connect = (options, callback) => {
@@ -559,7 +561,6 @@ test('native TCP publish buffers relay data until handshake is ready', () => {
     });
     return socket;
   };
-  nativeCrypto.consumeTcpFrames = () => [Buffer.from('plain-http')];
 
   try {
     const session = {
@@ -576,26 +577,27 @@ test('native TCP publish buffers relay data until handshake is ready', () => {
 
     const relaySocket = sockets[0];
     const localSocket = sockets[1];
-    relaySocket.emit('data', Buffer.from('early-encrypted'));
-
-    assert.equal(session.pendingRelayChunks.length, 1);
+    assert.equal(relaySocket.pauseCalls, 1);
+    assert.equal(localSocket.pauseCalls, 1);
+    assert.equal(relaySocket.listenerCount('data'), 0);
+    assert.equal(localSocket.listenerCount('data'), 0);
     assert.equal(localSocket.writes.length, 0);
 
     session.ready = true;
     session.session = {};
     publishPort._flushNativeTCPRelayPending(session);
 
-    assert.equal(session.pendingRelayChunks.length, 0);
-    assert.equal(localSocket.writes.length, 1);
-    assert.equal(localSocket.writes[0].toString(), 'plain-http');
+    assert.ok(session.bridge);
+    assert.equal(relaySocket.pipeCalls.length, 1);
+    assert.equal(localSocket.pipeCalls.length, 1);
+    session.bridge.destroy();
   } finally {
-    nativeCrypto.consumeTcpFrames = originalConsumeTcpFrames;
     net.connect = originalConnect;
     publishPort.stopListening();
   }
 });
 
-test('native publisher keeps the handshake channel open until its delayed write completes', async () => {
+test('native publisher keeps the handshake channel open until TLS write and relay ACKs complete', async () => {
   const connection = new FakeConnection();
   const publishPort = new PublishPort(connection, [8448]);
   const OriginalTlsSocket = tls.TLSSocket;
@@ -607,6 +609,8 @@ test('native publisher keeps the handshake channel open until its delayed write 
     deriveSessionKeys: nativeCrypto.deriveSessionKeys,
   };
   const writeGate = deferred();
+  const flushGate = deferred();
+  const originalFlush = DiodeSocket.prototype.flush;
   const ref = makeRef('2a');
   const physicalPort = 41020;
   const remoteDeviceId = `0x${'11'.repeat(20)}`;
@@ -614,6 +618,7 @@ test('native publisher keeps the handshake channel open until its delayed write 
   const relaySocket = new FakeStreamSocket();
   let tlsSocket;
   let writeStarted = false;
+  let flushStarted = false;
 
   const session = {
     physicalPort,
@@ -636,6 +641,7 @@ test('native publisher keeps the handshake channel open until its delayed write 
     constructor() {
       super();
       tlsSocket = this;
+      this.writableFinished = true;
     }
   };
   nativeCrypto.readHandshakeMessage = async () => ({ physicalPort });
@@ -655,6 +661,10 @@ test('native publisher keeps the handshake channel open until its delayed write 
     return writeGate.promise;
   };
   nativeCrypto.deriveSessionKeys = () => ({});
+  DiodeSocket.prototype.flush = () => {
+    flushStarted = true;
+    return flushGate.promise;
+  };
 
   try {
     publishPort.handleTLSHandshake(
@@ -673,14 +683,21 @@ test('native publisher keeps the handshake channel open until its delayed write 
     assert.equal(localSocket.resumeCalls, 0);
 
     writeGate.resolve();
+    await waitFor(() => flushStarted);
+    assert.equal(tlsSocket.destroyed, false);
+    assert.equal(session.ready, false, 'relay ACKs must finish before data socket activation');
+    flushGate.resolve();
     await waitFor(() => connection.getConnection(ref) === undefined);
 
     assert.equal(session.ready, true);
-    assert.equal(localSocket.resumeCalls, 1);
+    assert.ok(session.bridge);
     assert.equal(tlsSocket.destroyed, true);
     assert.equal(publishPort._trackedConnectionInfos.size, 0);
   } finally {
     tls.TLSSocket = OriginalTlsSocket;
+    DiodeSocket.prototype.flush = originalFlush;
+    writeGate.resolve();
+    flushGate.resolve();
     Object.assign(nativeCrypto, originals);
     publishPort.close();
   }
@@ -715,6 +732,104 @@ test('native UDP publish connects local socket to configured host', () => {
   assert.equal(sockets.length, 2);
   assert.deepEqual(sockets[0].connectCalls[0], { port: 41001, host: 'relay.example' });
   assert.deepEqual(sockets[1].connectCalls[0], { port: 8090, host: 'backend.internal' });
+});
+
+test('native socket allocation failure or concurrent disposal releases partial resources', async (t) => {
+  for (const protocol of ['tcp', 'udp']) {
+    for (const mode of ['throw', 'close']) {
+      await t.test(`${protocol} ${mode}`, () => {
+        const connection = new FakeConnection();
+        const publishPort = new PublishPort(connection, [8089]);
+        const session = {
+          physicalPort: 41000, port: 8089, host: '127.0.0.1', protocol,
+          deviceId: `0x${'11'.repeat(20)}`, connection, ready: false,
+          pendingRelayChunks: [Buffer.from('pending')], pendingRelayBytes: 7, nativeLease: true,
+        };
+        session.sessionKey = publishPort._nativeSessionKey(connection, session.physicalPort);
+        publishPort.nativeSessions.set(session.sessionKey, session);
+        connection._diodeActiveNativeSessions = 1;
+        const original = protocol === 'tcp' ? net.connect : dgram.createSocket;
+        const sockets = [];
+        const allocate = () => {
+          if (sockets.length === 1) {
+            if (mode === 'throw') throw new Error('allocation failed');
+            publishPort.close();
+          }
+          const socket = protocol === 'tcp' ? new FakeStreamSocket() : new FakeDatagramSocket();
+          sockets.push(socket);
+          return socket;
+        };
+        if (protocol === 'tcp') net.connect = allocate;
+        else dgram.createSocket = allocate;
+        try {
+          const method = protocol === 'tcp' ? 'handleNativeTCPRelay' : 'handleNativeUDPRelay';
+          assert.doesNotThrow(() => publishPort[method](makeSessionId('2e'), session.physicalPort, session, connection));
+          assert.ok(sockets.every((socket) => socket.destroyed || socket.closed));
+          assert.equal(connection._diodeActiveNativeSessions, 0);
+          assert.equal(publishPort.nativeSessions.size, 0);
+          assert.equal(session.pendingRelayBytes, 0);
+          assert.equal(session.pendingRelayChunks.length, 0);
+          assert.equal(connection.sentResponses.length, 0);
+          if (mode === 'throw') assert.equal(connection.sentErrors.length, 1);
+        } finally {
+          if (protocol === 'tcp') net.connect = original;
+          else dgram.createSocket = original;
+          publishPort.close();
+        }
+      });
+    }
+  }
+});
+
+test('native handshake cannot rekey, destroy an unowned session, or revive a closed one', async (t) => {
+  for (const mode of ['ready', 'in-progress', 'invalid-signature', 'closed-during-flush']) {
+    await t.test(mode, async () => {
+      const connection = new FakeConnection();
+      const publishPort = new PublishPort(connection, [8448]);
+      const originalTls = tls.TLSSocket;
+      const originalFinish = DiodeSocket.prototype.finishTlsWrites;
+      const originals = Object.fromEntries(['readHandshakeMessage', 'verifyHandshakeMessage', 'createHandshakeMessage', 'writeHandshakeMessage', 'deriveSessionKeys'].map((name) => [name, nativeCrypto[name]]));
+      const session = {
+        physicalPort: 41020, port: 8448, protocol: 'tcp', connection,
+        deviceId: `0x${'11'.repeat(20)}`, ready: mode === 'ready',
+        handshakeInProgress: mode === 'in-progress',
+        localSocket: new FakeStreamSocket(), relaySocket: new FakeStreamSocket(),
+        session: null,
+      };
+      session.sessionKey = publishPort._nativeSessionKey(connection, session.physicalPort);
+      publishPort.nativeSessions.set(session.sessionKey, session);
+      let derivations = 0;
+      tls.TLSSocket = class extends FakeStreamSocket {};
+      nativeCrypto.readHandshakeMessage = async () => ({ physicalPort: session.physicalPort });
+      nativeCrypto.verifyHandshakeMessage = () => ({ ok: mode !== 'invalid-signature', reason: 'invalid signature', deviceId: session.deviceId, ephPub: Buffer.alloc(33), nonce: Buffer.alloc(16) });
+      nativeCrypto.createHandshakeMessage = () => ({ message: {}, privKey: Buffer.alloc(32), nonce: Buffer.alloc(16) });
+      nativeCrypto.writeHandshakeMessage = async () => {};
+      nativeCrypto.deriveSessionKeys = () => { derivations += 1; return {}; };
+      DiodeSocket.prototype.finishTlsWrites = async () => { publishPort._cleanupNativeSession(session); };
+      try {
+        const ref = makeRef('2f');
+        publishPort.handleTLSHandshake(makeSessionId('2f'), ref, session.port, session.deviceId, connection);
+        await waitFor(() => !connection.getConnection(ref));
+        assert.equal(derivations, 0);
+        assert.equal(session.bridge, undefined);
+        if (mode === 'closed-during-flush') {
+          assert.equal(session.ready, false);
+          assert.equal(session._cleaned, true);
+          assert.equal(publishPort.nativeSessions.size, 0);
+        } else {
+          assert.equal(publishPort.nativeSessions.get(session.sessionKey), session);
+          assert.equal(session._cleaned, undefined);
+          assert.equal(session.localSocket.destroyed, false);
+          assert.equal(session.ready, mode === 'ready');
+        }
+      } finally {
+        tls.TLSSocket = originalTls;
+        DiodeSocket.prototype.finishTlsWrites = originalFinish;
+        Object.assign(nativeCrypto, originals);
+        publishPort.close();
+      }
+    });
+  }
 });
 
 test('handlePortOpen preserves localhost default when host is omitted', () => {
