@@ -1792,6 +1792,60 @@ test('idle pruning never closes a relay with active tunnel state', () => {
   manager.close();
 });
 
+test('an older fast RTT remains preferred while its background refresh is throttled', (t) => {
+  const manager = new DiodeClientManager({ relaySelection: { scoreCachePath: null } });
+  t.after(() => manager.close());
+  const fast = new FakeConnection('eu:41046');
+  const slow = new FakeConnection('as:41046');
+  manager._registerConnection(fast, 'eu:41046');
+  manager._registerConnection(slow, 'as:41046');
+  manager._recordRelayProbeSuccess('eu:41046', 11, 'seed');
+  manager._recordRelayProbeSuccess('as:41046', 250, 'seed');
+  manager.relayScores.get('eu:41046').lastSuccessAt = Date.now() - 61000;
+  manager._lastProbeStartedAt.set('eu:41046', Date.now() - 61000);
+  assert.equal(manager.getNearestConnection(), fast);
+  assert.equal(manager.pendingProbes.size, 0, 'refresh remains throttled');
+  manager._startupCoverageComplete = true;
+  manager.relaySelection.warmConnectionBudget = 1;
+  manager._pruneIdleConnections();
+  assert.equal(fast.closeCount, 0, 'score aging must not evict the fastest relay');
+  assert.equal(slow.closeCount, 1);
+});
+
+test('failed latency probes demote a connected relay until a successful measurement', (t) => {
+  const manager = new DiodeClientManager({ relaySelection: { scoreCachePath: null } });
+  t.after(() => manager.close());
+  const fast = new FakeConnection('fast:41046');
+  const healthy = new FakeConnection('healthy:41046');
+  manager._registerConnection(fast, 'fast:41046');
+  manager._registerConnection(healthy, 'healthy:41046');
+  manager._recordRelayProbeSuccess('fast:41046', 10, 'seed');
+  manager._recordRelayProbeSuccess('healthy:41046', 20, 'seed');
+  manager._recordRelayProbeFailure('fast:41046', new Error('ping timeout'));
+  assert.equal(manager.getNearestConnection(), healthy);
+  manager._recordRelayProbeSuccess('fast:41046', 10, 'seed');
+  assert.equal(manager.getNearestConnection(), fast);
+});
+
+test('an already connected slow destination still reconciles alternate ticket answers', async (t) => {
+  const manager = new DiodeClientManager({ relaySelection: { scoreCachePath: null } });
+  t.after(() => manager.close());
+  const slow = new FakeConnection('slow:41046', { serverEthereumAddress: '0xaaaa' });
+  const fast = new FakeConnection('fast:41046', { serverEthereumAddress: '0xbbbb' });
+  const primary = new FakeConnection('primary:41046', { getObject: async () => ({ serverIdHex: '0xaaaa' }) });
+  const alternate = new FakeConnection('alternate:41046', { getObject: async () => ({ serverIdHex: '0xbbbb' }) });
+  for (const [connection, latency] of [[primary, 10], [alternate, 12], [fast, 20], [slow, 300]]) {
+    const host = `${connection.host}:${connection.port}`;
+    manager._registerConnection(connection, host);
+    manager._updateServerIdMapping(connection);
+    manager._recordRelayProbeSuccess(host, latency, 'seed');
+  }
+  assert.equal(await manager.getConnectionForDevice('0x03'), fast);
+  assert.equal(manager._lastDeviceResolutionTrace.reconciliation.choseAlternate, true);
+  assert.equal(manager.deviceRelayCache.get('03').serverIdHex, '0xbbbb');
+  assert.equal(await manager.getConnectionForDevice('0x03'), fast, 'subsequent opens use the corrected route cache');
+});
+
 test('idle pruning preserves an in-flight portopen before a tunnel ref exists', () => {
   const manager = new DiodeClientManager({
     keyLocation: path.join(makeTempDir(), 'keys.json'),

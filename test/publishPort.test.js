@@ -787,7 +787,7 @@ test('native handshake cannot rekey, destroy an unowned session, or revive a clo
       const connection = new FakeConnection();
       const publishPort = new PublishPort(connection, [8448]);
       const originalTls = tls.TLSSocket;
-      const originalFinish = DiodeSocket.prototype.finishTlsWrites;
+      const originalFlush = DiodeSocket.prototype.flush;
       const originals = Object.fromEntries(['readHandshakeMessage', 'verifyHandshakeMessage', 'createHandshakeMessage', 'writeHandshakeMessage', 'deriveSessionKeys'].map((name) => [name, nativeCrypto[name]]));
       const session = {
         physicalPort: 41020, port: 8448, protocol: 'tcp', connection,
@@ -805,7 +805,7 @@ test('native handshake cannot rekey, destroy an unowned session, or revive a clo
       nativeCrypto.createHandshakeMessage = () => ({ message: {}, privKey: Buffer.alloc(32), nonce: Buffer.alloc(16) });
       nativeCrypto.writeHandshakeMessage = async () => {};
       nativeCrypto.deriveSessionKeys = () => { derivations += 1; return {}; };
-      DiodeSocket.prototype.finishTlsWrites = async () => { publishPort._cleanupNativeSession(session); };
+      DiodeSocket.prototype.flush = async () => { publishPort._cleanupNativeSession(session); };
       try {
         const ref = makeRef('2f');
         publishPort.handleTLSHandshake(makeSessionId('2f'), ref, session.port, session.deviceId, connection);
@@ -824,7 +824,7 @@ test('native handshake cannot rekey, destroy an unowned session, or revive a clo
         }
       } finally {
         tls.TLSSocket = originalTls;
-        DiodeSocket.prototype.finishTlsWrites = originalFinish;
+        DiodeSocket.prototype.flush = originalFlush;
         Object.assign(nativeCrypto, originals);
         publishPort.close();
       }

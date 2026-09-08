@@ -1140,14 +1140,18 @@ class DiodeClientManager extends EventEmitter {
           connection,
           index,
           hasScore,
-          fresh,
+          inCooldown: !!(score && score.cooldownUntil > Date.now()),
           latency: hasScore ? score.ewmaLatencyMs : Number.POSITIVE_INFINITY,
           connectedAt: connection._managerConnectedAt || Number.MAX_SAFE_INTEGER,
         };
       })
       .sort((left, right) => {
-        const leftGroup = left.hasScore ? (left.fresh ? 0 : 1) : 2;
-        const rightGroup = right.hasScore ? (right.fresh ? 0 : 1) : 2;
+        // Freshness schedules measurement; it is not a latency penalty. A
+        // nearby relay's score expires before the five-minute refresh throttle,
+        // so preferring every fresh score could send traffic overseas or prune
+        // the fastest connection merely because its probe completed first.
+        const leftGroup = left.inCooldown ? 2 : (left.hasScore ? 0 : 1);
+        const rightGroup = right.inCooldown ? 2 : (right.hasScore ? 0 : 1);
         if (leftGroup !== rightGroup) {
           return leftGroup - rightGroup;
         }
@@ -2141,19 +2145,8 @@ class DiodeClientManager extends EventEmitter {
     trace.initialServerIdHex = candidate.serverIdHex;
     trace.initialHostKey = candidate.hostKey || null;
 
-    if (candidate.relayConnection && isConnected(candidate.relayConnection)) {
-      const hostKey = candidate.hostKey || candidate.relayConnection._managerHostKey || '';
-      this._setDeviceCacheEntry(deviceIdHex, {
-        serverIdHex: candidate.serverIdHex,
-        hostKey,
-        ts: Date.now(),
-        ttlMs: this._getDeviceCacheTtlForHost(hostKey),
-      });
-      trace.finalServerIdHex = candidate.serverIdHex;
-      trace.finalHostKey = hostKey;
-      return candidate.relayConnection;
-    }
-
+    // A warm connection can still be a slow/stale destination ticket answer.
+    // Use the same reconciliation path for warm and newly dialed relays.
     try {
       const startedAt = Date.now();
       await this._ensureDeviceRelayCandidateConnection(candidate);

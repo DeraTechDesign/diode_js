@@ -1,0 +1,276 @@
+{
+  "date": "2026-09-08T17:34:15.324Z",
+  "node": "v22.19.0",
+  "version": "0.5.1",
+  "scope": "Live public relay network, disposable local identities; echoMbps counts payload once over upload+echo time, not one-way capacity",
+  "transports": [
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tcp",
+      "transport": "api",
+      "sample": 0,
+      "ok": true,
+      "ms": 6156.18,
+      "value": {
+        "firstEchoMs": 462.31,
+        "rtt": [
+          224.69,
+          223.69,
+          232.01,
+          223.69,
+          223.64
+        ],
+        "medianRttMs": 223.69,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 4523.03,
+          "echoMbps": 1.85
+        },
+        "cpuMs": 141,
+        "eventLoopP99Ms": 22.2
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tls",
+      "transport": "api",
+      "sample": 0,
+      "ok": true,
+      "ms": 6223.54,
+      "value": {
+        "firstEchoMs": 906.11,
+        "rtt": [
+          224.06,
+          223.44,
+          223.21,
+          235.17,
+          224.8
+        ],
+        "medianRttMs": 224.06,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 4148.35,
+          "echoMbps": 2.02
+        },
+        "cpuMs": 187,
+        "eventLoopP99Ms": 23.23
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "udp",
+      "transport": "api",
+      "sample": 0,
+      "ok": true,
+      "ms": 2718.97,
+      "value": {
+        "firstEchoMs": 452.39,
+        "rtt": [
+          223.72,
+          223.58,
+          223.56,
+          224.6,
+          223.89
+        ],
+        "medianRttMs": 223.72,
+        "bulk": {
+          "sent": 200,
+          "received": 200,
+          "lossPct": 0,
+          "offeredMbps": 1.86,
+          "echoMbps": 1.48
+        },
+        "cpuMs": 266,
+        "eventLoopP99Ms": 21.32
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tcp",
+      "transport": "native",
+      "sample": 0,
+      "ok": true,
+      "ms": 4299.91,
+      "value": {
+        "firstEchoMs": 1538.75,
+        "rtt": [
+          247.45,
+          246.13,
+          245.53,
+          245.78,
+          245.81
+        ],
+        "medianRttMs": 245.81,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 1491.58,
+          "echoMbps": 5.62
+        },
+        "cpuMs": 187,
+        "eventLoopP99Ms": 22.13
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "udp",
+      "transport": "native",
+      "sample": 0,
+      "ok": true,
+      "ms": 6680.85,
+      "value": {
+        "firstEchoMs": 1413.34,
+        "rtt": [
+          257.25,
+          250.95,
+          251.77,
+          251.7,
+          254.24
+        ],
+        "medianRttMs": 251.77,
+        "bulk": {
+          "sent": 200,
+          "received": 199,
+          "lossPct": 0.5,
+          "offeredMbps": 1.73,
+          "echoMbps": 1.36
+        },
+        "cpuMs": 203,
+        "eventLoopP99Ms": 20.76
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tcp",
+      "transport": "api",
+      "sample": 1,
+      "ok": true,
+      "ms": 5556.62,
+      "value": {
+        "firstEchoMs": 452.66,
+        "rtt": [
+          223.78,
+          227.67,
+          223.54,
+          223.79,
+          223.31
+        ],
+        "medianRttMs": 223.78,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 3941.71,
+          "echoMbps": 2.13
+        },
+        "cpuMs": 79,
+        "eventLoopP99Ms": 22.32
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tls",
+      "transport": "api",
+      "sample": 1,
+      "ok": true,
+      "ms": 6109.18,
+      "value": {
+        "firstEchoMs": 905.22,
+        "rtt": [
+          223.5,
+          223.54,
+          223.36,
+          223.58,
+          225.15
+        ],
+        "medianRttMs": 223.54,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 4043.09,
+          "echoMbps": 2.07
+        },
+        "cpuMs": 312,
+        "eventLoopP99Ms": 20.51
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "udp",
+      "transport": "api",
+      "sample": 1,
+      "ok": true,
+      "ms": 2837.41,
+      "value": {
+        "firstEchoMs": 451.38,
+        "rtt": [
+          223.34,
+          224.03,
+          224.55,
+          227.97,
+          223.43
+        ],
+        "medianRttMs": 224.03,
+        "bulk": {
+          "sent": 200,
+          "received": 200,
+          "lossPct": 0,
+          "offeredMbps": 1.64,
+          "echoMbps": 1.34
+        },
+        "cpuMs": 188,
+        "eventLoopP99Ms": 20.59
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "tcp",
+      "transport": "native",
+      "sample": 1,
+      "ok": true,
+      "ms": 4169.48,
+      "value": {
+        "firstEchoMs": 1504.14,
+        "rtt": [
+          235.24,
+          234.95,
+          236.46,
+          235.55,
+          240.91
+        ],
+        "medianRttMs": 235.55,
+        "bulk": {
+          "bytes": 1048576,
+          "ms": 1442.89,
+          "echoMbps": 5.81
+        },
+        "cpuMs": 125,
+        "eventLoopP99Ms": 20.12
+      }
+    },
+    {
+      "relay": "us2.prenet.diode.io",
+      "protocol": "udp",
+      "transport": "native",
+      "sample": 1,
+      "ok": true,
+      "ms": 3680.91,
+      "value": {
+        "firstEchoMs": 1398.38,
+        "rtt": [
+          236.67,
+          236.69,
+          245.7,
+          238.81,
+          237.39
+        ],
+        "medianRttMs": 237.39,
+        "bulk": {
+          "sent": 200,
+          "received": 200,
+          "lossPct": 0,
+          "offeredMbps": 2.04,
+          "echoMbps": 1.58
+        },
+        "cpuMs": 188,
+        "eventLoopP99Ms": 20.56
+      }
+    }
+  ]
+}

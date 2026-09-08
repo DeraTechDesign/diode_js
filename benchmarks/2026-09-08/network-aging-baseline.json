@@ -1,0 +1,336 @@
+{
+  "date": "2026-09-08T17:32:37.631Z",
+  "node": "v22.19.0",
+  "version": "0.5.3",
+  "scope": "Live public relay network, disposable local identities; echoMbps counts payload once over upload+echo time, not one-way capacity",
+  "selection": {
+    "ready": {
+      "ms": 226.61,
+      "relay": "eu1.prenet.diode.io:41046"
+    },
+    "settledMs": 16672,
+    "selected": "eu1.prenet.diode.io:41046",
+    "discovery": {
+      "loadedCount": 174,
+      "usableCount": 83,
+      "filteredCount": 91,
+      "startupProbeCount": 2
+    },
+    "relays": [
+      {
+        "host": "eu1.prenet.diode.io:41046",
+        "rttMs": 13,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "us1.prenet.diode.io:41046",
+        "rttMs": 149,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "as1.prenet.diode.io:41046",
+        "rttMs": 255,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "147.90.12.143:41046",
+        "rttMs": 44,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "129.153.190.246:41046",
+        "rttMs": 697,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "195.26.224.76:41046",
+        "rttMs": 30,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "82.70.40.188:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      },
+      {
+        "host": "50.70.33.191:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      },
+      {
+        "host": "149.102.142.164:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      },
+      {
+        "host": "172.237.135.36:41046",
+        "rttMs": 104,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "34.60.163.150:41046",
+        "rttMs": 105,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "172.232.175.125:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      },
+      {
+        "host": "172.105.151.19:41046",
+        "rttMs": 102,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "198.12.75.201:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      },
+      {
+        "host": "195.26.246.171:41046",
+        "rttMs": 119,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "152.53.245.124:41046",
+        "rttMs": 27,
+        "failures": 0,
+        "source": "network"
+      },
+      {
+        "host": "us2.prenet.diode.io:41046",
+        "rttMs": 119,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "eu2.prenet.diode.io:41046",
+        "rttMs": 43,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "as2.prenet.diode.io:41046",
+        "rttMs": 185,
+        "failures": 0,
+        "source": "seed"
+      },
+      {
+        "host": "194.13.82.30:41046",
+        "rttMs": null,
+        "failures": 1,
+        "source": "seed"
+      }
+    ],
+    "agedFastestScore": {
+      "selected": "152.53.245.124:41046",
+      "selectedRttMs": 27,
+      "fastest": "eu1.prenet.diode.io:41046",
+      "fastestRttMs": 13
+    }
+  },
+  "seeds": [
+    {
+      "host": "as1.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 1625.25,
+      "medianRttMs": 228.04,
+      "rtt": [
+        228.29,
+        228.09,
+        227.93,
+        228.04,
+        227.96
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 229
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 228.2
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 228.4
+        },
+        {
+          "command": "ticketv2",
+          "ms": 230.82
+        }
+      ]
+    },
+    {
+      "host": "as2.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 1287.63,
+      "medianRttMs": 165,
+      "rtt": [
+        165,
+        162.11,
+        175.61,
+        162.63,
+        176.91
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 189.63
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 177.19
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 215.06
+        },
+        {
+          "command": "ticketv2",
+          "ms": 169.93
+        }
+      ]
+    },
+    {
+      "host": "us1.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 1280.7,
+      "medianRttMs": 149.26,
+      "rtt": [
+        156.84,
+        147,
+        147.53,
+        162.33,
+        149.26
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 267.67
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 148.59
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 155.62
+        },
+        {
+          "command": "ticketv2",
+          "ms": 171.29
+        }
+      ]
+    },
+    {
+      "host": "us2.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 844.13,
+      "medianRttMs": 112.02,
+      "rtt": [
+        111.94,
+        112.33,
+        112.09,
+        111.77,
+        112.02
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 115.12
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 111.96
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 112.79
+        },
+        {
+          "command": "ticketv2",
+          "ms": 141.35
+        }
+      ]
+    },
+    {
+      "host": "eu1.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 99.02,
+      "medianRttMs": 9.91,
+      "rtt": [
+        10.1,
+        9.71,
+        9.76,
+        10.94,
+        9.91
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 11.26
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 9.88
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 10.27
+        },
+        {
+          "command": "ticketv2",
+          "ms": 12.63
+        }
+      ]
+    },
+    {
+      "host": "eu2.prenet.diode.io:41046",
+      "ok": true,
+      "connectMs": 239.31,
+      "medianRttMs": 17.37,
+      "rtt": [
+        72.44,
+        17.37,
+        16.97,
+        65.74,
+        16.61
+      ],
+      "commands": [
+        {
+          "command": "bytes",
+          "ms": 20.32
+        },
+        {
+          "command": "glmr:getblockpeak",
+          "ms": 16.69
+        },
+        {
+          "command": "glmr:getblockheader",
+          "ms": 65.15
+        },
+        {
+          "command": "ticketv2",
+          "ms": 21.55
+        }
+      ]
+    }
+  ]
+}

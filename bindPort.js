@@ -650,10 +650,12 @@ class BindPort extends EventEmitter {
       handshakeComplete = true;
       return session;
     } finally {
-      // TLS write callbacks can precede relay ACKs. Flush the authenticated
-      // exchange and close_notify before releasing its API ref.
+      // This short-lived channel carries one complete, signed exchange. Flush
+      // its relay ACKs without writing close_notify: the peer can already have
+      // released the API ref after its reply, so a new TLS alert can fail and
+      // incorrectly tear down the authenticated native session.
       if (handshakeComplete && diodeSocket && tlsSocket && !diodeSocket.destroyed) {
-        try { await diodeSocket.finishTlsWrites(tlsSocket); } catch (_) {}
+        try { await diodeSocket.flush(); } catch (_) {}
       }
       let currentWrapper;
       try { currentWrapper = connection.getClientSocket(ref); } catch {}

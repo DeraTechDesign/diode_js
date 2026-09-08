@@ -1,5 +1,19 @@
 # DiodeJs
 
+### Relay selection and live performance
+
+Connected relays rank by measured RTT, with recently failed probes demoted.
+An older RTT sample triggers a background refresh without automatically losing
+to a slower, newer sample. Slow destination tickets are reconciled even when
+their relay already has a warm connection. Existing tunnels stay on their relay.
+
+Run `node scripts/benchmark-network.js --help` for live seed discovery, handshake
+timings, and API TCP/TLS/UDP and Native TCP/UDP echo measurements. The benchmark
+uses disposable identities and a temporary echo service restricted to its own
+client. `--routing` reproduces score aging while measuring the actual selected
+data path. See [the September performance report](https://github.com/DeraTechDesign/diode_js/blob/main/docs/performance-2026-09-08.md)
+for results, historical comparisons, limitations, and reproduction commands.
+
 ### Native TCP/UDP transport
 
 Native transport (`transport: "native"`) uses `portopen2` and the existing

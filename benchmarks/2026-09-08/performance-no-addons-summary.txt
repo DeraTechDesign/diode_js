@@ -1,0 +1,10 @@
+Command: node --require ./test/fixtures/no-native-addons.cjs --test --test-reporter=tap test/nativeTcp.integration.test.js test/nativeHandshakeErrors.test.js
+Node: v22.19.0
+# tests 8
+# suites 0
+# pass 8
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 8700.2176

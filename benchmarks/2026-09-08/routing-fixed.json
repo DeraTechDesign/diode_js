@@ -1,0 +1,391 @@
+{
+  "date": "2026-09-08T17:37:04.613Z",
+  "node": "v22.19.0",
+  "version": "0.5.3",
+  "scope": "Live public relay network, disposable local identities; echoMbps counts payload once over upload+echo time, not one-way capacity",
+  "routing": {
+    "fastest": "eu1.prenet.diode.io:41046",
+    "answers": [
+      {
+        "via": "eu1.prenet.diode.io:41046",
+        "ok": true,
+        "ms": 121.73,
+        "destination": "eu1.prenet.diode.io:41046"
+      },
+      {
+        "via": "us2.prenet.diode.io:41046",
+        "ok": true,
+        "ms": 653.44,
+        "destination": "us2.prenet.diode.io:41046"
+      },
+      {
+        "via": "as1.prenet.diode.io:41046",
+        "ok": true,
+        "ms": 586.42,
+        "destination": "as1.prenet.diode.io:41046"
+      }
+    ],
+    "results": [
+      {
+        "phase": "fresh",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tcp",
+        "transport": "api",
+        "ok": true,
+        "ms": 392.4,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 63.24,
+          "rtt": [
+            22.75,
+            22.54,
+            23.2,
+            22.99,
+            23.31
+          ],
+          "medianRttMs": 22.99,
+          "bulk": {
+            "bytes": 1048576,
+            "ms": 173.77,
+            "echoMbps": 48.27
+          },
+          "cpuMs": 125,
+          "eventLoopP99Ms": 15.78
+        },
+        "route": {
+          "lookupMs": 12,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fresh",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tls",
+        "transport": "api",
+        "ok": true,
+        "ms": 360.09,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 114.86,
+          "rtt": [
+            22.42,
+            22.45,
+            22.64,
+            22.9,
+            22.66
+          ],
+          "medianRttMs": 22.64,
+          "bulk": {
+            "bytes": 1048576,
+            "ms": 98.11,
+            "echoMbps": 85.5
+          },
+          "cpuMs": 63,
+          "eventLoopP99Ms": 18.3
+        },
+        "route": {
+          "lookupMs": 11,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fresh",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "udp",
+        "transport": "api",
+        "ok": true,
+        "ms": 803.49,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 62.19,
+          "rtt": [
+            24.05,
+            22.21,
+            22.7,
+            23.09,
+            22.47
+          ],
+          "medianRttMs": 22.7,
+          "bulk": {
+            "sent": 200,
+            "received": 200,
+            "lossPct": 0,
+            "offeredMbps": 3,
+            "echoMbps": 2.89
+          },
+          "cpuMs": 250,
+          "eventLoopP99Ms": 15.54
+        },
+        "route": {
+          "lookupMs": 14,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fresh",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tcp",
+        "transport": "native",
+        "ok": true,
+        "ms": 499.89,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 220.66,
+          "rtt": [
+            20.32,
+            19.99,
+            19.89,
+            20.07,
+            19.81
+          ],
+          "medianRttMs": 19.99,
+          "bulk": {
+            "bytes": 1048576,
+            "ms": 137.36,
+            "echoMbps": 61.07
+          },
+          "cpuMs": 157,
+          "eventLoopP99Ms": 27.53
+        },
+        "route": {
+          "lookupMs": 11,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fresh",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "udp",
+        "transport": "native",
+        "ok": false,
+        "ms": 15049.53,
+        "error": "Echo timed out after 0/32 bytes",
+        "route": {
+          "lookupMs": 11,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fast-score-aged",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tcp",
+        "transport": "api",
+        "ok": true,
+        "ms": 296.8,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 56.92,
+          "rtt": [
+            21.92,
+            22.82,
+            21.92,
+            22.04,
+            22.17
+          ],
+          "medianRttMs": 22.04,
+          "bulk": {
+            "bytes": 1048576,
+            "ms": 91.26,
+            "echoMbps": 91.92
+          },
+          "cpuMs": 47,
+          "eventLoopP99Ms": 17.2
+        },
+        "route": {
+          "lookupMs": 12,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fast-score-aged",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tls",
+        "transport": "api",
+        "ok": true,
+        "ms": 352.47,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 109.01,
+          "rtt": [
+            22.46,
+            22.63,
+            22.48,
+            23.05,
+            22.23
+          ],
+          "medianRttMs": 22.48,
+          "bulk": {
+            "bytes": 1048576,
+            "ms": 97.64,
+            "echoMbps": 85.91
+          },
+          "cpuMs": 110,
+          "eventLoopP99Ms": 20.37
+        },
+        "route": {
+          "lookupMs": 11,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fast-score-aged",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "udp",
+        "transport": "api",
+        "ok": true,
+        "ms": 746.13,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 76.22,
+          "rtt": [
+            22.37,
+            22.03,
+            23.94,
+            22.14,
+            22.04
+          ],
+          "medianRttMs": 22.14,
+          "bulk": {
+            "sent": 200,
+            "received": 200,
+            "lossPct": 0,
+            "offeredMbps": 3.39,
+            "echoMbps": 3.25
+          },
+          "cpuMs": 125,
+          "eventLoopP99Ms": 15.29
+        },
+        "route": {
+          "lookupMs": 15,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fast-score-aged",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "tcp",
+        "transport": "native",
+        "ok": false,
+        "ms": 211.95,
+        "error": "Socket closed after 0/32 echo bytes",
+        "route": {
+          "lookupMs": 12,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      },
+      {
+        "phase": "fast-score-aged",
+        "controlRelay": "eu1.prenet.diode.io:41046",
+        "protocol": "udp",
+        "transport": "native",
+        "ok": true,
+        "ms": 3875.09,
+        "value": {
+          "openedRelay": "eu1.prenet.diode.io:41046",
+          "firstEchoMs": 208.01,
+          "rtt": [
+            21.48,
+            21.39,
+            27.1,
+            21.93,
+            21.56
+          ],
+          "medianRttMs": 21.56,
+          "bulk": {
+            "sent": 200,
+            "received": 199,
+            "lossPct": 0.5,
+            "offeredMbps": 3.14,
+            "echoMbps": 3.01
+          },
+          "cpuMs": 172,
+          "eventLoopP99Ms": 16.5
+        },
+        "route": {
+          "lookupMs": 12,
+          "initial": "eu1.prenet.diode.io:41046",
+          "final": "eu1.prenet.diode.io:41046",
+          "reconciliation": {
+            "triggered": false,
+            "attempted": false,
+            "hadAlternateAnswer": false,
+            "choseAlternate": false,
+            "alternateResults": []
+          }
+        }
+      }
+    ]
+  }
+}

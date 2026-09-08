@@ -668,9 +668,11 @@ class PublishPort extends EventEmitter {
         });
 
         // The handshake ref is closed in finally. Wait until TLS has accepted
-        // and drained the response frame so cleanup cannot truncate it.
+        // and the relay has acknowledged the signed response. Do not append
+        // TLS close_notify to this completed message exchange: either peer
+        // may already be releasing the temporary API ref.
         await nativeCrypto.writeHandshakeMessage(tlsSocket, message);
-        await diodeSocket.finishTlsWrites(tlsSocket);
+        await diodeSocket.flush();
         ensureCurrent();
 
         session.session = nativeCrypto.deriveSessionKeys({

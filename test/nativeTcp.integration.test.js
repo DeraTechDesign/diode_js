@@ -51,13 +51,13 @@ function makeConnection(identity) {
 // Simulate only the relay's RPC routing and portopen2 socket pairing. The
 // library performs its actual TLS handshake, signed identity verification,
 // session-key derivation, TCP encryption and stream shutdown on both sides.
-async function makeRelay(targetPort) {
+async function makeRelay(targetPort, { rejectHandshakeShutdown = false } = {}) {
   const binder = makeConnection(binderIdentity);
   const publisher = makeConnection(publisherIdentity);
   const pending = new Map();
   const sockets = [];
   const jobs = new Set();
-  const stats = { nativeOpens: 0, handshakeOpens: 0, apiBytes: 0, nativeBytes: 0, nativeCloses: 0 };
+  const stats = { nativeOpens: 0, handshakeOpens: 0, apiBytes: 0, nativeBytes: 0, nativeCloses: 0, shutdownRecords: 0 };
   let requestId = 0;
   let closed = false;
   const schedule = (callback) => {
@@ -106,6 +106,12 @@ async function makeRelay(targetPort) {
       async portSend(ref, data) {
         assert.ok(data.length <= 65000, 'TLS handshake must respect relay API frame limits');
         const frame = Buffer.from(data);
+        // TLS 1.2 alert records carry close_notify after the signed exchange.
+        // A relay may already have released the short-lived handshake ref.
+        if (rejectHandshakeShutdown && frame[0] === 21) {
+          stats.shutdownRecords += 1;
+          throw new Error('port does not exist');
+        }
         stats.apiBytes += frame.length;
         return new Promise((resolve) => schedule(() => deliver(destination, () => {
           destination.emit('unsolicited', envelope(['portsend', ref, frame]));
@@ -172,7 +178,7 @@ function binaryPayload(bytes, prefix) {
   return value;
 }
 
-async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false } = {}) {
+async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false, rejectHandshakeShutdown = false } = {}) {
   const request = binaryPayload(requestBytes, '030000130ee0000000000100080003000000');
   const response = Buffer.concat([binaryPayload(responseBytes, '1201003400000100'), Buffer.from('\x00FINAL-RESPONSE-TAIL\xff', 'latin1')]);
   const banner = serverFirst ? Buffer.from('SSH-2.0-loopback-native-test\r\n') : Buffer.alloc(0);
@@ -218,7 +224,7 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
   try {
     backend.listen(0, '127.0.0.1');
     await once(backend, 'listening');
-    relay = await makeRelay(backend.address().port);
+    relay = await makeRelay(backend.address().port, { rejectHandshakeShutdown });
     publish = new PublishPort(relay.publisher, { [backend.address().port]: { host: '127.0.0.1', mode: 'private', whitelist: [binderIdentity.address] } });
     bind = new BindPort(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: publisherIdentity.address.slice(2), protocol: 'tcp', transport: 'native' } });
     const listening = once(bind, 'listening');
@@ -286,6 +292,11 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
 
 test('real native TCP carries client-first binary data and a delayed response after client half-close', { timeout: 20000 }, async () => {
   await runNativeTunnel();
+});
+
+test('native setup does not send TLS shutdown records after the signed handshake exchange', { timeout: 20000 }, async () => {
+  const stats = await runNativeTunnel({ rejectHandshakeShutdown: true });
+  assert.equal(stats.shutdownRecords, 0);
 });
 
 test('real native TCP preserves a server-first banner sent before the authenticated handshake finishes', { timeout: 20000 }, async () => {
