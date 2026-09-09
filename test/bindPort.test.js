@@ -226,6 +226,37 @@ test('API portopen tries connected relays when device relay lookup fails', async
   }]);
 });
 
+test('stale warm routes try another seed without changing the transport', async () => {
+  for (const native of [false, true]) {
+    const calls = [];
+    const bad = makeRelay('stale.relay:41046', new Error('not found'), calls);
+    bad.RPC.portOpen2 = bad.RPC.portOpen;
+    const goodRef = makeRef('12345678');
+    const good = makeRelay('cold.seed:41046', native ? 41000 : goodRef, calls);
+    good.RPC.portOpen2 = good.RPC.portOpen;
+    const manager = new FakeManager({relays:[bad],resolvedRelay:bad,nearestRelay:bad});
+    manager.withSeedRelayFallback = async (excluded, open) => {
+      assert.deepEqual(excluded, ['stale.relay:41046']);
+      return open(good);
+    };
+    const bind = new BindPort(manager, {});
+    const result = await bind._openPortWithRelayFallback(Buffer.alloc(20), '00'.repeat(20), 'tcp:8088', 'rw', native, {});
+    assert.equal(result.connection, good);
+    assert.equal(native ? result.physicalPort : result.ref, native ? 41000 : goodRef);
+    assert.deepEqual(calls.map(c=>c.hostKey), ['stale.relay:41046','cold.seed:41046']);
+    bind.dispose();
+  }
+});
+
+test('an authorization rejection never expands to additional seed relays', async () => {
+  const denied=makeRelay('denied.relay:41046',new Error('Device not whitelisted'),[]);
+  const manager=new FakeManager({relays:[denied],resolvedRelay:denied,nearestRelay:denied});
+  manager.withSeedRelayFallback=()=>assert.fail('Denied access must not expand relay discovery');
+  const bind=new BindPort(manager,{});
+  await assert.rejects(bind._openApiPortWithRelayFallback(Buffer.alloc(20),'00'.repeat(20),'tcp:8088'),/not whitelisted/);
+  bind.dispose();
+});
+
 test('multiple BindPort instances share one manager listener set', () => {
   const manager = new FakeManager({
     relays: [],

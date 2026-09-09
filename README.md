@@ -8,6 +8,13 @@ closed after five seconds. If startup crashed before creating `keys.json`, stop
 all writers and remove only the empty `keys.json.lock` directory before retrying.
 Never delete an existing identity to resolve a connection error.
 
+If all connected routes return `not found`, tunnel opening tries at most three
+additional configured seed relays. Each trial stays available until the caller
+registers its tunnel; idle RTT pruning can then resume. Existing connection and
+RPC deadlines bound each attempt. This recovers stale destination tickets on
+clients with a small warm-relay budget. Transport selection and publisher access
+checks are preserved; application data is never replayed.
+
 Native TCP relay selection now checks the allocated data socket before accepting
 a relay. An unreachable socket closes that allocation and releases its lease,
 then tries the other available relays while the application socket stays paused.

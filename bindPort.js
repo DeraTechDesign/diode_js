@@ -448,8 +448,8 @@ class BindPort extends EventEmitter {
     return candidates;
   }
 
-  _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
-    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, false);
+  _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw', options = {}) {
+    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, false, options);
   }
 
   _openNativePortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw', options = {}) {
@@ -461,31 +461,34 @@ class BindPort extends EventEmitter {
     let clearedCache = false;
     let lastError = null;
 
+    const open = async connection => {
+      const rpc = this._getRpcFor(connection);
+      const relayKey = this._connectionKey(connection) || 'unknown relay';
+      const ref = await this._withTimeout(
+        () => native
+          ? rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs })
+          : rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+        this.portOpenTimeoutMs,
+        `${native ? 'portopen2' : 'portopen'} ${formattedTargetPort} via ${relayKey}`
+      );
+      if (!(native ? Number.isInteger(ref) && ref > 0 && ref <= 65535 : ref))
+        throw new Error(`${native ? 'portopen2 returned no valid port' : 'portopen returned no ref'} via ${relayKey}`);
+      const opened = native ? { connection, rpc, physicalPort: ref } : { connection, rpc, ref };
+      if (options.prepare) Object.assign(opened, await options.prepare(opened));
+      return opened;
+    };
+
     for (let index = 0; index < candidates.length; index += 1) {
       if (options.cancelled?.()) throw new Error('Bind closed during relay selection');
       const connection = candidates[index];
-      const rpc = this._getRpcFor(connection);
       const relayKey = this._connectionKey(connection) || 'unknown relay';
 
       try {
-        const ref = await this._withTimeout(
-          () => native
-            ? rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs })
-            : rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
-          this.portOpenTimeoutMs,
-          `${native ? 'portopen2' : 'portopen'} ${formattedTargetPort} via ${relayKey}`
-        );
-        if (native ? Number.isInteger(ref) && ref > 0 && ref <= 65535 : ref) {
-          const opened = native ? { connection, rpc, physicalPort: ref } : { connection, rpc, ref };
-          // Native allocation alone does not prove the relay data port is
-          // reachable. TCP callers complete that connection before selection.
-          if (options.prepare) Object.assign(opened, await options.prepare(opened));
-          if (index > 0) {
-            logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
-          }
-          return opened;
+        const opened = await open(connection);
+        if (index > 0) {
+          logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
         }
-        lastError = new Error(`${native ? 'portopen2 returned no valid port' : 'portopen returned no ref'} via ${relayKey}`);
+        return opened;
       } catch (error) {
         lastError = error;
         if (options.cancelled?.()) throw error;
@@ -506,6 +509,10 @@ class BindPort extends EventEmitter {
       }
     }
 
+    if (String(lastError?.reason || lastError?.message).toLowerCase() === 'not found' &&
+        typeof this.connection?.withSeedRelayFallback === 'function') {
+      return this.connection.withSeedRelayFallback(candidates.map(connection => this._connectionKey(connection)), open, options);
+    }
     throw lastError || new Error('No relay connection available');
   }
 
@@ -1337,7 +1344,8 @@ class BindPort extends EventEmitter {
 
         // Legacy API relay
         try {
-          const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw');
+          const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw',
+            { cancelled: () => context.closed || clientClosed || clientSocket.destroyed });
           connection = opened.connection;
           rpc = opened.rpc;
           ref = opened.ref;
