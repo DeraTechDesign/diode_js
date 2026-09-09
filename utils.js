@@ -188,7 +188,7 @@ function loadOrGenerateKeyPair(keyLocation) {
       temporaryFd = null;
 
       try {
-        fs.linkSync(temporaryPath, keyLocation);
+        installKeyFile(temporaryPath, keyLocation);
       } catch (error) {
         if (error && error.code === 'EEXIST') {
           return loadKeyPairFile(keyLocation);
@@ -210,6 +210,50 @@ function loadOrGenerateKeyPair(keyLocation) {
   } catch (error) {
     logger.error(() => `Error loading or generating key pair: ${error}`);
     throw error;
+  }
+}
+
+function installKeyFile(temporaryPath, keyLocation) {
+  try {
+    fs.linkSync(temporaryPath, keyLocation);
+    return;
+  } catch (error) {
+    // Android app storage rejects hard links under SELinux. Keep the same
+    // complete-file, single-writer guarantee using mkdir and rename there.
+    if (!['EACCES', 'EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS'].includes(error?.code)) throw error;
+  }
+  const lockPath = `${keyLocation}.lock`;
+  const deadline = Date.now() + 5000;
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  while (true) {
+    if (fs.existsSync(keyLocation)) {
+      const exists = new Error('Diode identity already exists');
+      exists.code = 'EEXIST';
+      throw exists;
+    }
+    try {
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (Date.now() >= deadline) {
+        const busy = new Error('Diode identity creation is locked; existing identity was not changed');
+        busy.code = 'EBUSY';
+        throw busy;
+      }
+      Atomics.wait(wait, 0, 0, 20);
+    }
+  }
+  try {
+    // Another starter can finish between the first read and acquiring the lock.
+    if (fs.existsSync(keyLocation)) {
+      const exists = new Error('Diode identity already exists');
+      exists.code = 'EEXIST';
+      throw exists;
+    }
+    fs.renameSync(temporaryPath, keyLocation);
+  } finally {
+    fs.rmdirSync(lockPath);
   }
 }
 

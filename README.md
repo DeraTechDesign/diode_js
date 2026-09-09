@@ -1,5 +1,13 @@
 # DiodeJs
 
+First-start identity creation supports Android app storage, where SELinux can
+deny hard links. The fallback uses a private directory lock and atomic rename
+of the complete, flushed key file. Concurrent starters reuse the winning identity;
+existing or corrupt identities are never replaced. A stale creation lock fails
+closed after five seconds. If startup crashed before creating `keys.json`, stop
+all writers and remove only the empty `keys.json.lock` directory before retrying.
+Never delete an existing identity to resolve a connection error.
+
 Native TCP relay selection now checks the allocated data socket before accepting
 a relay. An unreachable socket closes that allocation and releases its lease,
 then tries the other available relays while the application socket stays paused.
