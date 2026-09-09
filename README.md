@@ -1,5 +1,18 @@
 # DiodeJs
 
+Native TCP relay selection now checks the allocated data socket before accepting
+a relay. An unreachable socket closes that allocation and releases its lease,
+then tries the other available relays while the application socket stays paused.
+Cancellation closes late allocations. There is no API downgrade or replay of
+application data; failures after authentication still end the stream.
+
+On 2026-09-09, the live disposable-peer benchmark through `eu1.prenet.diode.io`
+passed Native TCP twice (1 MiB upload-plus-echo, 60.32 and 73.56 Mbps, not one-way
+capacity). The OrendaService application test still failed on its automatically
+selected route: allocated data-port timeouts and a handshake timeout. A successful
+control connection or local relay test does not qualify a public Native route.
+This branch is unreleased; installed diodejs 0.5.4 does not contain this retry fix.
+
 ### Relay selection and live performance
 
 Connected relays rank by measured RTT, with recently failed probes demoted.
