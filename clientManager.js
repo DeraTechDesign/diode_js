@@ -195,6 +195,7 @@ class DiodeClientManager extends EventEmitter {
     this._lastNetworkDiscoveryStats = null;
     this._lastDeviceResolutionTrace = null;
     this._closed = false;
+    this._relayTrialHosts = new Map();
     this._lifecycleGeneration = 0;
     this.fleetContract = DEFAULT_FLEET_CONTRACT;
 
@@ -1297,6 +1298,7 @@ class DiodeClientManager extends EventEmitter {
     if (!hostKey) {
       return false;
     }
+    if (this._relayTrialHosts.get(hostKey) > 0) return true;
     const score = this.relayScores.get(hostKey);
     if (score && score.discoveredFrom === 'target') {
       return true;
@@ -1362,6 +1364,39 @@ class DiodeClientManager extends EventEmitter {
       }
       this._closeManagedConnection(connection);
     }
+  }
+
+  // A fast but stale destination ticket can leave every warm relay returning
+  // "not found". Try at most three other configured seeds, retaining each
+  // connection while its tunnel is opened instead of pruning it by RTT first.
+  async withSeedRelayFallback(excludedHosts, open, options = {}) {
+    const excluded = new Set(excludedHosts);
+    const hosts = [...new Set(this.initialHosts.map(host => normalizeHostKey(host, this.defaultPort)))];
+    const generation = this._lifecycleGeneration;
+    let lastError;
+    for (const host of hosts.filter(host => host && !excluded.has(host)).slice(0, 3)) {
+      if (this._closed || generation !== this._lifecycleGeneration || options.cancelled?.())
+        throw new Error('Bind closed during seed relay selection');
+      this._relayTrialHosts.set(host, (this._relayTrialHosts.get(host) || 0) + 1);
+      try {
+        const connection = await this._probeHost(host, 'seed');
+        if (this._closed || generation !== this._lifecycleGeneration || options.cancelled?.())
+          throw new Error('Bind closed during seed relay selection');
+        return await open(connection);
+      } catch (error) {
+        lastError = error;
+      } finally {
+        // Let the caller register the accepted tunnel in its promise
+        // continuation before normal idle pruning resumes.
+        setImmediate(() => {
+          const count = (this._relayTrialHosts.get(host) || 1) - 1;
+          if (count > 0) this._relayTrialHosts.set(host, count);
+          else this._relayTrialHosts.delete(host);
+          this._pruneIdleConnections();
+        });
+      }
+    }
+    throw lastError || new Error('No additional seed relay available');
   }
 
   async _ensureConnection(hostEntry) {

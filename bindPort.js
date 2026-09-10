@@ -448,41 +448,50 @@ class BindPort extends EventEmitter {
     return candidates;
   }
 
-  _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
-    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, false);
+  _openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw', options = {}) {
+    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, false, options);
   }
 
-  _openNativePortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw') {
-    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, true);
+  _openNativePortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags = 'rw', options = {}) {
+    return this._openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, true, options);
   }
 
-  async _openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, native) {
+  async _openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, native, options = {}) {
     let candidates = await this._getApiRelayCandidates(deviceId, deviceIdHex);
     let clearedCache = false;
     let lastError = null;
 
-    for (let index = 0; index < candidates.length; index += 1) {
-      const connection = candidates[index];
+    const open = async connection => {
       const rpc = this._getRpcFor(connection);
+      const relayKey = this._connectionKey(connection) || 'unknown relay';
+      const ref = await this._withTimeout(
+        () => native
+          ? rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs })
+          : rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
+        this.portOpenTimeoutMs,
+        `${native ? 'portopen2' : 'portopen'} ${formattedTargetPort} via ${relayKey}`
+      );
+      if (!(native ? Number.isInteger(ref) && ref > 0 && ref <= 65535 : ref))
+        throw new Error(`${native ? 'portopen2 returned no valid port' : 'portopen returned no ref'} via ${relayKey}`);
+      const opened = native ? { connection, rpc, physicalPort: ref } : { connection, rpc, ref };
+      if (options.prepare) Object.assign(opened, await options.prepare(opened));
+      return opened;
+    };
+
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (options.cancelled?.()) throw new Error('Bind closed during relay selection');
+      const connection = candidates[index];
       const relayKey = this._connectionKey(connection) || 'unknown relay';
 
       try {
-        const ref = await this._withTimeout(
-          () => native
-            ? rpc.portOpen2(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs })
-            : rpc.portOpen(deviceId, formattedTargetPort, flags, { timeoutMs: this.portOpenTimeoutMs }),
-          this.portOpenTimeoutMs,
-          `${native ? 'portopen2' : 'portopen'} ${formattedTargetPort} via ${relayKey}`
-        );
-        if (native ? Number.isInteger(ref) && ref > 0 && ref <= 65535 : ref) {
-          if (index > 0) {
-            logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
-          }
-          return native ? { connection, rpc, physicalPort: ref } : { connection, rpc, ref };
+        const opened = await open(connection);
+        if (index > 0) {
+          logger.info(() => `Port ${formattedTargetPort} opened via fallback relay ${relayKey}`);
         }
-        lastError = new Error(`${native ? 'portopen2 returned no valid port' : 'portopen returned no ref'} via ${relayKey}`);
+        return opened;
       } catch (error) {
         lastError = error;
+        if (options.cancelled?.()) throw error;
       }
 
       logger.warn(() => `Port ${formattedTargetPort} did not open via ${relayKey}: ${lastError}`);
@@ -500,7 +509,59 @@ class BindPort extends EventEmitter {
       }
     }
 
+    if (String(lastError?.reason || lastError?.message).toLowerCase() === 'not found' &&
+        typeof this.connection?.withSeedRelayFallback === 'function') {
+      return this.connection.withSeedRelayFallback(candidates.map(connection => this._connectionKey(connection)), open, options);
+    }
     throw lastError || new Error('No relay connection available');
+  }
+
+  async _connectNativeTcpRelay(opened, context) {
+    Object.assign(context, opened, { nativeCloseStarted: false });
+    this._acquireNativeLease(context);
+    let relaySocket;
+    try {
+      if (context.closed) throw new Error('Bind closed during portopen2');
+      const relayHost = opened.connection.getServerRelayHost();
+      relaySocket = net.connect({ host: relayHost, port: opened.physicalPort, allowHalfOpen: true, autoSelectFamily: false });
+      relaySocket.setNoDelay(true);
+      relaySocket.pause();
+      context.sockets.add(relaySocket);
+      // Keep asynchronous destroy errors handled after the temporary listeners
+      // are removed. Successful streams get their lifecycle handler below.
+      relaySocket.on('error', () => {});
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = error => {
+          if (settled) return;
+          settled = true; clearTimeout(timer);
+          relaySocket.off('connect', connected);
+          relaySocket.off('error', finish);
+          relaySocket.off('close', closed);
+          if (error) reject(error); else resolve();
+        };
+        const connected = () => finish();
+        const closed = () => finish(new Error('Relay socket closed before connect'));
+        const timer = setTimeout(() => finish(new Error(`Relay socket connection timed out for ${relayHost}:${opened.physicalPort}`)),
+          normalizeTimerMs(this.portOpenTimeoutMs, 5000));
+        relaySocket.once('connect', connected);
+        relaySocket.once('error', finish);
+        relaySocket.once('close', closed);
+      });
+      return { relaySocket };
+    } catch (error) {
+      logger.error(() => `Native TCP relay connection failed: ${error}`);
+      // Close only this attempt. Keep the paused application socket available
+      // for another relay; no handshake or application bytes have been sent.
+      this._closeNativePort(context);
+      if (context.nativeLease) {
+        context.connection._diodeActiveNativeSessions = Math.max(0, Number(context.connection._diodeActiveNativeSessions || 0) - 1);
+        context.nativeLease = false;
+      }
+      context.sockets.delete(relaySocket); destroySocket(relaySocket);
+      context.physicalPort = null; context.connection = null; context.rpc = null;
+      throw error;
+    }
   }
 
   async _openTlsHandshakeChannel(connection, rpc, ref, context = null) {
@@ -1203,38 +1264,26 @@ class BindPort extends EventEmitter {
 
         if (useNative) {
           // Open a new native relay port on the device for this client
-          let physicalPort;
+          let physicalPort, relaySocket;
           try {
             const flags = config.flags || 'rw';
-            ({ connection, rpc, physicalPort } = await this._openNativePortWithRelayFallback(
-              deviceId, deviceIdHex, formattedTargetPort, flags
+            ({ connection, rpc, physicalPort, relaySocket } = await this._openNativePortWithRelayFallback(
+              deviceId, deviceIdHex, formattedTargetPort, flags, {
+                cancelled: () => context.closed || clientClosed || clientSocket.destroyed,
+                prepare: opened => this._connectNativeTcpRelay(opened, context),
+              }
             ));
           } catch (error) {
             logger.error(() => `Error opening portopen2 ${formattedTargetPort} on device: ${error}`);
-            clientSocket.destroy();
+            this._closeContext(context);
             return;
           }
-          context.connection = connection;
-          context.rpc = rpc;
-          context.physicalPort = physicalPort;
-          this._acquireNativeLease(context);
           if (clientClosed || context.closed || clientSocket.destroyed) {
-            this._closeNativePort(context);
+            this._closeContext(context);
             return;
           }
 
           const relayHost = connection.getServerRelayHost();
-          let relaySocket;
-          try {
-            relaySocket = net.connect({ host: relayHost, port: physicalPort, allowHalfOpen: true, autoSelectFamily: false });
-          } catch (error) {
-            logger.error(() => `Could not create native relay socket: ${error}`);
-            this._closeContext(context);
-            return;
-          }
-          relaySocket.setNoDelay(true);
-          relaySocket.pause();
-          context.sockets.add(relaySocket);
 
           let session = null;
           let bridge = null;
@@ -1248,35 +1297,6 @@ class BindPort extends EventEmitter {
           });
           relaySocket.on('close', () => { if (!bridge) cleanup(); });
 
-          try {
-            await new Promise((resolve, reject) => {
-              let settled = false;
-              const finish = (error) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                relaySocket.off('connect', onConnect);
-                relaySocket.off('error', onConnectError);
-                relaySocket.off('close', onConnectClose);
-                if (error) reject(error);
-                else resolve();
-              };
-              const onConnect = () => finish();
-              const onConnectError = (error) => finish(error);
-              const onConnectClose = () => finish(new Error('Relay socket closed before connect'));
-              const timer = setTimeout(
-                () => finish(new Error(`Relay socket connection timed out for ${relayHost}:${physicalPort}`)),
-                normalizeTimerMs(this.portOpenTimeoutMs, 5000)
-              );
-              relaySocket.once('connect', onConnect);
-              relaySocket.once('error', onConnectError);
-              relaySocket.once('close', onConnectClose);
-            });
-          } catch (error) {
-            logger.error(() => `Native TCP relay connection failed: ${error}`);
-            cleanup();
-            return;
-          }
           logger.info(() => `Connected to relay ${relayHost}:${physicalPort} for ${formattedTargetPort}`);
 
           if (clientClosed || context.closed || clientSocket.destroyed) {
@@ -1324,7 +1344,8 @@ class BindPort extends EventEmitter {
 
         // Legacy API relay
         try {
-          const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw');
+          const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw',
+            { cancelled: () => context.closed || clientClosed || clientSocket.destroyed });
           connection = opened.connection;
           rpc = opened.rpc;
           ref = opened.ref;
