@@ -1,5 +1,7 @@
 # DiodeJs
 
+Release candidate: `0.5.5`, including Native TCP allocation retries, Android identity storage, and stale-route recovery.
+
 First-start identity creation supports Android app storage, where SELinux can
 deny hard links. The fallback uses a private directory lock and atomic rename
 of the complete, flushed key file. Concurrent starters reuse the winning identity;
