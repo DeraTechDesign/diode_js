@@ -174,6 +174,10 @@ class BindPort extends EventEmitter {
       process.env.DIODE_RELAY_RESOLVE_TIMEOUT_MS,
       normalizeTimerMs(Math.max(this.portOpenTimeoutMs, targetConnectMs + this.portOpenTimeoutMs), 15000)
     );
+    // A stale device ticket must not hold ready relay routes behind a cold
+    // target handshake (normally allowed ten seconds). Keep that lookup alive
+    // for direct-only destinations while trying already connected relays.
+    this.relayLookupGraceMs = 250;
     this.nativeQueueLimitBytes = parseInt(process.env.DIODE_NATIVE_QUEUE_LIMIT_BYTES, 10) || MAX_SOCKET_QUEUE_BYTES;
     this.udpSessionIdleTimeoutMs = normalizeTimerMs(process.env.DIODE_UDP_SESSION_IDLE_TIMEOUT_MS, 300000);
     this._activeContexts = new Set();
@@ -408,7 +412,7 @@ class BindPort extends EventEmitter {
     cache.delete(`0x${normalized}`);
   }
 
-  async _getApiRelayCandidates(deviceId, deviceIdHex) {
+  async _getApiRelayCandidates(deviceId, deviceIdHex, onDeferred = null) {
     const candidates = [];
     const seen = new Set();
     const push = (connection) => {
@@ -423,14 +427,32 @@ class BindPort extends EventEmitter {
       candidates.push(connection);
     };
 
-    try {
-      push(await this._withTimeout(
+    const ready = typeof this.connection?.getConnections === 'function'
+      ? this.connection.getConnections().filter(connection => this._isUsableConnection(connection))
+      : [];
+    const resolution = this._withTimeout(
         () => this._resolveConnectionForDevice(deviceId),
         this.relayResolveTimeoutMs,
         `Relay resolution for ${deviceIdHex}`
-      ));
-    } catch (error) {
+    ).catch(error => {
       logger.warn(() => `Error resolving relay for device ${deviceIdHex}: ${error}`);
+      return null;
+    });
+    if (ready.length > 0 && onDeferred) {
+      const deferred = Symbol('relay lookup pending');
+      let timer;
+      try {
+        const resolved = await Promise.race([
+          resolution,
+          new Promise(resolve => { timer = setTimeout(() => resolve(deferred), this.relayLookupGraceMs); }),
+        ]);
+        if (resolved === deferred) onDeferred(resolution);
+        else push(resolved);
+      } finally {
+        clearTimeout(timer);
+      }
+    } else {
+      push(await resolution);
     }
 
     if (typeof (this.connection && this.connection.getNearestConnection) === 'function') {
@@ -457,7 +479,9 @@ class BindPort extends EventEmitter {
   }
 
   async _openPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, flags, native, options = {}) {
-    let candidates = await this._getApiRelayCandidates(deviceId, deviceIdHex);
+    const deferredLookups = [];
+    const onDeferred = resolution => deferredLookups.push(resolution);
+    let candidates = await this._getApiRelayCandidates(deviceId, deviceIdHex, onDeferred);
     let clearedCache = false;
     let lastError = null;
 
@@ -498,7 +522,7 @@ class BindPort extends EventEmitter {
       if (!clearedCache) {
         clearedCache = true;
         this._clearDeviceRelayCache(deviceIdHex);
-        const refreshed = await this._getApiRelayCandidates(deviceId, deviceIdHex);
+        const refreshed = await this._getApiRelayCandidates(deviceId, deviceIdHex, onDeferred);
         for (const candidate of refreshed) {
           const key = this._connectionKey(candidate) || String(candidates.length);
           const exists = candidates.some((existing) => (this._connectionKey(existing) || '') === key);
@@ -511,7 +535,22 @@ class BindPort extends EventEmitter {
 
     if (String(lastError?.reason || lastError?.message).toLowerCase() === 'not found' &&
         typeof this.connection?.withSeedRelayFallback === 'function') {
-      return this.connection.withSeedRelayFallback(candidates.map(connection => this._connectionKey(connection)), open, options);
+      try {
+        return await this.connection.withSeedRelayFallback(candidates.map(connection => this._connectionKey(connection)), open, options);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    // Preserve cold, non-seed destinations when no ready/seed route succeeded.
+    // A deferred lookup discovers a relay only; it never opens a second tunnel
+    // after this operation has already returned or been cancelled.
+    for (const resolution of deferredLookups) {
+      const connection = await resolution;
+      if (options.cancelled?.()) throw new Error('Bind closed during relay selection');
+      if (!this._isUsableConnection(connection) || candidates.some(candidate => this._connectionKey(candidate) === this._connectionKey(connection))) continue;
+      candidates.push(connection);
+      try { return await open(connection); }
+      catch (error) { lastError = error; }
     }
     throw lastError || new Error('No relay connection available');
   }
