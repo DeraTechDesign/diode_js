@@ -1,6 +1,14 @@
 # DiodeJs
 
-Release candidate: `0.5.5`, including Native TCP allocation retries, Android identity storage, and stale-route recovery.
+Release candidate: `0.5.6`, fixing config/app connections delayed by stale device tickets.
+
+When a device lookup is still dialing a relay after 250 ms, bind opening tries
+ready relays and then the existing bounded seed fallback. The lookup continues
+within its original deadline and remains available for destinations reachable
+only through a cold, non-seed relay. Cancellation prevents late tunnel opens.
+This applies to both API and Native transport without changing application data
+or authorization. A live config read that previously took 21.7 seconds completed
+in 2.2–3.0 seconds with the original seven-second Service deadline.
 
 First-start identity creation supports Android app storage, where SELinux can
 deny hard links. The fallback uses a private directory lock and atomic rename

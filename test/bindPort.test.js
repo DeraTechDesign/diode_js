@@ -248,6 +248,73 @@ test('stale warm routes try another seed without changing the transport', async 
   }
 });
 
+test('a pending stale ticket lookup does not delay ready relay routes in API or Native', async () => {
+  for (const native of [false, true]) {
+    const calls = [];
+    const pending = deferred();
+    const bad = makeRelay('stale.relay:41046', new Error('not found'), calls);
+    const good = makeRelay('ready.relay:41046', native ? 41000 : makeRef('aabb'), calls);
+    bad.RPC.portOpen2 = bad.RPC.portOpen;
+    good.RPC.portOpen2 = good.RPC.portOpen;
+    const manager = new FakeManager({ relays: [bad, good], nearestRelay: bad });
+    manager.getConnectionForDevice = () => pending.promise;
+    const bind = new BindPort(manager, {});
+    bind.relayLookupGraceMs = 5;
+    try {
+      const result = await bind._openPortWithRelayFallback(Buffer.alloc(20), '00'.repeat(20), 'tcp:1454', 'rw', native);
+      assert.equal(result.connection, good, 'ready route succeeds before the stale lookup resolves');
+      pending.resolve(bad);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(calls.map(call => call.hostKey), ['stale.relay:41046', 'ready.relay:41046']);
+    } finally {
+      pending.resolve(null);
+      bind.dispose();
+    }
+  }
+});
+
+test('cold non-seed relay is retained after ready and seed routes fail', async () => {
+  const calls = [];
+  const pending = deferred();
+  const bad = makeRelay('ready.relay:41046', new Error('not found'), calls);
+  const direct = makeRelay('direct.relay:41046', makeRef('ccdd'), calls);
+  const manager = new FakeManager({ relays: [bad], nearestRelay: bad });
+  manager.getConnectionForDevice = () => pending.promise;
+  manager.withSeedRelayFallback = async () => {
+    pending.resolve(direct);
+    throw new Error('not found');
+  };
+  const bind = new BindPort(manager, {});
+  bind.relayLookupGraceMs = 5;
+  try {
+    const result = await bind._openApiPortWithRelayFallback(Buffer.alloc(20), '00'.repeat(20), 'tls:1454');
+    assert.equal(result.connection, direct);
+    assert.deepEqual(calls.map(call => call.hostKey), ['ready.relay:41046', 'direct.relay:41046']);
+  } finally { pending.resolve(null); bind.dispose(); }
+});
+
+test('cancellation never opens a late resolved direct relay', async () => {
+  const calls = [];
+  const pending = deferred();
+  const bad = makeRelay('ready.relay:41046', new Error('not found'), calls);
+  const direct = makeRelay('direct.relay:41046', makeRef('eeff'), calls);
+  const manager = new FakeManager({ relays: [bad], nearestRelay: bad });
+  manager.getConnectionForDevice = () => pending.promise;
+  let cancelled = false;
+  manager.withSeedRelayFallback = async () => {
+    cancelled = true;
+    pending.resolve(direct);
+    throw new Error('Bind closed');
+  };
+  const bind = new BindPort(manager, {});
+  bind.relayLookupGraceMs = 5;
+  try {
+    await assert.rejects(bind._openApiPortWithRelayFallback(Buffer.alloc(20), '00'.repeat(20), 'tls:1454', 'rw',
+      { cancelled: () => cancelled }), /Bind closed/);
+    assert.deepEqual(calls.map(call => call.hostKey), ['ready.relay:41046']);
+  } finally { pending.resolve(null); bind.dispose(); }
+});
+
 test('an authorization rejection never expands to additional seed relays', async () => {
   const denied=makeRelay('denied.relay:41046',new Error('Device not whitelisted'),[]);
   const manager=new FakeManager({relays:[denied],resolvedRelay:denied,nearestRelay:denied});
