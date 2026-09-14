@@ -1529,3 +1529,169 @@ test('portclose2 is scoped to the relay connection as well as physical port', ()
   assert.equal(sessionB.localSocket.destroyed, false);
   publishPort.close();
 });
+
+test('flow observers record denied API and native requests without allocating target sockets', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, { 8080: { mode: 'private', whitelist: [] } });
+  const events = [];
+  publishPort.setFlowObserver((event) => events.push(event));
+  const originalConnect = net.connect;
+  net.connect = () => assert.fail('denied access must not connect to target');
+  try {
+    publishPort.handlePortOpen(makeSessionId(), ['portopen', 'tls:8080', makeRef(), makeDeviceId('a')], connection);
+    publishPort.handlePortOpen2(makeSessionId(), ['portopen2', 'tcp:8080', 41000, makeDeviceId('b'), 'rw'], connection);
+    assert.equal(events.length, 2);
+    assert.notEqual(events[0].flowId, events[1].flowId);
+    assert.deepEqual(events.map((event) => event.transport), ['api', 'native']);
+    for (const event of events) {
+      assert.equal(event.status, 'denied');
+      assert.equal(event.connectedAt, null);
+      assert.equal(event.bytesToTarget, 0);
+      assert.equal(event.bytesFromTarget, 0);
+      assert.match(event.peerAddress, /^0x[0-9a-f]{40}$/);
+      assert.ok(event.startedAt && event.endedAt);
+      assert.equal(Object.hasOwn(event, 'payload'), false);
+    }
+    assert.equal(publishPort._trackedConnectionInfos.size, 0);
+    assert.equal(publishPort.nativeSessions.size, 0);
+    assert.deepEqual(publishPort.snapshotFlows(), []);
+  } finally {
+    net.connect = originalConnect;
+    publishPort.close();
+  }
+});
+
+test('flow observers distinguish setup errors from connections and isolate callback failures', async () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [8080]);
+  const originalConnect = net.connect;
+  const events = [];
+  let localSocket;
+  let onConnect;
+  net.connect = (_options, callback) => {
+    localSocket = new FakeStreamSocket();
+    onConnect = callback;
+    return localSocket;
+  };
+  publishPort.setFlowObserver((event) => { events.push(event); throw new Error('observer failure'); });
+  const open = () => publishPort.handlePortOpen(makeSessionId(), ['portopen', 'tcp:8080', makeRef(), makeDeviceId('c')], connection);
+  try {
+    open();
+    assert.deepEqual(events, []);
+    localSocket.emit('error', new Error('ECONNREFUSED'));
+    assert.equal(events[0].status, 'error');
+    assert.equal(events[0].connectedAt, null);
+    assert.equal(publishPort._trackedConnectionInfos.size, 0);
+    open();
+    onConnect();
+    assert.equal(events[1].status, 'open');
+    assert.ok(events[1].connectedAt);
+    localSocket.bytesWritten = 125;
+    localSocket.bytesRead = 250;
+    const [snapshot] = publishPort.snapshotFlows();
+    assert.equal(snapshot.bytesToTarget, 125);
+    assert.equal(snapshot.bytesFromTarget, 250);
+    assert.equal(snapshot.flowId, events[1].flowId);
+    assert.equal(snapshot.endedAt, null);
+    assert.equal(localSocket.listenerCount('data'), 0, 'observing must not add a payload listener');
+    publishPort.setFlowObserver(async (event) => { events.push(event); throw new Error('async observer failure'); });
+    localSocket.emit('error', new Error('connection reset'));
+    await new Promise((resolve) => setImmediate(resolve));
+    const last = events.at(-1);
+    assert.equal(last.status, 'error');
+    assert.ok(last.connectedAt);
+    assert.equal(last.bytesToTarget, 125);
+    assert.equal(last.bytesFromTarget, 250);
+    assert.deepEqual(publishPort.snapshotFlows(), []);
+    net.connect = () => { throw new Error('socket allocation failed'); };
+    open();
+    assert.equal(events.at(-1).status, 'error');
+    assert.equal(events.at(-1).connectedAt, null);
+  } finally {
+    net.connect = originalConnect;
+    publishPort.close();
+  }
+});
+
+test('API UDP flow counters are cumulative without per-datagram observer calls and disabling releases tracking', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [5353]);
+  const originalCreateSocket = dgram.createSocket;
+  const localSocket = new FakeDatagramSocket();
+  const events = [];
+  dgram.createSocket = () => localSocket;
+  publishPort.setFlowObserver((event) => events.push(event));
+  try {
+    publishPort.handlePortOpen(makeSessionId(), ['portopen', 'udp:5353', makeRef(), makeDeviceId('d')], connection);
+    assert.equal(events.length, 1);
+    for (let index = 0; index < 20; index += 1) {
+      publishPort.handlePortSend(makeSessionId(), ['portsend', makeRef(), Buffer.alloc(5)], connection);
+      localSocket.emit('message', Buffer.alloc(10));
+    }
+    assert.equal(events.length, 1);
+    const [snapshot] = publishPort.snapshotFlows();
+    assert.equal(snapshot.bytesToTarget, 100);
+    assert.equal(snapshot.bytesFromTarget, 200);
+    assert.equal(snapshot.protocol, 'udp');
+    const info = connection.getConnection(makeRef());
+    publishPort.setFlowObserver(null);
+    assert.equal(info._flow, undefined);
+    assert.deepEqual(publishPort.snapshotFlows(), []);
+    publishPort.close();
+    assert.equal(events.length, 2, 'disabled observers receive no later lifecycle event');
+    assert.throws(() => publishPort.setFlowObserver({}), TypeError);
+  } finally {
+    dgram.createSocket = originalCreateSocket;
+    publishPort.close();
+  }
+});
+
+test('native UDP flows count decrypted application datagrams and require authenticated readiness', () => {
+  const connection = new FakeConnection();
+  const publishPort = new PublishPort(connection, [5353]);
+  const originalCreateSocket = dgram.createSocket;
+  const originalParse = nativeCrypto.parseUdpPacket;
+  const originalCreate = nativeCrypto.createUdpPacket;
+  const sockets = [];
+  const events = [];
+  dgram.createSocket = () => { const socket = new FakeDatagramSocket(); sockets.push(socket); return socket; };
+  nativeCrypto.parseUdpPacket = (_session, packet) => packet.length ? Buffer.alloc(5) : null;
+  nativeCrypto.createUdpPacket = (_session, message) => Buffer.alloc(message.length + 50);
+  publishPort.setFlowObserver((event) => events.push(event));
+  try {
+    publishPort.handlePortOpen2(makeSessionId(), ['portopen2', 'udp:5353', 41000, makeDeviceId('e'), 'rwu'], connection);
+    const session = publishPort._getNativeSession(connection, 41000);
+    assert.deepEqual(events, [], 'socket creation alone must not claim authenticated access');
+    sockets[0].emit('message', Buffer.alloc(100));
+    assert.equal(sockets[1].sendCalls.length, 0);
+    session.ready = true;
+    session.session = {};
+    publishPort._openFlow(session);
+    for (let index = 0; index < 20; index += 1) {
+      sockets[0].emit('message', Buffer.alloc(100));
+      sockets[1].emit('message', Buffer.alloc(10));
+    }
+    sockets[0].emit('message', Buffer.alloc(0));
+    assert.equal(events.length, 1);
+    const [snapshot] = publishPort.snapshotFlows();
+    assert.equal(snapshot.bytesToTarget, 100);
+    assert.equal(snapshot.bytesFromTarget, 200);
+    assert.equal(snapshot.transport, 'native');
+    assert.equal(snapshot.protocol, 'udp');
+    publishPort.handlePortClose2(makeSessionId(), ['portclose2', 41000], connection);
+    assert.equal(events.at(-1).status, 'closed');
+    assert.equal(events.at(-1).bytesToTarget, 100);
+    assert.equal(events.at(-1).bytesFromTarget, 200);
+    assert.equal(publishPort.nativeSessions.size, 0);
+    assert.equal(session._flow, undefined);
+    publishPort.handlePortOpen2(makeSessionId(), ['portopen2', 'udp:5353', 41001, makeDeviceId('e'), 'rwu'], connection);
+    sockets[2].emit('error', new Error('relay failed before authentication'));
+    assert.equal(events.at(-1).status, 'error');
+    assert.equal(events.at(-1).connectedAt, null);
+  } finally {
+    dgram.createSocket = originalCreateSocket;
+    nativeCrypto.parseUdpPacket = originalParse;
+    nativeCrypto.createUdpPacket = originalCreate;
+    publishPort.close();
+  }
+});

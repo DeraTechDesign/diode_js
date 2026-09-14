@@ -140,7 +140,7 @@ function makeRelay(ackRttMs = 0, protocol = 'tls') {
   };
 }
 
-async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = false, failSend = false, slowReader = false, protocol = 'tls', clientEnds = false, slowBackend = false, readDelayMs = 10 } = {}) {
+async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = false, failSend = false, slowReader = false, protocol = 'tls', clientEnds = false, slowBackend = false, readDelayMs = 10, flowObserver = null, flowSnapshotMs = 0 } = {}) {
   // TPKT/X.224-like prefix is a binary client-first request, not an HTTP probe.
   const request = Buffer.alloc(bytes);
   for (let index = 0; index < request.length; index += 1) request[index] = index % 251;
@@ -154,6 +154,7 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
   let bind;
   let client;
   let resumeTimer;
+  let flowTimer;
   const backendResumeTimers = new Set();
   let backendEnded = false;
   let finishBackendRead = () => {};
@@ -186,6 +187,8 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
     await once(backend, 'listening');
     relay = makeRelay(ackRttMs, protocol);
     publish = new PublishPort(relay.publisher, { [backend.address().port]: { host: '127.0.0.1' } });
+    if (flowObserver) publish.setFlowObserver(flowObserver);
+    if (flowSnapshotMs) flowTimer = setInterval(() => publish.snapshotFlows(), flowSnapshotMs);
     bind = new BindPort(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: deviceId.toString('hex'), protocol, transport: 'api' } });
     const listening = once(bind, 'listening');
     bind.bindSinglePort(0);
@@ -251,6 +254,7 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
     finishBackendRead = () => {};
     for (const timer of backendResumeTimers) clearTimeout(timer);
     if (resumeTimer) clearTimeout(resumeTimer);
+    if (flowTimer) clearInterval(flowTimer);
     if (client) client.destroy();
     if (bind) bind.dispose();
     if (publish) publish.close();
@@ -264,6 +268,25 @@ if (require.main === module) {
   const test = require('node:test');
   for (const protocol of ['tls', 'tcp']) {
     const label = `real API/${protocol.toUpperCase()}`;
+    test(`${label} flow observations count plaintext bytes and preserve the final totals`, { timeout: 20000 }, async () => {
+      const events = [];
+      const bytes = 1024 * 1024;
+      const result = await runTunnel({ bytes, protocol, ackRttMs: 10, flowObserver: (event) => events.push(event), flowSnapshotMs: 25 });
+      assert.equal(new Set(events.map((event) => event.flowId)).size, 1);
+      assert.equal(events[0].status, 'open');
+      const last = events.at(-1);
+      assert.equal(last.status, 'closed');
+      assert.equal(last.bytesToTarget, bytes);
+      assert.equal(last.bytesFromTarget, bytes);
+      assert.equal(last.transport, 'api');
+      assert.equal(last.protocol, protocol);
+      assert.ok(last.connectedAt && last.endedAt);
+      assert.ok(events.length < result.frames, 'observations must not fire for every data frame');
+      for (let index = 1; index < events.length; index += 1) {
+        assert.ok(events[index].bytesToTarget >= events[index - 1].bytesToTarget);
+        assert.ok(events[index].bytesFromTarget >= events[index - 1].bytesFromTarget);
+      }
+    });
     test(`${label} tunnel echoes 1 MiB of client-first binary data`, { timeout: 20000 }, async () => {
       const result = await runTunnel({ ackRttMs: 10, protocol });
       assert.ok(result.maxInFlightFrames > 2, 'bulk data should use the bounded send pipeline');

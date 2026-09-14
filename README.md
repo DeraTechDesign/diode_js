@@ -591,10 +591,89 @@ For the RPC methods that accept `options`, pass `{ timeoutMs, signal }` to set a
   - `addPorts(ports)`: Adds multiple ports at once (equivalent to the constructor's publishedPorts parameter).
     - `ports` (array|object): Either an array of port numbers or an object mapping ports to their configurations.
   - `getPublishedPorts()`: Returns a plain object with all published ports and their configurations.
+  - `setFlowObserver(callback | null)`: Enables built-in flow tracking for new publisher connections and delivers lifecycle observations. Pass `null` to disable tracking and discard active telemetry. Returns the publisher.
+  - `snapshotFlows()`: Returns current cumulative observations for tracked, connected flows and also delivers each observation to the registered observer. Does not create a background timer.
   - `clearPorts()`: Removes all published ports. Returns the number of ports that were cleared.
   - `startListening()`: Starts listening for unsolicited messages.
   - `stopListening()`: Pauses unsolicited-message handling without closing active sessions.
   - `close()`: Permanently removes listeners and closes all API/native sessions. A closed instance cannot be restarted; create a new `PublishPort` instead.
+
+##### Built-in publisher flow monitoring
+
+`PublishPort` measures traffic internally for API TCP/TLS/UDP and Native TCP/UDP.
+Monitoring is disabled by default. Enable it before accepting application
+connections. The observer receives metadata and cumulative byte totals, with no
+packet payloads, URLs, certificate material, or private keys.
+
+```javascript
+// Flush this bounded latest-observation map in a separate background task.
+const pending = new Map();
+let droppedObservations = 0;
+publishPort.setFlowObserver((flow) => {
+  if (pending.has(flow.flowId) || pending.size < 2000) {
+    pending.set(flow.flowId, flow);
+  } else {
+    droppedObservations += 1;
+  }
+});
+const snapshotTimer = setInterval(() => publishPort.snapshotFlows(), 30000);
+snapshotTimer.unref();
+
+// On shutdown, close first to deliver final observations, then drain the queue.
+clearInterval(snapshotTimer);
+publishPort.close();
+publishPort.setFlowObserver(null);
+```
+
+The observer is a delivery callback; all connection identification, lifecycle
+tracking, and byte accounting are implemented inside diodeJS. Observer exceptions
+and rejected promises are contained. Callbacks must return promptly; network or
+disk work should run in the consumer's separate bounded queue. `snapshotFlows()`
+both delivers and returns observations, so consumers should not enqueue its
+return value again.
+
+Each observation contains:
+
+| Field | Meaning |
+| --- | --- |
+| `flowId` | UUID unique to this connection or denied attempt. |
+| `peerAddress` | Normalized lowercase Diode peer wallet address. |
+| `port` | Published target port. |
+| `protocol` | `tcp`, `tls`, or `udp`. |
+| `transport` | `api` or `native`; Native's TLS handshake helper is excluded. |
+| `startedAt` | ISO timestamp when the publisher began tracking the attempt. |
+| `connectedAt` | ISO timestamp when the connection became ready, or `null` for failed setup/denied attempts. |
+| `observedAt` | ISO timestamp for this observation. |
+| `endedAt` | ISO timestamp for a terminal observation; `null` while open. |
+| `status` | `open`, `closed`, `denied`, or `error`. |
+| `bytesToTarget` | Cumulative plaintext bytes submitted toward the target. |
+| `bytesFromTarget` | Cumulative plaintext bytes received from the target. |
+
+An `open` observation requires the local TCP backend to connect; API TLS also
+requires the TLS handshake, and Native requires the authenticated native
+handshake. UDP readiness means the forwarding association is prepared; UDP does
+not confirm target reachability or datagram delivery. Setup failure produces a
+terminal `error` with `connectedAt: null`, without a preceding `open`. A failure
+after readiness retains `connectedAt`. Publisher whitelist denials produce a
+terminal zero-byte `denied` observation without connecting to the target.
+Attempts rejected before reaching this publisher cannot appear here.
+
+TCP/TLS counts use the local backend socket's existing `bytesWritten` and
+`bytesRead` counters only at observation time. UDP adds byte lengths inside its
+existing handlers. No additional TCP payload listeners or per-packet observer
+callbacks are installed. Counts exclude encryption/framing overhead and are not
+wire billing totals or end-to-end delivery receipts. Use the latest cumulative
+observation per `flowId`; adding successive observations would double-count.
+
+Active telemetry is attached to existing live connection records and released
+when they close. There is no retained history in diodeJS. Disabling monitoring
+discards active counters; re-enabling starts tracking new connections only.
+
+Run `node scripts/benchmarkPublishFlows.js` for an opt-in loopback comparison of
+disabled monitoring versus lifecycle observations plus 25 ms snapshots. It uses
+real API TCP/TLS streams and simulated relay RPC; results do not establish a
+live-network performance guarantee. `DIODE_FLOW_BENCH_ROUNDS` (default `5`) and
+`DIODE_FLOW_BENCH_MIB` (default `4`) control the comparison.
   - `handlePortOpen(sessionIdRaw, messageContent)`: Handles port open requests.
   - `handlePortSend(sessionIdRaw, messageContent)`: Handles port send requests.
   - `handlePortClose(sessionIdRaw, messageContent)`: Handles port close requests.

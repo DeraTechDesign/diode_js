@@ -178,7 +178,7 @@ function binaryPayload(bytes, prefix) {
   return value;
 }
 
-async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false, rejectHandshakeShutdown = false } = {}) {
+async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false, rejectHandshakeShutdown = false, flowObserver = null } = {}) {
   const request = binaryPayload(requestBytes, '030000130ee0000000000100080003000000');
   const response = Buffer.concat([binaryPayload(responseBytes, '1201003400000100'), Buffer.from('\x00FINAL-RESPONSE-TAIL\xff', 'latin1')]);
   const banner = serverFirst ? Buffer.from('SSH-2.0-loopback-native-test\r\n') : Buffer.alloc(0);
@@ -226,6 +226,7 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
     await once(backend, 'listening');
     relay = await makeRelay(backend.address().port, { rejectHandshakeShutdown });
     publish = new PublishPort(relay.publisher, { [backend.address().port]: { host: '127.0.0.1', mode: 'private', whitelist: [binderIdentity.address] } });
+    if (flowObserver) publish.setFlowObserver(flowObserver);
     bind = new BindPort(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: publisherIdentity.address.slice(2), protocol: 'tcp', transport: 'native' } });
     const listening = once(bind, 'listening');
     bind.bindSinglePort(0);
@@ -292,6 +293,21 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
 
 test('real native TCP carries client-first binary data and a delayed response after client half-close', { timeout: 20000 }, async () => {
   await runNativeTunnel();
+});
+
+test('native flow observations count application bytes once and exclude the TLS helper handshake', { timeout: 20000 }, async () => {
+  const events = [];
+  await runNativeTunnel({ requestBytes: 128 * 1024, responseBytes: 256 * 1024, serverFirst: true, flowObserver: (event) => events.push(event) });
+  assert.equal(events.length, 2, 'only lifecycle events fire without explicit snapshots');
+  assert.equal(events[0].status, 'open');
+  assert.equal(events[1].status, 'closed');
+  assert.equal(events[0].flowId, events[1].flowId);
+  assert.equal(events[1].peerAddress, binderIdentity.address);
+  assert.equal(events[1].bytesToTarget, 128 * 1024);
+  assert.equal(events[1].bytesFromTarget, 256 * 1024 + Buffer.byteLength('\x00FINAL-RESPONSE-TAIL\xff', 'latin1') + Buffer.byteLength('SSH-2.0-loopback-native-test\r\n'));
+  assert.equal(events[1].transport, 'native');
+  assert.equal(events[1].protocol, 'tcp');
+  assert.ok(events[1].connectedAt && events[1].endedAt);
 });
 
 test('native setup does not send TLS shutdown records after the signed handshake exchange', { timeout: 20000 }, async () => {

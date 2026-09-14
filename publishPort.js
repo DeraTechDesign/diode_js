@@ -5,6 +5,7 @@ const tls = require('tls');
 const dgram = require('dgram');
 const fs = require('fs');
 const { Buffer } = require('buffer');
+const { randomUUID } = require('node:crypto');
 const EventEmitter = require('events');
 const DiodeSocket = require('./diodeSocket');
 const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBackpressure');
@@ -177,6 +178,7 @@ class PublishPort extends EventEmitter {
     this.connection = connection;
     this._rpcByConnection = new WeakMap();
     this._trackedConnectionInfos = new Map();
+    this._flowObserver = null;
     this.rpc = this._isManager() ? null : this._getRpcFor(connection);
     this._listening = false; // ensure startListening is idempotent
     this.nativeSessions = new Map();
@@ -256,6 +258,92 @@ class PublishPort extends EventEmitter {
   getPublishedPorts() {
     return Object.fromEntries(this.publishedPorts.entries());
   }
+
+  // Observers must only enqueue work: no I/O belongs in connection callbacks.
+  // Enabling observation covers new flows; disabling discards active tracking.
+  setFlowObserver(observer) {
+    if (observer !== null && typeof observer !== 'function') {
+      throw new TypeError('Flow observer must be a function or null');
+    }
+    this._flowObserver = observer;
+    if (!observer) {
+      for (const info of this._trackedConnectionInfos.keys()) delete info._flow;
+      for (const session of this.nativeSessions.values()) delete session._flow;
+    }
+    return this;
+  }
+
+  // Snapshotting is caller scheduled. Counts are cumulative plaintext bytes at
+  // the backend socket, excluding Diode framing, TLS overhead and handshakes.
+  snapshotFlows() {
+    if (!this._flowObserver) return [];
+    const snapshots = [];
+    for (const info of this._trackedConnectionInfos.keys()) {
+      if (info._flow?.connectedAt && !info._cleaned) snapshots.push(this._observeFlow(info, 'open'));
+    }
+    for (const session of this.nativeSessions.values()) {
+      if (session._flow?.connectedAt && !session._cleaned) snapshots.push(this._observeFlow(session, 'open'));
+    }
+    return snapshots;
+  }
+
+  _trackFlow(info, transport = 'api') {
+    if (!this._flowObserver || info.handshake || info._flow) return;
+    info._flow = {
+      flowId: randomUUID(),
+      peerAddress: String(info.deviceId || '').toLowerCase(),
+      port: info.port,
+      protocol: info.protocol,
+      transport,
+      startedAt: new Date().toISOString(),
+      connectedAt: null,
+      bytesToTarget: 0,
+      bytesFromTarget: 0,
+    };
+  }
+
+  _observeFlow(info, status) {
+    const flow = info._flow;
+    if (!this._flowObserver || !flow) return null;
+    const observedAt = new Date().toISOString();
+    if (info.protocol !== 'udp') {
+      const socket = info.localSocket || info.socket;
+      if (socket) {
+        flow.bytesToTarget = Math.max(flow.bytesToTarget, Number(socket.bytesWritten) || 0);
+        flow.bytesFromTarget = Math.max(flow.bytesFromTarget, Number(socket.bytesRead) || 0);
+      }
+    }
+    const snapshot = {
+      ...flow,
+      observedAt,
+      endedAt: status === 'open' ? null : observedAt,
+      status,
+    };
+    try {
+      const pending = this._flowObserver({ ...snapshot });
+      if (pending && typeof pending.then === 'function') Promise.resolve(pending).catch(() => {});
+    } catch (_) {}
+    return snapshot;
+  }
+
+  _openFlow(info) {
+    if (!info._flow || info._flow.connectedAt || info._cleaned) return;
+    info._flow.connectedAt = new Date().toISOString();
+    this._observeFlow(info, 'open');
+  }
+
+  _finishFlow(info, status = null) {
+    if (!info._flow) return;
+    this._observeFlow(info, status || (info.error || !info._flow.connectedAt ? 'error' : 'closed'));
+    delete info._flow;
+  }
+
+  _flowAttempt(port, deviceId, protocol, transport, status) {
+    if (!this._flowObserver || !['tcp', 'tls', 'udp'].includes(protocol)) return;
+    const info = { port, deviceId, protocol };
+    this._trackFlow(info, transport);
+    this._finishFlow(info, status);
+  }
   
   // Clear all published ports
   clearPorts() {
@@ -330,6 +418,7 @@ class PublishPort extends EventEmitter {
     this._trackedConnectionInfos.delete(info);
     if (info._cleaned) return;
     info._cleaned = true;
+    this._finishFlow(info);
     releaseRelayBackpressure(info._inboundState);
     const rpc = this._getRpcFor(connection);
     const sockets = new Set([
@@ -400,6 +489,7 @@ class PublishPort extends EventEmitter {
       state.bytes += copy.length;
       updateRelayBackpressure(connection, state, state.bytes);
       if (state.bytes > MAX_NATIVE_QUEUE_BYTES) {
+        info.error = new Error('Backend receive queue limit exceeded');
         this._cleanupConnectionInfo(connection, ref, info, { notifyRemote: true });
         return;
       }
@@ -530,6 +620,7 @@ class PublishPort extends EventEmitter {
     // Check if the port is published
     if (!this.publishedPorts.has(port)) {
       logger.warn(() => `Port ${port} is not published. Rejecting request.`);
+      if (!isHandshake) this._flowAttempt(port, deviceId, protocol, 'api', 'denied');
       // Send error response
       void Promise.resolve(rpc.sendError(sessionId, ref, 'Port is not published')).catch(() => {});
       return;
@@ -540,6 +631,7 @@ class PublishPort extends EventEmitter {
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
+        if (!isHandshake) this._flowAttempt(port, deviceId, protocol, 'api', 'denied');
         void Promise.resolve(rpc.sendError(sessionId, ref, 'Device not whitelisted')).catch(() => {});
         return;
       }
@@ -686,6 +778,7 @@ class PublishPort extends EventEmitter {
           physicalPort: session.physicalPort,
         });
         session.ready = true;
+        if (session.protocol === 'udp') this._openFlow(session);
         if (session.timer) {
           clearTimeout(session.timer);
           session.timer = null;
@@ -769,6 +862,7 @@ class PublishPort extends EventEmitter {
     // Check if the port is published
     if (!this.publishedPorts.has(port)) {
       logger.warn(() => `Port ${port} is not published. Rejecting request.`);
+      this._flowAttempt(port, deviceId, protocol, 'native', 'denied');
       void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Port is not published')).catch(() => {});
       return;
     }
@@ -778,6 +872,7 @@ class PublishPort extends EventEmitter {
     if (portConfig.mode === 'private' && Array.isArray(portConfig.whitelist)) {
       if (!portConfig.whitelist.includes(deviceId)) {
         logger.warn(() => `Device ${deviceId} is not whitelisted for port ${port}. Rejecting request.`);
+        this._flowAttempt(port, deviceId, protocol, 'native', 'denied');
         void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Device not whitelisted')).catch(() => {});
         return;
       }
@@ -786,6 +881,7 @@ class PublishPort extends EventEmitter {
 
     if (!physicalPort || physicalPort > 65535) {
       logger.warn(() => `Invalid physical port in portopen2: ${physicalPortRaw}`);
+      this._flowAttempt(port, deviceId, protocol, 'native', 'error');
       void Promise.resolve(rpc.sendError(sessionId, physicalPortRef, 'Invalid physical port')).catch(() => {});
       return;
     }
@@ -812,6 +908,7 @@ class PublishPort extends EventEmitter {
       pendingRelayChunks: [],
       nativeLease: true,
     };
+    this._trackFlow(session, 'native');
     connection._diodeActiveNativeSessions = Number(connection._diodeActiveNativeSessions || 0) + 1;
     const sessionTimeoutMs = normalizeTimerMs(
       Math.max(15000, this.handshakeTimeoutMs * 2),
@@ -837,6 +934,7 @@ class PublishPort extends EventEmitter {
   _cleanupNativeSession(session) {
     if (!session || session._cleaned) return;
     session._cleaned = true;
+    this._finishFlow(session);
     session.ready = false;
     if (session.bridge) session.bridge.destroy();
     if (session.handshakeInfo) {
@@ -910,9 +1008,13 @@ class PublishPort extends EventEmitter {
       localSocket: session.localSocket,
       relaySocket: session.relaySocket,
       session: session.session,
-      onError: (error) => logger.error(() => `Native TCP stream error (${session.deviceId}): ${error}`),
+      onError: (error) => {
+        session.error = error;
+        logger.error(() => `Native TCP stream error (${session.deviceId}): ${error}`);
+      },
       onClose: () => this._cleanupNativeSession(session),
     });
+    this._openFlow(session);
   }
 
   handleNativeTCPRelay(sessionId, physicalPortRef, session, connection) {
@@ -924,6 +1026,7 @@ class PublishPort extends EventEmitter {
       responded = true;
       void Promise.resolve(rpc.sendResponse(sessionId, physicalPortRef, 'ok')).catch((error) => {
         logger.error(() => `Failed to acknowledge native TCP portopen: ${error}`);
+        session.error = error;
         this._cleanupNativeSession(session);
       });
     };
@@ -955,6 +1058,7 @@ class PublishPort extends EventEmitter {
         return;
       }
     } catch (error) {
+      session.error = error;
       sendError('Native TCP socket setup failed');
       cleanup();
       return;
@@ -972,6 +1076,7 @@ class PublishPort extends EventEmitter {
       }
     };
     session.connectTimer = setTimeout(() => {
+      session.error = new Error('Native relay connection timed out');
       sendError('Native relay connection timed out');
       cleanup();
     }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
@@ -990,11 +1095,13 @@ class PublishPort extends EventEmitter {
 
     relaySocket.on('error', (err) => {
       logger.error(() => `Relay socket error (${deviceId}): ${err}`);
+      session.error = err;
       sendError('Relay connection failed');
       cleanup();
     });
     localSocket.on('error', (err) => {
       logger.error(() => `Local TCP service error (${deviceId}): ${err}`);
+      session.error = err;
       sendError('Local service connection failed');
       cleanup();
     });
@@ -1015,6 +1122,7 @@ class PublishPort extends EventEmitter {
       responded = true;
       void Promise.resolve(rpc.sendResponse(sessionId, physicalPortRef, 'ok')).catch((error) => {
         logger.error(() => `Failed to acknowledge native UDP portopen: ${error}`);
+        session.error = error;
         this._cleanupNativeSession(session);
       });
     };
@@ -1042,6 +1150,7 @@ class PublishPort extends EventEmitter {
         return;
       }
     } catch (error) {
+      session.error = error;
       sendError('Native UDP socket setup failed');
       this._cleanupNativeSession(session);
       return;
@@ -1059,6 +1168,7 @@ class PublishPort extends EventEmitter {
       }
     };
     session.connectTimer = setTimeout(() => {
+      session.error = new Error('Native UDP connection timed out');
       sendError('Native UDP connection timed out');
       this._cleanupNativeSession(session);
     }, normalizeTimerMs(this.backendConnectTimeoutMs, 5000));
@@ -1070,24 +1180,29 @@ class PublishPort extends EventEmitter {
         const plaintext = nativeCrypto.parseUdpPacket(session.session, msg);
         if (!plaintext) return;
         localSocket.send(plaintext);
+        if (session._flow) session._flow.bytesToTarget += plaintext.length;
       } catch (error) {
         logger.error(() => `Native UDP decode failed (${deviceId}): ${error}`);
+        session.error = error;
         this._cleanupNativeSession(session);
       }
     });
     localSocket.on('message', (msg) => {
       if (!session.ready || !session.session) return;
+      if (session._flow) session._flow.bytesFromTarget += msg.length;
       try {
         const packet = nativeCrypto.createUdpPacket(session.session, msg);
         relaySocket.send(packet);
       } catch (error) {
         logger.error(() => `Native UDP encode failed (${deviceId}): ${error}`);
+        session.error = error;
         this._cleanupNativeSession(session);
       }
     });
 
     relaySocket.on('error', (err) => {
       logger.error(() => `Relay UDP socket error (${deviceId}): ${err}`);
+      session.error = err;
       sendError('Relay UDP error');
       try { relaySocket.close(); } catch {}
       try { localSocket.close(); } catch {}
@@ -1095,6 +1210,7 @@ class PublishPort extends EventEmitter {
     });
     localSocket.on('error', (err) => {
       logger.error(() => `Local UDP service error (${deviceId}): ${err}`);
+      session.error = err;
       sendError('Local UDP error');
       try { relaySocket.close(); } catch {}
       try { localSocket.close(); } catch {}
@@ -1114,6 +1230,7 @@ class PublishPort extends EventEmitter {
         maybeReady();
       });
     } catch (error) {
+      session.error = error;
       sendError('Native UDP socket connection failed');
       this._cleanupNativeSession(session);
     }
@@ -1142,16 +1259,19 @@ class PublishPort extends EventEmitter {
       };
       sendSocket.on('error', (error) => {
         logger.error(() => `Error sending data to device: ${error}`);
+        if (info) info.error = error;
         cleanup();
       });
       localSocket.on('end', finishWrites);
       localSocket.on('close', (hadError) => {
+        if (info && (hadError || localSocket.readableAborted)) info.error = new Error('Backend stream aborted');
         if (hadError || localSocket.readableAborted) cleanup();
         else finishWrites();
       });
 
       localSocket.on('error', (err) => {
         logger.error(() => `Error with local service: ${err}`);
+        if (info) info.error = err;
         const failedDuringOpen = !!(opening && !opening.responded);
         if (failedDuringOpen) {
           opening.responded = true;
@@ -1183,21 +1303,25 @@ class PublishPort extends EventEmitter {
         clearTimeout(connectTimer);
         localSocket.setNoDelay(true);
         logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
+        this._openFlow(connectionInfo);
         if (!opening.responded) {
           opening.responded = true;
           void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
             logger.error(() => `Failed to acknowledge TCP portopen: ${error}`);
+            connectionInfo.error = error;
             this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
           });
         }
       });
     } catch (error) {
       logger.error(() => `Could not create local TCP backend socket: ${error}`);
+      this._flowAttempt(port, deviceId, 'tcp', 'api', 'error');
       void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
       return;
     }
 
     connectionInfo = { socket: localSocket, protocol: 'tcp', port, host: portConfig.host, deviceId };
+    this._trackFlow(connectionInfo);
     this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
     if (this._closed) {
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
@@ -1236,6 +1360,7 @@ class PublishPort extends EventEmitter {
     }
     const certPem = connection.getDeviceCertificate();
     if (!certPem) {
+      this._flowAttempt(port, deviceId, 'tls', 'api', 'error');
       void Promise.resolve(rpc.sendError(sessionId, ref, 'No device certificate available')).catch(() => {});
       return;
     }
@@ -1262,6 +1387,7 @@ class PublishPort extends EventEmitter {
       });
     } catch (error) {
       logger.error(() => `Could not create publisher TLS socket: ${error}`);
+      this._flowAttempt(port, deviceId, 'tls', 'api', 'error');
       destroySocket(diodeSocket);
       void Promise.resolve(rpc.sendError(sessionId, ref, 'TLS setup failed')).catch(() => {});
       return;
@@ -1281,16 +1407,20 @@ class PublishPort extends EventEmitter {
         if (connectTimer) clearTimeout(connectTimer);
         localSocket.setNoDelay(true);
         logger.info(() => `Connected to local TCP service on ${portConfig.host}:${port}`);
+        connectionInfo._flowBackendReady = true;
+        if (connectionInfo._flowTlsReady) this._openFlow(connectionInfo);
         if (!responded) {
           responded = true;
           void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
             logger.error(() => `Failed to acknowledge TLS portopen: ${error}`);
+            connectionInfo.error = error;
             this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
           });
         }
       });
     } catch (error) {
       logger.error(() => `Could not create local TLS backend socket: ${error}`);
+      this._flowAttempt(port, deviceId, 'tls', 'api', 'error');
       destroySocket(tlsSocket);
       destroySocket(diodeSocket);
       void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
@@ -1306,6 +1436,7 @@ class PublishPort extends EventEmitter {
       host: portConfig.host,
       deviceId,
     };
+    this._trackFlow(connectionInfo);
     this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
     if (this._closed) {
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
@@ -1325,11 +1456,16 @@ class PublishPort extends EventEmitter {
     }
 
     // Pipe data between the TLS socket and the local service
+    tlsSocket.once('secure', () => {
+      connectionInfo._flowTlsReady = true;
+      if (connectionInfo._flowBackendReady) this._openFlow(connectionInfo);
+    });
     tlsSocket.pipe(localSocket).pipe(tlsSocket);
 
     // Handle errors and cleanup
     tlsSocket.on('error', (err) => {
       logger.error(() => `TLS Socket error: ${err}`);
+      connectionInfo.error = err;
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
     });
 
@@ -1340,6 +1476,7 @@ class PublishPort extends EventEmitter {
     });
     localSocket.on('error', (err) => {
       logger.error(() => `Local TLS backend error: ${err}`);
+      connectionInfo.error = err;
       const failedDuringOpen = !responded;
       if (failedDuringOpen) {
         responded = true;
@@ -1348,10 +1485,14 @@ class PublishPort extends EventEmitter {
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: !failedDuringOpen });
     });
     localSocket.on('close', (hadError) => {
+      if (hadError) connectionInfo.error = new Error('Backend TLS stream aborted');
       if (connectTimer) clearTimeout(connectTimer);
       if (!hadError && localSocket.readableEnded && !connectionInfo._cleaned) {
         void diodeSocket.finishTlsWrites(tlsSocket)
-          .catch((error) => logger.debug(() => `Publish TLS write shutdown: ${error.message}`))
+          .catch((error) => {
+            connectionInfo.error = error;
+            logger.debug(() => `Publish TLS write shutdown: ${error.message}`);
+          })
           .finally(() => this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded }));
       } else {
         this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
@@ -1378,6 +1519,7 @@ class PublishPort extends EventEmitter {
       localSocket = dgram.createSocket('udp4');
     } catch (error) {
       logger.error(() => `Could not create local UDP backend socket: ${error}`);
+      this._flowAttempt(port, deviceId, 'udp', 'api', 'error');
       void Promise.resolve(rpc.sendError(sessionId, ref, 'Local service connection failed')).catch(() => {});
       return;
     }
@@ -1404,6 +1546,7 @@ class PublishPort extends EventEmitter {
       host: portConfig.host,
       deviceId
     };
+    this._trackFlow(connectionInfo);
     this._trackedConnectionInfos.set(connectionInfo, { connection, ref: Buffer.from(ref) });
     if (this._closed) {
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
@@ -1421,22 +1564,27 @@ class PublishPort extends EventEmitter {
     }
 
     logger.info(() => `UDP connection set up for ${portConfig.host}:${port}`);
+    this._openFlow(connectionInfo);
 
     // Handle messages from the local UDP service
     localSocket.on('message', (msg, rinfo) => {
+      if (connectionInfo._flow) connectionInfo._flow.bytesFromTarget += msg.length;
       void Promise.resolve(rpc.portSend(ref, msg, { timeoutMs: this.ioTimeoutMs })).catch((error) => {
         logger.error(() => `Error sending UDP data to device: ${error}`);
+        connectionInfo.error = error;
         this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
       });
     });
 
     localSocket.on('error', (err) => {
       logger.error(() => `UDP Socket error: ${err}`);
+      connectionInfo.error = err;
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
     });
     // Acknowledge only after routing and error handlers are installed.
     void Promise.resolve(rpc.sendResponse(sessionId, ref, 'ok')).catch((error) => {
       logger.error(() => `Failed to acknowledge UDP portopen: ${error}`);
+      connectionInfo.error = error;
       this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: false });
     });
   }
@@ -1476,9 +1624,11 @@ class PublishPort extends EventEmitter {
         localSocket.send(data, remoteInfo.port, remoteInfo.address, (err) => {
           if (err) {
             logger.error(() => `Error sending UDP data: ${err}`);
+            connectionInfo.error = err;
             this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: true });
           }
         });
+        if (connectionInfo._flow) connectionInfo._flow.bytesToTarget += data.length;
 
         // Update remoteInfo if not set
         if (!localSocket.remoteAddress) {
