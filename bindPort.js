@@ -1123,7 +1123,10 @@ class BindPort extends EventEmitter {
       return false;
     }
     
-    const { targetPort, deviceIdHex, protocol = 'tls' } = config;
+    const { targetPort, deviceIdHex, protocol = 'tls', listenHost } = config;
+    if (listenHost !== undefined && (typeof listenHost !== 'string' || !net.isIP(listenHost))) {
+      throw new Error('listenHost must be an IPv4 or IPv6 address');
+    }
     const transport = config.transport || 'api';
     const useNative = transport === 'native' && (protocol === 'tcp' || protocol === 'udp');
     if (transport === 'native' && protocol === 'tls') {
@@ -1250,7 +1253,8 @@ class BindPort extends EventEmitter {
         server.clientRefs = null;
       });
 
-      server.bind(localPort);
+      if (listenHost) server.bind(localPort, listenHost);
+      else server.bind(localPort);
       this.servers.set(parseInt(localPort), server);
     } else {
       // For TCP and tls protocols, use TCP server locally
@@ -1527,7 +1531,7 @@ class BindPort extends EventEmitter {
       });
       server._diodeClosed = false;
 
-      server.listen(localPort, () => {
+      server.listen(...(listenHost ? [localPort, listenHost] : [localPort]), () => {
         logger.info(() => `Local server listening on port ${localPort} forwarding to device ${protocol} port ${targetPort}`);
         this.emit('listening', {
           localPort: Number(server.address().port),

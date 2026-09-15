@@ -1,5 +1,10 @@
 # DiodeJs
 
+`BindPort` configuration accepts an optional `listenHost` IP address. Use
+`{ targetPort: 8088, deviceIdHex, protocol: 'tls', listenHost: '127.0.0.1' }`
+for a local-only management tunnel. Omitting it preserves the existing listener
+behavior. This setting does not change the selected API or Native transport.
+
 Release candidate: `0.5.6`, fixing config/app connections delayed by stale device tickets.
 
 When a device lookup is still dialing a relay after 250 ms, bind opening tries

@@ -9,6 +9,32 @@ const { Duplex } = require('node:stream');
 const BindPort = require('../bindPort');
 const nativeCrypto = require('../nativeCrypto');
 
+test('explicit loopback listeners bind only the requested interface for every protocol', async () => {
+  for (const protocol of ['tcp', 'tls', 'udp']) {
+    const manager = new FakeManager({ relays: [], resolvedRelay: null, nearestRelay: null });
+    const bind = new BindPort(manager, { 0: {
+      targetPort: 8088, deviceIdHex: '11'.repeat(20), protocol, listenHost: '127.0.0.1', transport: 'api'
+    } });
+    try {
+      bind.bindSinglePort(0);
+      const server = bind.servers.get(0);
+      await once(server, 'listening');
+      assert.equal(server.address().address, '127.0.0.1');
+    } finally { bind.dispose(); }
+  }
+});
+
+test('invalid listener host is rejected before a socket is opened', () => {
+  const manager = new FakeManager({ relays: [], resolvedRelay: null, nearestRelay: null });
+  const bind = new BindPort(manager, { 0: {
+    targetPort: 8088, deviceIdHex: '11'.repeat(20), protocol: 'tls', listenHost: 'untrusted.example'
+  } });
+  try {
+    assert.throws(() => bind.bindSinglePort(0), /listenHost/);
+    assert.equal(bind.servers.size, 0);
+  } finally { bind.dispose(); }
+});
+
 function makeRef(hex) {
   return Buffer.from(hex.padStart(8, '0'), 'hex');
 }
