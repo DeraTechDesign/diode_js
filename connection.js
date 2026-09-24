@@ -201,6 +201,8 @@ class DiodeConnection extends EventEmitter {
     this._relayUsage = null;
     this._relayUsageGeneration = -1;
     this._relayUsageSequence = 0;
+    this._ticketUsageEpoch = null;
+    this._ticketUsageSequence = null;
     this._supportsRelayUsage = null;
     this._relayUsageQueryInFlight = false;
     this._ticketAcceptedOnTransport = false;
@@ -278,6 +280,8 @@ class DiodeConnection extends EventEmitter {
     this.lastRelayMeasuredBytes = 0;
     this._relayUsage = null;
     this._relayUsageGeneration = -1;
+    this._ticketUsageEpoch = null;
+    this._ticketUsageSequence = null;
     this._supportsRelayUsage = null;
     this._relayUsageQueryInFlight = false;
     this._ticketAcceptedOnTransport = false;
@@ -929,6 +933,10 @@ class DiodeConnection extends EventEmitter {
         this._relayUsage = deviceUsage;
         this._relayUsageGeneration = this._socketGeneration;
         this._relayUsageSequence += 1;
+        // An unsolicited report can supersede the one checked against the
+        // ticket epoch. Require a fresh check before signing it.
+        this._ticketUsageEpoch = null;
+        this._ticketUsageSequence = null;
         this.emit('relay_usage', {
           generation: this._socketGeneration,
           sequence: this._relayUsageSequence,
@@ -1088,12 +1096,12 @@ class DiodeConnection extends EventEmitter {
       return Promise.reject(new DiodeDisconnectedError('Diode relay disconnected before reporting usage'));
     }
     if (this._relayUsageGeneration === generation && this._relayUsageSequence > sequence) {
-      return Promise.resolve(this._relayUsage);
+      return Promise.resolve({ usage: this._relayUsage, sequence: this._relayUsageSequence });
     }
     return new Promise((resolve, reject) => {
       let timer;
       let settleImmediate;
-      let latestUsage;
+      let latestReport;
       const cleanup = () => {
         clearTimeout(timer);
         if (settleImmediate) clearImmediate(settleImmediate);
@@ -1102,11 +1110,11 @@ class DiodeConnection extends EventEmitter {
       };
       const onUsage = (event) => {
         if (event.generation !== generation || event.sequence <= sequence) return;
-        latestUsage = event.usage;
+        latestReport = { usage: event.usage, sequence: event.sequence };
         if (settleImmediate) return;
         settleImmediate = setImmediate(() => {
           cleanup();
-          resolve(latestUsage);
+          resolve(latestReport);
         });
       };
       const onDisconnect = (event) => {
@@ -1134,6 +1142,8 @@ class DiodeConnection extends EventEmitter {
     const send = allowTransportReady
       ? (command) => this._sendCommandTransportReady(command, commandOptions)
       : (command) => this.sendCommand(command, commandOptions);
+    this._ticketUsageEpoch = null;
+    this._ticketUsageSequence = null;
 
     // The relay's paid ticket is scoped to an epoch; never use the previous
     // epoch's floor when interpreting current device usage.
@@ -1141,6 +1151,15 @@ class DiodeConnection extends EventEmitter {
       ? await this.RPC._getEpochWithSender(send)
       : await this.RPC.getEpoch();
     if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage epoch');
+    const assertUsageEpoch = async () => {
+      const currentEpoch = allowTransportReady
+        ? await this.RPC._getEpochWithSender(send)
+        : await this.RPC.getEpoch();
+      if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage epoch');
+      if (generation !== this._socketGeneration || currentEpoch !== epoch) {
+        throw new DiodeConnectionError('Diode ticket epoch changed while measuring usage', 'DIODE_USAGE_EPOCH_CHANGED');
+      }
+    };
     if (epoch !== this.lastAcceptedTicketEpoch) {
       this.lastAcceptedTicketEpoch = epoch;
       this.lastAcceptedTicketBytes = 0;
@@ -1153,9 +1172,14 @@ class DiodeConnection extends EventEmitter {
         // ambiguous pre-ticket `bytes` reply to that floor.
         this.totalBytes = Math.max(128000, this.lastAcceptedTicketBytes);
         this.accumulatedBytes = Math.max(0, this.totalBytes - this.lastAcceptedTicketBytes);
+        await assertUsageEpoch();
+        this._ticketUsageEpoch = epoch;
         return null;
       }
-      return this._syncMeasuredBytesWithRelay({ allowTransportReady, expectedSocket, expectedGeneration });
+      const measuredBytes = await this._syncMeasuredBytesWithRelay({ allowTransportReady, expectedSocket, expectedGeneration });
+      await assertUsageEpoch();
+      this._ticketUsageEpoch = epoch;
+      return measuredBytes;
     }
 
     const sequence = this._relayUsageSequence;
@@ -1177,12 +1201,19 @@ class DiodeConnection extends EventEmitter {
       // but unsolicited dispatch is deferred. Drain that batch so an older
       // queued request cannot win over the fresh report.
       await new Promise(setImmediate);
-      const usage = await this._waitForRelayUsageAfter(sequence, generation);
+      const report = await this._waitForRelayUsageAfter(sequence, generation);
       if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage report');
+      const usage = report.usage;
       if (!Number.isSafeInteger(usage) || usage < 0) {
         throw new DiodeConnectionError('Diode relay reported invalid usage', 'DIODE_USAGE_INVALID');
       }
       this._supportsRelayUsage = true;
+      await assertUsageEpoch();
+      if (this._relayUsageSequence !== report.sequence || this._relayUsageGeneration !== generation) {
+        throw new DiodeConnectionError('Diode relay usage changed during epoch check', 'DIODE_USAGE_STALE');
+      }
+      this._ticketUsageEpoch = epoch;
+      this._ticketUsageSequence = report.sequence;
       this.totalBytes = this.lastAcceptedTicketBytes > 0 && usage <= this.lastAcceptedTicketBytes
         ? this.lastAcceptedTicketBytes
         : usage + this._ticketHeadroomBytes;
@@ -1627,6 +1658,9 @@ class DiodeConnection extends EventEmitter {
     if (hasExpectedTransport) {
       this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode ticket epoch');
     }
+    if (this._supportsRelayUsage !== null && this._ticketUsageEpoch !== epoch) {
+      throw new DiodeConnectionError('Diode ticket usage belongs to another epoch', 'DIODE_USAGE_EPOCH_CHANGED');
+    }
     // Relay ticket floors are scoped to an epoch. The previous epoch's
     // accepted total cannot bound a ticket in the new epoch.
     if (epoch !== this.lastAcceptedTicketEpoch) {
@@ -1640,7 +1674,11 @@ class DiodeConnection extends EventEmitter {
       ? Math.max(0, this.lastAcceptedTicketBytes)
       : 0;
     let totalBytes;
-    if (this._supportsRelayUsage === true && this._relayUsageGeneration === this._socketGeneration) {
+    if (this._supportsRelayUsage === true) {
+      if (this._relayUsageGeneration !== this._socketGeneration ||
+          this._ticketUsageSequence !== this._relayUsageSequence) {
+        throw new DiodeConnectionError('Diode ticket usage is stale', 'DIODE_USAGE_STALE');
+      }
       totalBytes = acceptedBytes > 0 && this._relayUsage <= acceptedBytes
         ? acceptedBytes
         : this._relayUsage + this._ticketHeadroomBytes;
@@ -1656,6 +1694,16 @@ class DiodeConnection extends EventEmitter {
       localAddress,
       epoch
     );
+    // Signing may yield. Do not return a ticket based on a report that was
+    // superseded while its signature was being created.
+    if (this._supportsRelayUsage === true &&
+        (this._relayUsageGeneration !== this._socketGeneration ||
+         this._ticketUsageSequence !== this._relayUsageSequence)) {
+      throw new DiodeConnectionError('Diode ticket usage is stale', 'DIODE_USAGE_STALE');
+    }
+    if (this._supportsRelayUsage !== null && this._ticketUsageEpoch !== epoch) {
+      throw new DiodeConnectionError('Diode ticket usage belongs to another epoch', 'DIODE_USAGE_EPOCH_CHANGED');
+    }
     if (hasExpectedTransport) {
       this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode ticket signature');
       this.totalConnections = totalConnections;

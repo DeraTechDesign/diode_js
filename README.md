@@ -142,6 +142,15 @@ Connection retry behavior can be configured via environment variables:
 | DIODE_TICKET_BYTES_THRESHOLD | Bytes threshold for ticket updates | 4194304 (4 MiB) |
 | DIODE_TICKET_UPDATE_INTERVAL | Time interval for ticket updates (ms) | 30000 (30s) |
 
+With relay `hello` version 1001, ticket usage is an absolute device byte count.
+The client checks the ticket epoch before and after fetching it, and again
+before signing. A change between those steps cancels the ticket so the next
+attempt fetches a fresh report. The relay report contains no epoch, however,
+and the relay's usage counter can follow a different clock from the ticket
+chain. This check cannot prove which epoch a high report belongs to after a
+cold start or reconnect. Complete protection requires the relay to return an
+epoch alongside usage.
+
 Example `.env` file:
 ```
 DIODE_MAX_RETRIES=10

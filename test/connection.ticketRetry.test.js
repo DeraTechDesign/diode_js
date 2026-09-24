@@ -308,6 +308,8 @@ test('too_low repair reconciles against authoritative relay usage without adding
   connection._supportsRelayUsage = true;
   connection._relayUsageGeneration = connection._socketGeneration;
   connection._relayUsage = 820_000_000;
+  connection._ticketUsageEpoch = 687;
+  connection._ticketUsageSequence = connection._relayUsageSequence;
   const ticket = await connection.createTicketCommand();
   assert.equal(ticket[5], 820_001_024);
   assert.equal(connection.totalBytes, 820_001_024);
@@ -462,6 +464,8 @@ test('active stream too_low retries use fresh usage and bounded temporary margin
     connection._supportsRelayUsage = true;
     connection._relayUsageGeneration = connection._socketGeneration;
     connection._relayUsage = reports[refreshes];
+    connection._ticketUsageEpoch = 687;
+    connection._ticketUsageSequence = connection._relayUsageSequence;
     refreshes += 1;
   };
   connection.sendCommand = (command, options) => {
@@ -519,6 +523,117 @@ test('new epoch usage replaces the previous epoch paid floor', async () => {
   assert.equal(ticket[2], 688);
   assert.equal(ticket[5], 20_001_024);
   assert.equal(connection.lastAcceptedTicketBytes, 0);
+});
+
+test('ticket creation refuses a usage report from the previous epoch', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  let epoch = 687;
+  connection.RPC.getEpoch = async () => epoch;
+  stubHelloUsage(connection, 500_000_000);
+
+  await connection._refreshTicketUsage();
+  epoch = 688; // Epoch rolls over after hello but before ticket signing.
+
+  await assert.rejects(connection.createTicketCommand(), (error) =>
+    error.code === 'DIODE_USAGE_EPOCH_CHANGED');
+  assert.equal(connection.lastAcceptedTicketEpoch, 687);
+  assert.equal(connection.lastAcceptedTicketBytes, 0);
+
+  stubHelloUsage(connection, 20_000_000);
+  await connection._refreshTicketUsage();
+  const retry = await connection.createTicketCommand();
+  assert.equal(retry[2], 688);
+  assert.equal(retry[5], 20_001_024);
+});
+
+test('hello refuses usage when the epoch changes while the report is in flight', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  const epochs = [687, 688];
+  connection.RPC.getEpoch = async () => epochs.shift() ?? 688;
+  stubHelloUsage(connection, 500_000_000);
+
+  await assert.rejects(connection._refreshTicketUsage(), (error) =>
+    error.code === 'DIODE_USAGE_EPOCH_CHANGED');
+  assert.equal(connection._ticketUsageEpoch, null);
+  await assert.rejects(connection.createTicketCommand(), (error) =>
+    error.code === 'DIODE_USAGE_EPOCH_CHANGED');
+});
+
+test('too_low retry after rollover signs fresh-epoch usage', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  let epoch = 687;
+  connection.RPC.getEpoch = async () => epoch;
+  stubHelloUsage(connection, 500_000_000);
+  await connection._refreshTicketUsage();
+  const previousEpochTicket = await connection.createTicketCommand();
+  assert.equal(previousEpochTicket[5], 500_001_024);
+  epoch = 688;
+
+  let retryTicket;
+  connection.sendCommand = async (command) => {
+    if (command[0] === 'hello') {
+      reportRelayUsage(connection, 20_000_000);
+      return ['ok'];
+    }
+    retryTicket = command;
+    return ['thanks!'];
+  };
+  const response = new Promise((resolve, reject) => {
+    connection.pendingRequests.set(1, {
+      resolve,
+      reject,
+      commandArray: previousEpochTicket,
+      ticketRetryCount: 0,
+    });
+  });
+  connection._handleData(encodeResponse(1, tooLowResponse({ epoch: 688, totalBytes: 0 })));
+
+  assert.deepEqual(await response, ['thanks!']);
+  assert.equal(retryTicket[2], 688);
+  assert.equal(retryTicket[5], 20_000_000 + 64 * 1024);
+});
+
+test('an extra usage request during epoch validation retries with a fresh report', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  let reads = 0;
+  connection.RPC.getEpoch = async () => {
+    reads += 1;
+    if (reads === 2) {
+      reportRelayUsage(connection, 10_000_100);
+      await new Promise(setImmediate);
+    }
+    return 687;
+  };
+  stubHelloUsage(connection, 10_000_000);
+  await assert.rejects(connection._refreshTicketUsage(), (error) =>
+    error.code === 'DIODE_USAGE_STALE');
+
+  stubHelloUsage(connection, 10_000_100);
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 10_001_124);
+});
+
+test('signing refuses a usage report superseded during an async signature', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  stubHelloUsage(connection, 10_000_000);
+  await connection._refreshTicketUsage();
+  connection.createTicketSignature = async () => {
+    reportRelayUsage(connection, 11_000_000);
+    await new Promise(setImmediate);
+    return Buffer.alloc(65, 1);
+  };
+
+  await assert.rejects(connection.createTicketCommand(), (error) =>
+    error.code === 'DIODE_USAGE_STALE');
+  stubHelloUsage(connection, 11_000_000);
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 11_001_024);
 });
 
 test('unsupported hello wire error probes the paid floor without ambiguous pre-ticket bytes', async () => {
