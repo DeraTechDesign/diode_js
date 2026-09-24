@@ -203,7 +203,7 @@ test('too_low response does not leave processed frames to be replayed', async ()
       resolve,
       reject,
       commandArray: ['ticketv2'],
-      ticketRetryCount: 1,
+      ticketRetryCount: 3,
     });
   });
   const tooLow = [

@@ -107,11 +107,10 @@ class DiodeResponseError extends DiodeConnectionError {
   }
 }
 
-// The relay rejects a ticket whose cumulative byte count advances by more
-// than 100,000,000 from its previous accepted ticket. Keep headroom for other
-// clients using the same device identity and pay large backlogs in steps.
+// Legacy relays reject a ticket more than 100,000,000 bytes above the last
+// accepted ticket. Current relays compare against device usage instead.
 const MAX_TICKET_BYTE_ADVANCE = 64_000_000;
-const TICKET_HEADROOM_BYTES = 1024;
+const TICKET_HEADROOM_LEVELS = [1024, 64 * 1024, 256 * 1024, 1024 * 1024];
 const RELAY_USAGE_HELLO_VERSION = 1001;
 
 class DiodeConnection extends EventEmitter {
@@ -205,6 +204,7 @@ class DiodeConnection extends EventEmitter {
     this._supportsRelayUsage = null;
     this._relayUsageQueryInFlight = false;
     this._ticketAcceptedOnTransport = false;
+    this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[0];
     this.relayUsageWaitMs = this.commandTimeoutMs;
     
     // Log the ticket batching settings
@@ -281,6 +281,7 @@ class DiodeConnection extends EventEmitter {
     this._supportsRelayUsage = null;
     this._relayUsageQueryInFlight = false;
     this._ticketAcceptedOnTransport = false;
+    this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[0];
 
     const attempt = new Promise((resolve, reject) => {
       let settled = false;
@@ -790,9 +791,15 @@ class DiodeConnection extends EventEmitter {
           const originalCommand = pending.commandArray;
           const retryCount = pending.ticketRetryCount || 0;
           const isTicketCommand = this._isTicketCommand(originalCommand);
+          const maxTicketRetries = this._supportsRelayUsage === true
+            ? TICKET_HEADROOM_LEVELS.length - 1
+            : 1;
 
-          if (isTicketCommand && retryCount < 1) {
+          if (isTicketCommand && retryCount < maxTicketRetries) {
             this.fixResponse(responseData);
+            if (this._supportsRelayUsage === true) {
+              this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[retryCount + 1];
+            }
             const allowTransportReady = pending.allowTransportReady === true;
             const expectedSocket = pending.expectedSocket;
             const expectedGeneration = pending.expectedGeneration;
@@ -812,7 +819,10 @@ class DiodeConnection extends EventEmitter {
                   : this.sendCommand(ticketCommand, retryOptions);
               })
               .then(pending.resolve)
-              .catch(pending.reject);
+              .catch((error) => {
+                this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[0];
+                pending.reject(error);
+              });
             return true;
           }
           this._recordTicketResponse(originalCommand, responseData);
@@ -1033,7 +1043,10 @@ class DiodeConnection extends EventEmitter {
   _recordTicketResponse(commandArray, responseData) {
     if (!this._isTicketCommand(commandArray) || !Array.isArray(responseData)) return;
     const status = responseData[0] !== undefined ? parseResponseType(responseData[0]) : '';
-    if (status !== 'thanks!') return;
+    if (status !== 'thanks!') {
+      this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[0];
+      return;
+    }
     const ticketTotalBytes = this._ticketTotalBytes(commandArray);
     if (!Number.isFinite(ticketTotalBytes)) return;
     if (commandArray[0] === 'ticketv2') {
@@ -1048,6 +1061,7 @@ class DiodeConnection extends EventEmitter {
     }
     this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, ticketTotalBytes);
     this._ticketAcceptedOnTransport = true;
+    this._ticketHeadroomBytes = TICKET_HEADROOM_LEVELS[0];
     this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
     this.lastTicketUpdate = Date.now();
   }
@@ -1078,15 +1092,22 @@ class DiodeConnection extends EventEmitter {
     }
     return new Promise((resolve, reject) => {
       let timer;
+      let settleImmediate;
+      let latestUsage;
       const cleanup = () => {
         clearTimeout(timer);
+        if (settleImmediate) clearImmediate(settleImmediate);
         this.off('relay_usage', onUsage);
         this.off('disconnect', onDisconnect);
       };
       const onUsage = (event) => {
         if (event.generation !== generation || event.sequence <= sequence) return;
-        cleanup();
-        resolve(event.usage);
+        latestUsage = event.usage;
+        if (settleImmediate) return;
+        settleImmediate = setImmediate(() => {
+          cleanup();
+          resolve(latestUsage);
+        });
       };
       const onDisconnect = (event) => {
         if (event.generation !== generation) return;
@@ -1152,6 +1173,10 @@ class DiodeConnection extends EventEmitter {
         throw new DiodeConnectionError('Diode relay rejected usage negotiation', 'DIODE_USAGE_NEGOTIATION');
       }
       if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage negotiation');
+      // The relay sends its fresh ticket_request before the hello response,
+      // but unsolicited dispatch is deferred. Drain that batch so an older
+      // queued request cannot win over the fresh report.
+      await new Promise(setImmediate);
       const usage = await this._waitForRelayUsageAfter(sequence, generation);
       if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage report');
       if (!Number.isSafeInteger(usage) || usage < 0) {
@@ -1160,7 +1185,7 @@ class DiodeConnection extends EventEmitter {
       this._supportsRelayUsage = true;
       this.totalBytes = this.lastAcceptedTicketBytes > 0 && usage <= this.lastAcceptedTicketBytes
         ? this.lastAcceptedTicketBytes
-        : usage + TICKET_HEADROOM_BYTES;
+        : usage + this._ticketHeadroomBytes;
       this.accumulatedBytes = Math.max(0, this.totalBytes - this.lastAcceptedTicketBytes);
       return usage;
     } finally {
@@ -1199,9 +1224,7 @@ class DiodeConnection extends EventEmitter {
     // On old relays this command is used only after an accepted ticket has
     // selected the right fleet. Reconcile downward as well as upward: writes
     // lost on disconnect must not become payable traffic.
-    this.totalBytes = measuredBytes <= 0
-      ? baseBytes
-      : baseBytes + measuredBytes + TICKET_HEADROOM_BYTES;
+    this.totalBytes = measuredBytes <= 0 ? baseBytes : baseBytes + measuredBytes;
     this.accumulatedBytes = Math.max(0, this.totalBytes - baseBytes);
     return measuredBytes;
   }
@@ -1620,7 +1643,7 @@ class DiodeConnection extends EventEmitter {
     if (this._supportsRelayUsage === true && this._relayUsageGeneration === this._socketGeneration) {
       totalBytes = acceptedBytes > 0 && this._relayUsage <= acceptedBytes
         ? acceptedBytes
-        : this._relayUsage + TICKET_HEADROOM_BYTES;
+        : this._relayUsage + this._ticketHeadroomBytes;
       this.totalBytes = totalBytes;
       this.accumulatedBytes = Math.max(0, totalBytes - acceptedBytes);
     } else {

@@ -129,9 +129,11 @@ test('ticket too_low during initial handshake keeps the transport-ready retry pa
   assert.equal(internalRetries, 1);
 });
 
-test('ticket too_low response does not retry recursively', async () => {
+test('ticket too_low response stops after the bounded retries', async () => {
   const connection = makeConnection();
   let retryCount = 0;
+  connection._supportsRelayUsage = true;
+  connection._ticketHeadroomBytes = 1024 * 1024;
 
   connection.fixResponse = () => {};
   connection.createTicketCommand = async () => {
@@ -144,7 +146,7 @@ test('ticket too_low response does not retry recursively', async () => {
       resolve,
       reject,
       commandArray: ['ticketv2'],
-      ticketRetryCount: 1,
+      ticketRetryCount: 3,
     });
   });
 
@@ -153,6 +155,45 @@ test('ticket too_low response does not retry recursively', async () => {
 
   assert.equal(retryCount, 0);
   assert.equal(Buffer.from(result[0]).toString('utf8'), 'too_low');
+  assert.equal(connection._ticketHeadroomBytes, 1024);
+});
+
+test('legacy relay stops after one too_low retry', async () => {
+  const connection = makeConnection();
+  connection._supportsRelayUsage = false;
+  let refreshes = 0;
+  connection._refreshTicketUsage = async () => { refreshes += 1; };
+  const result = new Promise((resolve, reject) => {
+    connection.pendingRequests.set(1, {
+      resolve,
+      reject,
+      commandArray: ['ticketv2'],
+      ticketRetryCount: 1,
+    });
+  });
+
+  connection._handleData(encodeResponse(1, tooLowResponse()));
+  assert.equal(Buffer.from((await result)[0]).toString('utf8'), 'too_low');
+  assert.equal(refreshes, 0);
+});
+
+test('failed ticket retry clears the temporary headroom', async () => {
+  const connection = makeConnection();
+  connection._refreshTicketUsage = async () => {};
+  connection.createTicketCommand = async () => ['ticketv2'];
+  connection.sendCommand = async () => { throw new Error('retry failed'); };
+  const result = new Promise((resolve, reject) => {
+    connection.pendingRequests.set(1, {
+      resolve,
+      reject,
+      commandArray: ['ticketv2'],
+      ticketRetryCount: 0,
+    });
+  });
+
+  connection._handleData(encodeResponse(1, tooLowResponse()));
+  await assert.rejects(result, /retry failed/);
+  assert.equal(connection._ticketHeadroomBytes, 1024);
 });
 
 test('session responses do not swallow later unsolicited messages on the same session', async () => {
@@ -348,6 +389,20 @@ for (const beforeResponse of [false, true]) {
   });
 }
 
+test('hello selects the fresh usage report after an older queued request', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.sendCommand = async (command) => {
+    assert.deepEqual(command, ['hello', 1001]);
+    reportRelayUsage(connection, 700_000_000); // previous epoch, still queued
+    reportRelayUsage(connection, 20_000_000); // response to this hello
+    return ['ok'];
+  };
+
+  assert.equal(await connection._refreshTicketUsage(), 20_000_000);
+  assert.equal((await connection.createTicketCommand())[5], 20_001_024);
+});
+
 test('two idle reconnects keep the same signed byte total and clear stale local bytes', async () => {
   let paidBytes = 0;
   for (let reconnect = 0; reconnect < 2; reconnect += 1) {
@@ -395,6 +450,60 @@ test('too_low with over 64 MB unpaid uses absolute usage rather than doubling th
   const ticket = await connection.createTicketCommand();
   assert.equal(ticket[5], 120_001_024);
   assert.equal(ticket[5] - 120_000_000, 1024);
+});
+
+test('active stream too_low retries use fresh usage and bounded temporary margin', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  const reports = [120_100_000, 120_300_000, 120_700_000];
+  let refreshes = 0;
+  let submissions = 0;
+  connection._refreshTicketUsage = async () => {
+    connection._supportsRelayUsage = true;
+    connection._relayUsageGeneration = connection._socketGeneration;
+    connection._relayUsage = reports[refreshes];
+    refreshes += 1;
+  };
+  connection.sendCommand = (command, options) => {
+    assert.equal(command[0], 'ticketv2');
+    const retryNumber = options.ticketRetryCount;
+    const currentUsage = [120_300_000, 120_700_000, 121_000_000][submissions];
+    assert.equal(retryNumber, submissions + 1);
+    assert.ok(command[5] - reports[submissions] <= 1024 * 1024);
+    submissions += 1;
+    return new Promise((resolve, reject) => {
+      const requestId = submissions + 1;
+      connection.pendingRequests.set(requestId, {
+        resolve,
+        reject,
+        commandArray: command,
+        ticketRetryCount: retryNumber,
+      });
+      const response = submissions < 3
+        ? tooLowResponse({ totalBytes: 10_000_000 })
+        : ['response', 'thanks!'];
+      if (submissions < 3) assert.ok(command[5] < currentUsage);
+      else assert.ok(command[5] >= currentUsage);
+      setImmediate(() => connection._handleData(encodeResponse(requestId, response)));
+    });
+  };
+
+  const result = new Promise((resolve, reject) => {
+    connection.pendingRequests.set(1, {
+      resolve,
+      reject,
+      commandArray: ['ticketv2'],
+      ticketRetryCount: 0,
+    });
+  });
+  connection._handleData(encodeResponse(1, tooLowResponse({ totalBytes: 10_000_000 })));
+  assert.equal(Buffer.from((await result)[0]).toString('utf8'), 'thanks!');
+  assert.equal(refreshes, 3);
+  assert.equal(submissions, 3);
+  assert.equal(connection.lastAcceptedTicketBytes, 121_748_576);
+  assert.equal(connection._ticketHeadroomBytes, 1024, 'successful ticket resets retry margin');
+  connection._relayUsage = 121_000_000;
+  assert.equal((await connection.createTicketCommand())[5], 121_748_576);
 });
 
 test('new epoch usage replaces the previous epoch paid floor', async () => {
@@ -452,7 +561,7 @@ test('legacy bytes measurement is used only after an accepted ticket selects the
   };
 
   await connection._refreshTicketUsage();
-  assert.equal((await connection.createTicketCommand())[5], 10_001_124);
+  assert.equal((await connection.createTicketCommand())[5], 10_000_100);
   signedUnpaidBytes = 3; // zigzag encoding for -1
   await connection._refreshTicketUsage();
   assert.equal((await connection.createTicketCommand())[5], 10_000_000);
@@ -480,7 +589,9 @@ test('disconnect cancels the absolute usage waiter and removes its listeners', a
   stubTicketSigning(connection);
   connection.sendCommand = async () => ['ok'];
   const refresh = connection._refreshTicketUsage();
-  await new Promise(setImmediate);
+  for (let turn = 0; turn < 3 && connection.listenerCount('relay_usage') === 0; turn += 1) {
+    await new Promise(setImmediate);
+  }
   assert.equal(connection.listenerCount('relay_usage'), 1);
   connection.emit('disconnect', { generation: connection._socketGeneration });
   await assert.rejects(refresh, (error) => error.code === 'DIODE_DISCONNECTED');
