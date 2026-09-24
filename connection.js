@@ -1694,6 +1694,16 @@ class DiodeConnection extends EventEmitter {
       localAddress,
       epoch
     );
+    // Signing may yield. Do not return a ticket based on a report that was
+    // superseded while its signature was being created.
+    if (this._supportsRelayUsage === true &&
+        (this._relayUsageGeneration !== this._socketGeneration ||
+         this._ticketUsageSequence !== this._relayUsageSequence)) {
+      throw new DiodeConnectionError('Diode ticket usage is stale', 'DIODE_USAGE_STALE');
+    }
+    if (this._supportsRelayUsage !== null && this._ticketUsageEpoch !== epoch) {
+      throw new DiodeConnectionError('Diode ticket usage belongs to another epoch', 'DIODE_USAGE_EPOCH_CHANGED');
+    }
     if (hasExpectedTransport) {
       this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode ticket signature');
       this.totalConnections = totalConnections;

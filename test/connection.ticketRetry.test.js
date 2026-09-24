@@ -617,6 +617,25 @@ test('an extra usage request during epoch validation retries with a fresh report
   assert.equal((await connection.createTicketCommand())[5], 10_001_124);
 });
 
+test('signing refuses a usage report superseded during an async signature', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  stubHelloUsage(connection, 10_000_000);
+  await connection._refreshTicketUsage();
+  connection.createTicketSignature = async () => {
+    reportRelayUsage(connection, 11_000_000);
+    await new Promise(setImmediate);
+    return Buffer.alloc(65, 1);
+  };
+
+  await assert.rejects(connection.createTicketCommand(), (error) =>
+    error.code === 'DIODE_USAGE_STALE');
+  stubHelloUsage(connection, 11_000_000);
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 11_001_024);
+});
+
 test('unsupported hello wire error probes the paid floor without ambiguous pre-ticket bytes', async () => {
   const connection = makeConnection();
   stubTicketSigning(connection);
