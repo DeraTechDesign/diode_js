@@ -107,6 +107,11 @@ class DiodeResponseError extends DiodeConnectionError {
   }
 }
 
+// The relay rejects a ticket whose cumulative byte count advances by more
+// than 100,000,000 from its previous accepted ticket. Keep headroom for other
+// clients using the same device identity and pay large backlogs in steps.
+const MAX_TICKET_BYTE_ADVANCE = 64_000_000;
+
 class DiodeConnection extends EventEmitter {
   constructor(host, port, keyLocation = './db/keys.json') {
     super();
@@ -190,6 +195,7 @@ class DiodeConnection extends EventEmitter {
     this._ticketUpdateToken = null;
     this.pendingTicketUpdateForce = false;
     this.lastAcceptedTicketBytes = 0;
+    this.lastAcceptedTicketEpoch = null;
     this.lastRelayMeasuredBytes = 0;
     
     // Log the ticket batching settings
@@ -332,6 +338,17 @@ class DiodeConnection extends EventEmitter {
             this.isReconnecting = false;
             this.retryCount = 0;
             this._startTicketUpdateTimer();
+            // A bounded handshake ticket can leave a large unpaid backlog.
+            // Continue paying it promptly instead of waiting for the timer or
+            // another packet to arrive.
+            if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
+              setImmediate(() => {
+                if (generation !== this._socketGeneration || !this.isReady()) return;
+                this._updateTicketIfNeeded(true).catch((error) => {
+                  logger.error(() => `Error catching up connection tickets: ${error}`);
+                });
+              });
+            }
             if (this._resolveReconnectWaiter) this._resolveReconnectWaiter();
             settle();
           } catch (error) {
@@ -910,11 +927,19 @@ class DiodeConnection extends EventEmitter {
       unpaid measurement still comes from the relay "bytes" command.
     */
     const lastTicket = this._parseTooLowTicketSummary(response);
+    if (Number.isSafeInteger(lastTicket.epoch) &&
+        Number.isSafeInteger(this.lastAcceptedTicketEpoch) &&
+        lastTicket.epoch < this.lastAcceptedTicketEpoch) return;
     if (Number.isFinite(lastTicket.totalConnections)) {
       this.totalConnections = Math.max(this.totalConnections, lastTicket.totalConnections);
     }
     if (Number.isFinite(lastTicket.totalBytes)) {
-      this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, lastTicket.totalBytes);
+      if (Number.isSafeInteger(lastTicket.epoch) && lastTicket.epoch !== this.lastAcceptedTicketEpoch) {
+        this.lastAcceptedTicketEpoch = lastTicket.epoch;
+        this.lastAcceptedTicketBytes = lastTicket.totalBytes;
+      } else {
+        this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, lastTicket.totalBytes);
+      }
       const relayMeasuredBytes = Number.isFinite(this.lastRelayMeasuredBytes) ? this.lastRelayMeasuredBytes : 0;
       const pendingBytes = Math.max(this.accumulatedBytes, relayMeasuredBytes, 0);
       this.totalBytes = Math.max(this.totalBytes, lastTicket.totalBytes + pendingBytes + 1024);
@@ -985,6 +1010,16 @@ class DiodeConnection extends EventEmitter {
     if (status !== 'thanks!') return;
     const ticketTotalBytes = this._ticketTotalBytes(commandArray);
     if (!Number.isFinite(ticketTotalBytes)) return;
+    if (commandArray[0] === 'ticketv2') {
+      const ticketEpoch = parseUInt(commandArray[2]);
+      if (Number.isSafeInteger(ticketEpoch) &&
+          Number.isSafeInteger(this.lastAcceptedTicketEpoch) &&
+          ticketEpoch < this.lastAcceptedTicketEpoch) return;
+      if (Number.isSafeInteger(ticketEpoch) && ticketEpoch !== this.lastAcceptedTicketEpoch) {
+        this.lastAcceptedTicketEpoch = ticketEpoch;
+        this.lastAcceptedTicketBytes = 0;
+      }
+    }
     this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, ticketTotalBytes);
     this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
     this.lastTicketUpdate = Date.now();
@@ -1419,9 +1454,6 @@ class DiodeConnection extends EventEmitter {
     const totalConnections = this.totalConnections + 1;
     if (!hasExpectedTransport) this.totalConnections = totalConnections;
   
-    // Assume totalBytes is managed elsewhere
-    const totalBytes = this.totalBytes;
-  
     // Get server Ethereum address as Buffer
     const serverIdBuffer = await this._waitForServerEthereumAddress({
       expectedSocket,
@@ -1444,6 +1476,19 @@ class DiodeConnection extends EventEmitter {
     if (hasExpectedTransport) {
       this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode ticket epoch');
     }
+    // Relay ticket floors are scoped to an epoch. The previous epoch's
+    // accepted total cannot bound a ticket in the new epoch.
+    if (epoch !== this.lastAcceptedTicketEpoch) {
+      this.lastAcceptedTicketEpoch = epoch;
+      this.lastAcceptedTicketBytes = 0;
+    }
+    // Preserve the full unpaid target in this.totalBytes. Only bound the
+    // amount signed into this ticket; _recordTicketResponse advances the
+    // accepted floor after each acknowledgement.
+    const acceptedBytes = Number.isSafeInteger(this.lastAcceptedTicketBytes)
+      ? Math.max(0, this.lastAcceptedTicketBytes)
+      : 0;
+    const totalBytes = Math.min(this.totalBytes, acceptedBytes + MAX_TICKET_BYTE_ADVANCE);
     const signature = await this.createTicketSignature(
       serverIdBuffer,
       totalConnections,

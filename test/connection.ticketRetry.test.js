@@ -20,6 +20,7 @@ function encodeResponse(requestId, response) {
 }
 
 function tooLowResponse(overrides = {}) {
+  const epoch = overrides.epoch === undefined ? 687 : overrides.epoch;
   const totalConnections = overrides.totalConnections === undefined ? 11 : overrides.totalConnections;
   const totalBytes = overrides.totalBytes === undefined ? 135591 : overrides.totalBytes;
 
@@ -27,7 +28,7 @@ function tooLowResponse(overrides = {}) {
     'response',
     'too_low',
     1284,
-    687,
+    epoch,
     totalConnections,
     totalBytes,
     Buffer.from([0]),
@@ -200,4 +201,107 @@ test('ticket update keeps accumulated bytes when ticket is rejected', async () =
 
   assert.equal(connection.accumulatedBytes, 1000);
   assert.equal(connection.lastTicketUpdate, 123);
+});
+
+test('large byte totals are paid in bounded tickets without losing the unpaid target', async () => {
+  const connection = makeConnection();
+  connection.totalBytes = 190_000_000;
+  connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
+  connection.RPC.getEpoch = async () => 687;
+  const signedBytes = [];
+  connection.createTicketSignature = async (_server, _connections, bytes) => {
+    signedBytes.push(bytes);
+    return Buffer.alloc(65, 1);
+  };
+
+  const first = await connection.createTicketCommand();
+  assert.equal(first[5], 64_000_000);
+  connection._recordTicketResponse(first, ['thanks!']);
+  assert.equal(connection.totalBytes, 190_000_000);
+  assert.equal(connection.accumulatedBytes, 126_000_000);
+
+  const second = await connection.createTicketCommand();
+  assert.equal(second[5], 128_000_000);
+  connection._recordTicketResponse(second, ['thanks!']);
+
+  const third = await connection.createTicketCommand();
+  assert.equal(third[5], 190_000_000);
+  assert.deepEqual(signedBytes, [first[5], second[5], third[5]]);
+});
+
+test('too_low repair uses the persisted relay floor before bounding catch-up', async () => {
+  const connection = makeConnection();
+  connection.totalBytes = 190_000_000;
+  connection.accumulatedBytes = 120_000_000;
+  connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
+  connection.RPC.getEpoch = async () => 687;
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+
+  connection.fixResponse(tooLowResponse({ totalConnections: 9, totalBytes: 700_000_000 }));
+
+  assert.equal(connection.lastAcceptedTicketBytes, 700_000_000);
+  assert.equal(connection.totalBytes, 820_001_024);
+  const ticket = await connection.createTicketCommand();
+  assert.equal(ticket[5], 764_000_000);
+  assert.equal(connection.totalBytes, 820_001_024);
+});
+
+test('ticket updates drain a large backlog without exceeding the relay jump limit', async () => {
+  const connection = makeConnection();
+  connection.socket = { destroyed: false, writable: true };
+  connection._ready = true;
+  connection._transportReady = true;
+  connection.totalBytes = 190_000_000;
+  connection.accumulatedBytes = 190_000_000;
+  connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
+  connection.RPC.getEpoch = async () => 687;
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+  connection._syncMeasuredBytesWithRelay = async () => 0;
+  connection._startTicketUpdateTimer = () => {};
+
+  let relayFloor = 0;
+  const acceptedTotals = [];
+  connection.sendCommand = async (command) => {
+    const ticketBytes = command[5];
+    assert.ok(ticketBytes - relayFloor <= 100_000_000);
+    assert.ok(ticketBytes > relayFloor);
+    relayFloor = ticketBytes;
+    acceptedTotals.push(ticketBytes);
+    connection._recordTicketResponse(command, ['thanks!']);
+    return ['thanks!'];
+  };
+
+  await connection._updateTicketIfNeeded(true);
+  for (let index = 0; index < 10 && relayFloor < connection.totalBytes; index += 1) {
+    await new Promise(setImmediate);
+  }
+
+  assert.deepEqual(acceptedTotals, [64_000_000, 128_000_000, 190_000_000]);
+  assert.equal(connection.accumulatedBytes, 0);
+});
+
+test('epoch rollover does not reuse the previous epoch ticket floor', async () => {
+  const connection = makeConnection();
+  connection.lastAcceptedTicketEpoch = 687;
+  connection.lastAcceptedTicketBytes = 700_000_000;
+  connection.totalBytes = 900_000_000;
+  connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
+  connection.RPC.getEpoch = async () => 688;
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+
+  const first = await connection.createTicketCommand();
+  assert.equal(first[2], 688);
+  assert.equal(first[5], 64_000_000);
+  assert.equal(connection.lastAcceptedTicketEpoch, 688);
+  assert.equal(connection.lastAcceptedTicketBytes, 0);
+
+  connection.fixResponse(tooLowResponse({ epoch: 688, totalBytes: 20_000_000 }));
+  const retry = await connection.createTicketCommand();
+  assert.equal(retry[5], 84_000_000);
+
+  // Late responses from an older epoch cannot restore its higher floor.
+  connection._recordTicketResponse(['ticketv2', 1284, 687, null, 1, 700_000_000], ['thanks!']);
+  connection.fixResponse(tooLowResponse({ epoch: 687, totalBytes: 700_000_000 }));
+  assert.equal(connection.lastAcceptedTicketEpoch, 688);
+  assert.equal(connection.lastAcceptedTicketBytes, 20_000_000);
 });
