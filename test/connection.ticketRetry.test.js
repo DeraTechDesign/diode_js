@@ -36,11 +36,34 @@ function tooLowResponse(overrides = {}) {
   ];
 }
 
+function stubTicketSigning(connection, epoch = 687) {
+  connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
+  connection.RPC.getEpoch = async () => epoch;
+  connection.createTicketSignature = async () => Buffer.alloc(65, 1);
+}
+
+function reportRelayUsage(connection, usage) {
+  connection._handleData(encodeResponse(99, ['ticket_request', usage]));
+}
+
+function stubHelloUsage(connection, usage, { beforeResponse = false } = {}) {
+  const commands = [];
+  connection.sendCommand = async (command) => {
+    commands.push(command[0]);
+    assert.deepEqual(command, ['hello', 1001]);
+    reportRelayUsage(connection, usage);
+    if (beforeResponse) await new Promise(setImmediate);
+    return ['ok'];
+  };
+  return commands;
+}
+
 test('ticket too_low response retries once with repaired ticket', async () => {
   const connection = makeConnection();
   let retryCount = 0;
 
   connection.fixResponse = () => {};
+  connection._refreshTicketUsage = async () => {};
   connection.createTicketCommand = async () => ['ticketv2'];
   connection.sendCommand = async (command, options) => {
     retryCount += 1;
@@ -72,7 +95,7 @@ test('ticket too_low during initial handshake keeps the transport-ready retry pa
   let internalRetries = 0;
 
   connection.fixResponse = () => {};
-  connection._syncMeasuredBytesWithRelay = async (options) => {
+  connection._refreshTicketUsage = async (options) => {
     syncAllowed = options.allowTransportReady === true;
   };
   connection.createTicketCommand = async (options) => {
@@ -159,7 +182,7 @@ test('session responses do not swallow later unsolicited messages on the same se
   assert.equal(Buffer.from(message[1][0]).toString('utf8'), 'portsend');
 });
 
-test('too_low repair does not reduce local byte counters', () => {
+test('too_low repair discards an unverified local byte target', () => {
   const connection = makeConnection();
   connection.totalConnections = 40;
   connection.totalBytes = 1304576;
@@ -167,10 +190,10 @@ test('too_low repair does not reduce local byte counters', () => {
   connection.fixResponse(tooLowResponse());
 
   assert.equal(connection.totalConnections, 40);
-  assert.equal(connection.totalBytes, 1304576);
+  assert.equal(connection.totalBytes, 135591);
 });
 
-test('too_low repair uses node-reported paid byte floor', () => {
+test('too_low repair uses only the node-reported paid byte floor', () => {
   const connection = makeConnection();
   connection.totalConnections = 4;
   connection.totalBytes = 128000;
@@ -184,8 +207,8 @@ test('too_low repair uses node-reported paid byte floor', () => {
 
   assert.equal(connection.totalConnections, 7);
   assert.equal(connection.lastAcceptedTicketBytes, 135591);
-  assert.equal(connection.totalBytes, 140711);
-  assert.equal(connection.accumulatedBytes, 5120);
+  assert.equal(connection.totalBytes, 135591);
+  assert.equal(connection.accumulatedBytes, 0);
 });
 
 test('ticket update keeps accumulated bytes when ticket is rejected', async () => {
@@ -229,7 +252,7 @@ test('large byte totals are paid in bounded tickets without losing the unpaid ta
   assert.deepEqual(signedBytes, [first[5], second[5], third[5]]);
 });
 
-test('too_low repair uses the persisted relay floor before bounding catch-up', async () => {
+test('too_low repair reconciles against authoritative relay usage without adding local pending bytes', async () => {
   const connection = makeConnection();
   connection.totalBytes = 190_000_000;
   connection.accumulatedBytes = 120_000_000;
@@ -240,9 +263,12 @@ test('too_low repair uses the persisted relay floor before bounding catch-up', a
   connection.fixResponse(tooLowResponse({ totalConnections: 9, totalBytes: 700_000_000 }));
 
   assert.equal(connection.lastAcceptedTicketBytes, 700_000_000);
-  assert.equal(connection.totalBytes, 820_001_024);
+  assert.equal(connection.totalBytes, 700_000_000);
+  connection._supportsRelayUsage = true;
+  connection._relayUsageGeneration = connection._socketGeneration;
+  connection._relayUsage = 820_000_000;
   const ticket = await connection.createTicketCommand();
-  assert.equal(ticket[5], 764_000_000);
+  assert.equal(ticket[5], 820_001_024);
   assert.equal(connection.totalBytes, 820_001_024);
 });
 
@@ -257,6 +283,7 @@ test('ticket updates drain a large backlog without exceeding the relay jump limi
   connection.RPC.getEpoch = async () => 687;
   connection.createTicketSignature = async () => Buffer.alloc(65, 1);
   connection._syncMeasuredBytesWithRelay = async () => 0;
+  connection._refreshTicketUsage = async () => {};
   connection._startTicketUpdateTimer = () => {};
 
   let relayFloor = 0;
@@ -297,11 +324,199 @@ test('epoch rollover does not reuse the previous epoch ticket floor', async () =
 
   connection.fixResponse(tooLowResponse({ epoch: 688, totalBytes: 20_000_000 }));
   const retry = await connection.createTicketCommand();
-  assert.equal(retry[5], 84_000_000);
+  assert.equal(retry[5], 20_000_000);
 
   // Late responses from an older epoch cannot restore its higher floor.
   connection._recordTicketResponse(['ticketv2', 1284, 687, null, 1, 700_000_000], ['thanks!']);
   connection.fixResponse(tooLowResponse({ epoch: 687, totalBytes: 700_000_000 }));
   assert.equal(connection.lastAcceptedTicketEpoch, 688);
   assert.equal(connection.lastAcceptedTicketBytes, 20_000_000);
+});
+
+for (const beforeResponse of [false, true]) {
+  test(`hello waits for absolute usage ${beforeResponse ? 'before' : 'after'} its response`, async () => {
+    const connection = makeConnection();
+    stubTicketSigning(connection);
+    const commands = stubHelloUsage(connection, 10_000_000, { beforeResponse });
+    connection.totalBytes = 110_000_000;
+    connection.accumulatedBytes = 109_000_000;
+
+    assert.equal(await connection._refreshTicketUsage(), 10_000_000);
+    assert.deepEqual(commands, ['hello']);
+    assert.equal(connection.totalBytes, 10_001_024);
+    assert.equal((await connection.createTicketCommand())[5], 10_001_024);
+  });
+}
+
+test('two idle reconnects keep the same signed byte total and clear stale local bytes', async () => {
+  let paidBytes = 0;
+  for (let reconnect = 0; reconnect < 2; reconnect += 1) {
+    const connection = makeConnection();
+    stubTicketSigning(connection);
+    stubHelloUsage(connection, 10_000_000);
+    connection.totalBytes = 500_000_000;
+    connection.accumulatedBytes = 500_000_000;
+    await connection._refreshTicketUsage();
+    const ticket = await connection.createTicketCommand();
+    if (reconnect === 0) paidBytes = ticket[5];
+    assert.equal(ticket[5], paidBytes);
+    connection._recordTicketResponse(ticket, ['thanks!']);
+    assert.equal(connection.accumulatedBytes, 0);
+    await connection._refreshTicketUsage();
+    assert.equal((await connection.createTicketCommand())[5], paidBytes);
+    assert.equal(connection.accumulatedBytes, 0);
+  }
+  assert.equal(paidBytes, 10_001_024);
+});
+
+test('too_low from a parallel connection does not add local pending bytes to its paid floor', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.totalBytes = 40_000_000;
+  connection.accumulatedBytes = 100_000;
+  connection.fixResponse(tooLowResponse({ totalBytes: 10_101_024 }));
+  stubHelloUsage(connection, 10_101_024);
+
+  await connection._refreshTicketUsage();
+  const ticket = await connection.createTicketCommand();
+  assert.equal(ticket[5], 10_101_024);
+  assert.equal(connection.accumulatedBytes, 0);
+});
+
+test('too_low with over 64 MB unpaid uses absolute usage rather than doubling the ticket', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.totalBytes = 220_000_000;
+  connection.accumulatedBytes = 110_000_000;
+  connection.fixResponse(tooLowResponse({ totalBytes: 10_000_000 }));
+  stubHelloUsage(connection, 120_000_000);
+
+  await connection._refreshTicketUsage();
+  const ticket = await connection.createTicketCommand();
+  assert.equal(ticket[5], 120_001_024);
+  assert.equal(ticket[5] - 120_000_000, 1024);
+});
+
+test('new epoch usage replaces the previous epoch paid floor', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection, 688);
+  connection.lastAcceptedTicketEpoch = 687;
+  connection.lastAcceptedTicketBytes = 700_000_000;
+  connection.totalBytes = 900_000_000;
+  stubHelloUsage(connection, 20_000_000);
+
+  await connection._refreshTicketUsage();
+  const ticket = await connection.createTicketCommand();
+  assert.equal(ticket[2], 688);
+  assert.equal(ticket[5], 20_001_024);
+  assert.equal(connection.lastAcceptedTicketBytes, 0);
+});
+
+test('unsupported hello wire error probes the paid floor without ambiguous pre-ticket bytes', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.totalBytes = 110_000_000;
+  connection.accumulatedBytes = 110_000_000;
+  const commands = [];
+  connection.sendCommand = async (command) => {
+    commands.push(command[0]);
+    const response = new Promise((resolve, reject) => {
+      connection.pendingRequests.set(1, { resolve, reject, commandArray: command });
+    });
+    connection._handleData(encodeResponse(1, ['error', Buffer.from('version not supported')]));
+    return response;
+  };
+
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 128000);
+  connection.fixResponse(tooLowResponse({ totalBytes: 10_000_000 }));
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 10_000_000);
+  assert.deepEqual(commands, ['hello']);
+});
+
+test('legacy bytes measurement is used only after an accepted ticket selects the fleet', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.socket = { destroyed: false };
+  connection.lastAcceptedTicketEpoch = 687;
+  connection.lastAcceptedTicketBytes = 10_000_000;
+  connection._supportsRelayUsage = false;
+  connection._ticketAcceptedOnTransport = true;
+  const commands = [];
+  let signedUnpaidBytes = 200; // zigzag encoding for +100
+  connection.sendCommand = async (command) => {
+    commands.push(command[0]);
+    assert.deepEqual(command, ['bytes']);
+    return [signedUnpaidBytes];
+  };
+
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 10_001_124);
+  signedUnpaidBytes = 3; // zigzag encoding for -1
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 10_000_000);
+  assert.equal(connection.accumulatedBytes, 0);
+  assert.deepEqual(commands, ['bytes', 'bytes']);
+});
+
+test('hello response without absolute usage fails closed', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.relayUsageWaitMs = 10;
+  connection.sendCommand = async (command) => {
+    assert.deepEqual(command, ['hello', 1001]);
+    return ['ok'];
+  };
+
+  await assert.rejects(connection._refreshTicketUsage(), (error) => error.code === 'DIODE_USAGE_TIMEOUT');
+  assert.equal(connection._supportsRelayUsage, null);
+  assert.equal(connection.listenerCount('relay_usage'), 0);
+  assert.equal(connection.listenerCount('disconnect'), 0);
+});
+
+test('disconnect cancels the absolute usage waiter and removes its listeners', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.sendCommand = async () => ['ok'];
+  const refresh = connection._refreshTicketUsage();
+  await new Promise(setImmediate);
+  assert.equal(connection.listenerCount('relay_usage'), 1);
+  connection.emit('disconnect', { generation: connection._socketGeneration });
+  await assert.rejects(refresh, (error) => error.code === 'DIODE_DISCONNECTED');
+  assert.equal(connection.listenerCount('relay_usage'), 0);
+  assert.equal(connection.listenerCount('disconnect'), 0);
+});
+
+test('hello command timeout fails closed without a legacy fallback', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.sendCommand = async () => {
+    const error = new Error('hello timed out');
+    error.code = 'DIODE_COMMAND_TIMEOUT';
+    throw error;
+  };
+
+  await assert.rejects(connection._refreshTicketUsage(), (error) => error.code === 'DIODE_COMMAND_TIMEOUT');
+  assert.equal(connection._supportsRelayUsage, null);
+});
+
+test('failed write bytes are removed by the next absolute relay usage report', async () => {
+  const connection = makeConnection();
+  stubTicketSigning(connection);
+  connection.ticketUpdateThreshold = Number.MAX_SAFE_INTEGER;
+  connection._ensureConnected = async () => {};
+  connection.socket = {
+    destroyed: false,
+    writable: true,
+    write(_message, callback) { callback(new Error('send failed')); },
+  };
+
+  await assert.rejects(connection.sendCommand(['ping', Buffer.alloc(2048)]), /send failed/);
+  assert.ok(connection.totalBytes > 128000);
+  assert.equal(connection.pendingRequests.size, 0);
+  stubHelloUsage(connection, 0);
+  await connection._refreshTicketUsage();
+  assert.equal((await connection.createTicketCommand())[5], 1024);
+  assert.equal(connection.totalBytes, 1024);
 });

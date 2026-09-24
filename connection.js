@@ -111,6 +111,8 @@ class DiodeResponseError extends DiodeConnectionError {
 // than 100,000,000 from its previous accepted ticket. Keep headroom for other
 // clients using the same device identity and pay large backlogs in steps.
 const MAX_TICKET_BYTE_ADVANCE = 64_000_000;
+const TICKET_HEADROOM_BYTES = 1024;
+const RELAY_USAGE_HELLO_VERSION = 1001;
 
 class DiodeConnection extends EventEmitter {
   constructor(host, port, keyLocation = './db/keys.json') {
@@ -197,6 +199,13 @@ class DiodeConnection extends EventEmitter {
     this.lastAcceptedTicketBytes = 0;
     this.lastAcceptedTicketEpoch = null;
     this.lastRelayMeasuredBytes = 0;
+    this._relayUsage = null;
+    this._relayUsageGeneration = -1;
+    this._relayUsageSequence = 0;
+    this._supportsRelayUsage = null;
+    this._relayUsageQueryInFlight = false;
+    this._ticketAcceptedOnTransport = false;
+    this.relayUsageWaitMs = this.commandTimeoutMs;
     
     // Log the ticket batching settings
     logger.info(() => `Ticket batching settings - Bytes Threshold: ${this.ticketUpdateThreshold} bytes, Update Interval: ${this.ticketUpdateInterval}ms`);
@@ -260,6 +269,18 @@ class DiodeConnection extends EventEmitter {
     this._transportReady = false;
     this.receiveBuffer = Buffer.alloc(0);
     this._serverEthAddress = null;
+    // A new TLS connection can terminate on a different relay with a
+    // different paid floor. Never carry a local high-water ticket into it.
+    this.totalBytes = 128000;
+    this.accumulatedBytes = 0;
+    this.lastAcceptedTicketBytes = 0;
+    this.lastAcceptedTicketEpoch = null;
+    this.lastRelayMeasuredBytes = 0;
+    this._relayUsage = null;
+    this._relayUsageGeneration = -1;
+    this._supportsRelayUsage = null;
+    this._relayUsageQueryInFlight = false;
+    this._ticketAcceptedOnTransport = false;
 
     const attempt = new Promise((resolve, reject) => {
       let settled = false;
@@ -316,9 +337,9 @@ class DiodeConnection extends EventEmitter {
             const cachedServerAddress = await this._waitForServerEthereumAddress(handshakeOptions);
             this._assertCurrentTransport(socket, generation, 'Diode server identity lookup');
             if (cachedServerAddress) this._serverEthAddress = cachedServerAddress;
-            this._assertCurrentTransport(socket, generation, 'Diode measured-byte synchronization');
-            await this._syncMeasuredBytesWithRelay(handshakeOptions);
-            this._assertCurrentTransport(socket, generation, 'Diode measured-byte synchronization');
+            this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
+            await this._refreshTicketUsage(handshakeOptions);
+            this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
             const ticketCommand = await this.createTicketCommand(handshakeOptions);
             this._assertCurrentTransport(socket, generation, 'Diode ticket creation');
             const ticketResponse = await this._sendCommandTransportReady(ticketCommand, handshakeOptions);
@@ -775,13 +796,8 @@ class DiodeConnection extends EventEmitter {
             const allowTransportReady = pending.allowTransportReady === true;
             const expectedSocket = pending.expectedSocket;
             const expectedGeneration = pending.expectedGeneration;
-            const hasExpectedTransport = expectedSocket !== undefined || expectedGeneration !== undefined;
             const retryContext = { allowTransportReady, expectedSocket, expectedGeneration };
-            this._syncMeasuredBytesWithRelay(retryContext)
-              .catch((error) => {
-                if (hasExpectedTransport) throw error;
-                logger.debug(() => `Unable to sync relay measured bytes after too_low: ${error}`);
-              })
+            this._refreshTicketUsage(retryContext)
               .then(() => this.createTicketCommand(retryContext))
               .then((ticketCommand) => {
                 const retryOptions = {
@@ -899,14 +915,23 @@ class DiodeConnection extends EventEmitter {
     if (messageType === 'ticket_request') {
       const deviceUsageRaw = messageContent[1];
       const deviceUsage = parseUInt(deviceUsageRaw);
-      if (typeof deviceUsage === 'number' && deviceUsage > this.totalBytes) {
-        this.totalBytes = deviceUsage;
+      if (Number.isSafeInteger(deviceUsage) && deviceUsage >= 0) {
+        this._relayUsage = deviceUsage;
+        this._relayUsageGeneration = this._socketGeneration;
+        this._relayUsageSequence += 1;
+        this.emit('relay_usage', {
+          generation: this._socketGeneration,
+          sequence: this._relayUsageSequence,
+          usage: deviceUsage,
+        });
       }
 
-      // Use the same single-flight ticket path as periodic updates.
-      this._updateTicketIfNeeded(true).catch((error) => {
-        logger.error(() => `Error handling ticket_request: ${error}`);
-      });
+      if (this.isReady() && !this._relayUsageQueryInFlight) {
+        // Use the same single-flight ticket path as periodic updates.
+        this._updateTicketIfNeeded(true).catch((error) => {
+          logger.error(() => `Error handling ticket_request: ${error}`);
+        });
+      }
     }
     return true;
   }
@@ -923,8 +948,8 @@ class DiodeConnection extends EventEmitter {
         local_address,
         device_signature
       ]
-      The byte value is the relay's last accepted paid floor. The live
-      unpaid measurement still comes from the relay "bytes" command.
+      The byte value is the relay's last accepted paid floor. It says
+      nothing about new usage; the relay usage report supplies that.
     */
     const lastTicket = this._parseTooLowTicketSummary(response);
     if (Number.isSafeInteger(lastTicket.epoch) &&
@@ -940,10 +965,11 @@ class DiodeConnection extends EventEmitter {
       } else {
         this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, lastTicket.totalBytes);
       }
-      const relayMeasuredBytes = Number.isFinite(this.lastRelayMeasuredBytes) ? this.lastRelayMeasuredBytes : 0;
-      const pendingBytes = Math.max(this.accumulatedBytes, relayMeasuredBytes, 0);
-      this.totalBytes = Math.max(this.totalBytes, lastTicket.totalBytes + pendingBytes + 1024);
-      this.accumulatedBytes = Math.max(this.accumulatedBytes, this.totalBytes - lastTicket.totalBytes);
+      // Local pending bytes can already be included in the relay's global
+      // usage and another connection's paid ticket. A fresh relay query after
+      // too_low establishes the target without adding them again.
+      this.totalBytes = this.lastAcceptedTicketBytes;
+      this.accumulatedBytes = 0;
     }
   }
 
@@ -1021,6 +1047,7 @@ class DiodeConnection extends EventEmitter {
       }
     }
     this.lastAcceptedTicketBytes = Math.max(this.lastAcceptedTicketBytes, ticketTotalBytes);
+    this._ticketAcceptedOnTransport = true;
     this.accumulatedBytes = Math.max(0, this.totalBytes - ticketTotalBytes);
     this.lastTicketUpdate = Date.now();
   }
@@ -1040,6 +1067,105 @@ class DiodeConnection extends EventEmitter {
     if (!Number.isFinite(encoded)) return null;
     if (encoded % 2 === 0) return encoded / 2;
     return -((encoded - 1) / 2);
+  }
+
+  _waitForRelayUsageAfter(sequence, generation) {
+    if (generation !== this._socketGeneration || generation === this._lastDisconnectedGeneration) {
+      return Promise.reject(new DiodeDisconnectedError('Diode relay disconnected before reporting usage'));
+    }
+    if (this._relayUsageGeneration === generation && this._relayUsageSequence > sequence) {
+      return Promise.resolve(this._relayUsage);
+    }
+    return new Promise((resolve, reject) => {
+      let timer;
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.off('relay_usage', onUsage);
+        this.off('disconnect', onDisconnect);
+      };
+      const onUsage = (event) => {
+        if (event.generation !== generation || event.sequence <= sequence) return;
+        cleanup();
+        resolve(event.usage);
+      };
+      const onDisconnect = (event) => {
+        if (event.generation !== generation) return;
+        cleanup();
+        reject(new DiodeDisconnectedError('Diode relay disconnected before reporting usage'));
+      };
+      this.on('relay_usage', onUsage);
+      this.on('disconnect', onDisconnect);
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new DiodeConnectionError('Diode relay did not report ticket usage', 'DIODE_USAGE_TIMEOUT'));
+      }, normalizeTimerMs(this.relayUsageWaitMs, this.commandTimeoutMs));
+    });
+  }
+
+  async _refreshTicketUsage({
+    allowTransportReady = false,
+    expectedSocket = undefined,
+    expectedGeneration = undefined,
+  } = {}) {
+    const hasExpectedTransport = expectedSocket !== undefined || expectedGeneration !== undefined;
+    const generation = hasExpectedTransport ? expectedGeneration : this._socketGeneration;
+    const commandOptions = hasExpectedTransport ? { expectedSocket, expectedGeneration } : {};
+    const send = allowTransportReady
+      ? (command) => this._sendCommandTransportReady(command, commandOptions)
+      : (command) => this.sendCommand(command, commandOptions);
+
+    // The relay's paid ticket is scoped to an epoch; never use the previous
+    // epoch's floor when interpreting current device usage.
+    const epoch = allowTransportReady
+      ? await this.RPC._getEpochWithSender(send)
+      : await this.RPC.getEpoch();
+    if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage epoch');
+    if (epoch !== this.lastAcceptedTicketEpoch) {
+      this.lastAcceptedTicketEpoch = epoch;
+      this.lastAcceptedTicketBytes = 0;
+    }
+
+    if (this._supportsRelayUsage === false) {
+      if (!this._ticketAcceptedOnTransport) {
+        // Older relays do not provide an absolute usage floor. Probe with a
+        // small ticket; too_low supplies their paid floor. Never add an
+        // ambiguous pre-ticket `bytes` reply to that floor.
+        this.totalBytes = Math.max(128000, this.lastAcceptedTicketBytes);
+        this.accumulatedBytes = Math.max(0, this.totalBytes - this.lastAcceptedTicketBytes);
+        return null;
+      }
+      return this._syncMeasuredBytesWithRelay({ allowTransportReady, expectedSocket, expectedGeneration });
+    }
+
+    const sequence = this._relayUsageSequence;
+    this._relayUsageQueryInFlight = true;
+    try {
+      let response;
+      try {
+        response = await send(['hello', RELAY_USAGE_HELLO_VERSION]);
+      } catch (error) {
+        if (!/version not supported/i.test(String(error && error.message))) throw error;
+        this._supportsRelayUsage = false;
+        return this._refreshTicketUsage({ allowTransportReady, expectedSocket, expectedGeneration });
+      }
+      if (!response || parseResponseType(response[0]) !== 'ok') {
+        throw new DiodeConnectionError('Diode relay rejected usage negotiation', 'DIODE_USAGE_NEGOTIATION');
+      }
+      if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage negotiation');
+      const usage = await this._waitForRelayUsageAfter(sequence, generation);
+      if (hasExpectedTransport) this._assertCurrentTransport(expectedSocket, expectedGeneration, 'Diode usage report');
+      if (!Number.isSafeInteger(usage) || usage < 0) {
+        throw new DiodeConnectionError('Diode relay reported invalid usage', 'DIODE_USAGE_INVALID');
+      }
+      this._supportsRelayUsage = true;
+      this.totalBytes = this.lastAcceptedTicketBytes > 0 && usage <= this.lastAcceptedTicketBytes
+        ? this.lastAcceptedTicketBytes
+        : usage + TICKET_HEADROOM_BYTES;
+      this.accumulatedBytes = Math.max(0, this.totalBytes - this.lastAcceptedTicketBytes);
+      return usage;
+    } finally {
+      this._relayUsageQueryInFlight = false;
+    }
   }
 
   async _syncMeasuredBytesWithRelay({
@@ -1062,19 +1188,21 @@ class DiodeConnection extends EventEmitter {
     const measuredBytes = responseData && responseData[0] !== undefined
       ? this._parseRelaySignedInt(responseData[0])
       : null;
-    if (!Number.isFinite(measuredBytes) || measuredBytes <= 0) {
-      return measuredBytes;
+    if (!Number.isSafeInteger(measuredBytes)) {
+      throw new DiodeConnectionError('Diode relay returned invalid unpaid bytes', 'DIODE_USAGE_INVALID');
     }
 
     this.lastRelayMeasuredBytes = measuredBytes;
     const baseBytes = Number.isFinite(this.lastAcceptedTicketBytes) && this.lastAcceptedTicketBytes > 0
       ? this.lastAcceptedTicketBytes
       : 128000;
-    const targetTotalBytes = baseBytes + measuredBytes + 1024;
-    if (targetTotalBytes > this.totalBytes) {
-      this.totalBytes = targetTotalBytes;
-      this.accumulatedBytes = Math.max(this.accumulatedBytes, this.totalBytes - baseBytes);
-    }
+    // On old relays this command is used only after an accepted ticket has
+    // selected the right fleet. Reconcile downward as well as upward: writes
+    // lost on disconnect must not become payable traffic.
+    this.totalBytes = measuredBytes <= 0
+      ? baseBytes
+      : baseBytes + measuredBytes + TICKET_HEADROOM_BYTES;
+    this.accumulatedBytes = Math.max(0, this.totalBytes - baseBytes);
     return measuredBytes;
   }
 
@@ -1488,7 +1616,16 @@ class DiodeConnection extends EventEmitter {
     const acceptedBytes = Number.isSafeInteger(this.lastAcceptedTicketBytes)
       ? Math.max(0, this.lastAcceptedTicketBytes)
       : 0;
-    const totalBytes = Math.min(this.totalBytes, acceptedBytes + MAX_TICKET_BYTE_ADVANCE);
+    let totalBytes;
+    if (this._supportsRelayUsage === true && this._relayUsageGeneration === this._socketGeneration) {
+      totalBytes = acceptedBytes > 0 && this._relayUsage <= acceptedBytes
+        ? acceptedBytes
+        : this._relayUsage + TICKET_HEADROOM_BYTES;
+      this.totalBytes = totalBytes;
+      this.accumulatedBytes = Math.max(0, totalBytes - acceptedBytes);
+    } else {
+      totalBytes = Math.min(this.totalBytes, acceptedBytes + MAX_TICKET_BYTE_ADVANCE);
+    }
     const signature = await this.createTicketSignature(
       serverIdBuffer,
       totalConnections,
@@ -1612,9 +1749,7 @@ class DiodeConnection extends EventEmitter {
       try {
         if (this.accumulatedBytes > 0 || force) {
           logger.debug(() => `Updating ticket: accumulated ${this.accumulatedBytes} bytes, ${timeSinceLastUpdate}ms since last update`);
-          await this._syncMeasuredBytesWithRelay().catch((error) => {
-            logger.debug(() => `Unable to sync relay measured bytes before ticket update: ${error}`);
-          });
+          await this._refreshTicketUsage();
           if (generation !== this._socketGeneration || this._ticketUpdateToken !== updateToken) return;
           const ticketCommand = await this.createTicketCommand();
           if (generation !== this._socketGeneration || this._ticketUpdateToken !== updateToken) return;
