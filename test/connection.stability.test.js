@@ -181,6 +181,14 @@ test('malformed deferred unsolicited frames cannot escape or block a later ticke
 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(applicationListenerCalls, malformedFrames.length + 1);
+  assert.equal(connection._relayUsage, 131072);
+  assert.equal(ticketRequests, 0, 'a ticket request cannot start before the handshake');
+  prepareTransport(connection);
+  connection._deferUnsolicited([
+    Buffer.from([4]),
+    [Buffer.from('ticket_request'), Buffer.from([2, 0, 1])],
+  ]);
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(ticketRequests, 1);
   connection.close();
 });
@@ -195,7 +203,7 @@ test('too_low response does not leave processed frames to be replayed', async ()
       resolve,
       reject,
       commandArray: ['ticketv2'],
-      ticketRetryCount: 1,
+      ticketRetryCount: 3,
     });
   });
   const tooLow = [
@@ -283,7 +291,7 @@ test('an old ticket update cannot clear a new session ticket flight', async () =
   const first = deferred();
   const second = deferred();
   let syncCall = 0;
-  connection._syncMeasuredBytesWithRelay = () => {
+  connection._refreshTicketUsage = () => {
     syncCall += 1;
     return syncCall === 1 ? first.promise : second.promise;
   };
@@ -421,7 +429,7 @@ test('connection becomes ready only after the secure ticket handshake succeeds',
 
   const connection = makeConnection();
   connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
-  connection._syncMeasuredBytesWithRelay = async () => 0;
+  connection._refreshTicketUsage = async () => 0;
   connection.createTicketCommand = async () => ['ticketv2'];
   connection._sendCommandTransportReady = async () => ['thanks!'];
   try {
@@ -462,7 +470,7 @@ test('a stale handshake cannot mutate or send through a newer ready generation',
     lookupCalls += 1;
     return lookupCalls === 1 ? firstLookup.promise : secondServerAddress;
   };
-  connection._syncMeasuredBytesWithRelay = async () => {
+  connection._refreshTicketUsage = async () => {
     syncGenerations.push(connection._socketGeneration);
     return 0;
   };
@@ -529,7 +537,7 @@ test('explicit connect resolves a backoff waiter and a later disconnect can reco
   connection.retryDelay = 1000;
   connection.maxRetryDelay = 1000;
   connection._waitForServerEthereumAddress = async () => Buffer.alloc(20, 1);
-  connection._syncMeasuredBytesWithRelay = async () => 0;
+  connection._refreshTicketUsage = async () => 0;
   connection.createTicketCommand = async () => ['ticketv2'];
   connection._sendCommandTransportReady = async () => ['thanks!'];
   try {
