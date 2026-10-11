@@ -1,6 +1,6 @@
 {
   "name": "diodejs",
-  "version": "0.5.10",
+  "version": "0.5.11",
   "description": "A JavaScript client for interacting with the Diode network. It provides functionalities to bind and publish ports, send RPC commands, and handle responses.",
   "main": "index.js",
   "files": [
@@ -8,6 +8,7 @@
     "clientManager.js",
     "connection.js",
     "diodeSocket.js",
+    "udpLatestSender.js",
     "index.js",
     "logger.js",
     "nativeCrypto.js",
@@ -23,7 +24,10 @@
     "scripts/"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "bench:stability": "node scripts/benchmark-stability.js",
+    "bench:stream-parser": "node scripts/benchmark-stream-parser.js",
+    "bench:teleoperation": "node scripts/benchmark-teleoperation.js"
   },
   "author": "",
   "license": "ISC",

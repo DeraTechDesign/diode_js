@@ -83,3 +83,16 @@ test('native bridge reports an authentication failure without forwarding plainte
   assert.equal(localSocket.writes.length, 0);
   assert.equal(relaySocket.destroyed, true);
 });
+
+test('native bridge rejects a missing encrypted frame instead of delivering a silently truncated stream', async () => {
+  const localSocket = new Endpoint(), relaySocket = new Endpoint(), keys = sessions(), errors = [];
+  const bridge = bridgeNativeTcp({ localSocket, relaySocket, session: keys.local, onError: error => errors.push(error) });
+  try {
+    nativeCrypto.createTcpFrame(keys.remote, Buffer.from('lost prefix'));
+    relaySocket.push(nativeCrypto.createTcpFrame(keys.remote, Buffer.from('later bytes')));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(errors.length, 1, 'a gap in an ordered stream must fail the bridge');
+    assert.match(errors[0].message, /counter gap/);
+    assert.equal(localSocket.writes.length, 0); assert.equal(relaySocket.destroyed, true);
+  } finally { bridge.destroy(); }
+});

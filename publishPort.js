@@ -8,6 +8,7 @@ const { Buffer } = require('buffer');
 const { randomUUID } = require('node:crypto');
 const EventEmitter = require('events');
 const DiodeSocket = require('./diodeSocket');
+const PUBLISH_PORT_LISTENER_STATE = Symbol.for('diodejs.publishPort.listenerState');
 const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBackpressure');
 const DiodeRPC = require('./rpc');
 const { makeReadable, parseUInt, toBufferView } = require('./utils');
@@ -288,6 +289,7 @@ class PublishPort extends EventEmitter {
   }
 
   _trackFlow(info, transport = 'api') {
+    info._publisherOwner = this;
     if (!this._flowObserver || info.handshake || info._flow) return;
     info._flow = {
       flowId: randomUUID(),
@@ -415,6 +417,7 @@ class PublishPort extends EventEmitter {
 
   _cleanupConnectionInfo(connection, ref, info, { notifyRemote = true } = {}) {
     if (!info) return;
+    if (info._publisherOwner && info._publisherOwner !== this) return;
     this._trackedConnectionInfos.delete(info);
     if (info._cleaned) return;
     info._cleaned = true;
@@ -451,7 +454,7 @@ class PublishPort extends EventEmitter {
     let existing;
     try { existing = connection.getConnection(ref); } catch (_) {}
     if (existing && existing !== info) {
-      this._cleanupConnectionInfo(connection, ref, existing, { notifyRemote: false });
+      (existing._publisherOwner || this)._cleanupConnectionInfo(connection, ref, existing, { notifyRemote: false });
     }
     connection.addConnection(ref, info);
   }
@@ -567,16 +570,60 @@ class PublishPort extends EventEmitter {
         logger.error(() => `Publisher unsolicited dispatcher failed: ${error}`);
       }
     };
-    this.connection.on('unsolicited', this._onUnsolicited);
+    let state = this.connection[PUBLISH_PORT_LISTENER_STATE];
+    if (!state) {
+      const root = this.connection;
+      state = { instances: new Set() };
+      state.dispatch = (message, sourceConnection) => {
+        try {
+          const connection = sourceConnection || root;
+          const instances = Array.from(state.instances);
+          let owner = instances[0];
+          const validated = validatePublisherUnsolicited(message);
+          if (!validated.error) {
+            const { messageType, messageContent } = validated;
+            if (messageType === 'portopen' || messageType === 'portopen2') {
+              const name = String(makeReadable(messageContent[1]));
+              const port = parseInt(name.includes(':') ? name.split(':')[1] : name, 10);
+              // One policy owner answers the open. Sibling publishers must not
+              // reject each other's ports or acknowledge the same request twice.
+              owner = instances.find(instance => instance.publishedPorts.has(port)) || owner;
+            } else if (['portsend', 'data', 'portclose'].includes(messageType)) {
+              const ref = toBufferView(messageContent[1]);
+              const info = connection.getConnection?.(ref);
+              if (info?._publisherOwner) owner = state.instances.has(info._publisherOwner) ? info._publisherOwner : null;
+              else if (info) owner = instances.find(instance => instance.publishedPorts.has(info.port)) || owner;
+              else if (connection.getClientSocket?.(ref)) owner = null; // BindPort owns this direction.
+            } else if (messageType === 'portclose2') {
+              const physicalPort = parseUInt(messageContent[1]);
+              owner = instances.find(instance => instance._getNativeSession(connection, physicalPort)) || owner;
+            }
+          }
+          owner?._onUnsolicited(message, sourceConnection);
+        } catch (error) {
+          logger.error(() => `Publisher routing failed: ${error}`);
+        }
+      };
+      root[PUBLISH_PORT_LISTENER_STATE] = state;
+      root.on('unsolicited', state.dispatch);
+    }
+    state.instances.add(this);
+    this._listenerState = state;
     this._listening = true;
     return this;
   }
 
   stopListening() {
     if (!this._listening) return this;
-    if (this._onUnsolicited) {
-      this.connection.off('unsolicited', this._onUnsolicited);
+    const state = this._listenerState;
+    if (state) {
+      state.instances.delete(this);
+      if (state.instances.size === 0) {
+        this.connection.off('unsolicited', state.dispatch);
+        delete this.connection[PUBLISH_PORT_LISTENER_STATE];
+      }
     }
+    this._listenerState = null;
     this._listening = false;
     return this;
   }
@@ -690,9 +737,11 @@ class PublishPort extends EventEmitter {
       void Promise.resolve(rpc.sendError(sessionId, ref, 'TLS setup failed')).catch(() => {});
       return;
     }
+    diodeSocket.on('error', error => tlsSocket.destroy(error));
     tlsSocket.setNoDelay(true);
 
     const connectionInfo = {
+      _publisherOwner: this,
       diodeSocket,
       tlsSocket,
       protocol: 'tls',
@@ -1392,6 +1441,8 @@ class PublishPort extends EventEmitter {
       void Promise.resolve(rpc.sendError(sessionId, ref, 'TLS setup failed')).catch(() => {});
       return;
     }
+    // Propagate asynchronous relay failures even on Node 18's TLS wrapper.
+    diodeSocket.on('error', error => tlsSocket.destroy(error));
     tlsSocket.setNoDelay(true);
     let responded = false;
     let connectTimer = null;
@@ -1461,6 +1512,17 @@ class PublishPort extends EventEmitter {
       if (connectionInfo._flowBackendReady) this._openFlow(connectionInfo);
     });
     tlsSocket.pipe(localSocket).pipe(tlsSocket);
+
+    // A successful backend TCP connect is not a completed TLS handshake.
+    // Bound clients that open a published ref but never send/finish TLS.
+    const secureTimer = setTimeout(() => {
+      if (connectionInfo._cleaned) return;
+      connectionInfo.error = new Error('Published TLS handshake timed out');
+      this._cleanupConnectionInfo(connection, ref, connectionInfo, { notifyRemote: responded });
+    }, normalizeTimerMs(this.handshakeTimeoutMs, 10000));
+    if (typeof secureTimer.unref === 'function') secureTimer.unref();
+    tlsSocket.once('secure', () => clearTimeout(secureTimer));
+    tlsSocket.once('close', () => clearTimeout(secureTimer));
 
     // Handle errors and cleanup
     tlsSocket.on('error', (err) => {

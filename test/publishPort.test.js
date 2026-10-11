@@ -10,6 +10,23 @@ const PublishPort = require('../publishPort');
 const nativeCrypto = require('../nativeCrypto');
 const DiodeSocket = require('../diodeSocket');
 
+test('shared publisher routing does not fall through a private owner to a broader duplicate policy', () => {
+  const connection = new FakeConnection();
+  const owner = new PublishPort(connection, { 8080: { mode: 'private', whitelist: ['0x' + '11'.repeat(20)] } });
+  const sibling = new PublishPort(connection, { 8080: { mode: 'public' } });
+  owner.handleTCPConnection = () => assert.fail('unauthorized peer reached private backend');
+  sibling.handleTCPConnection = () => assert.fail('duplicate public policy bypassed private owner');
+  try {
+    connection.emit('unsolicited', [Buffer.from([1]), ['portopen', 'tcp:8080', Buffer.from([2]), Buffer.alloc(20, 0x22)]]);
+    assert.equal(connection.sentErrors.length, 1);
+    assert.match(String(connection.sentErrors[0][2]), /not whitelisted/);
+    assert.equal(connection.listenerCount('unsolicited'), 1);
+    owner.close();
+    assert.equal(connection.listenerCount('unsolicited'), 1);
+  } finally { owner.close(); sibling.close(); }
+  assert.equal(connection.listenerCount('unsolicited'), 0);
+});
+
 class FakeStreamSocket extends EventEmitter {
   constructor() {
     super();
@@ -676,6 +693,8 @@ test('native publisher keeps the handshake channel open until TLS write and rela
     );
     await waitFor(() => writeStarted);
 
+    const sibling = new PublishPort(connection, { 9999: { mode: 'public' } });
+    sibling.close();
     assert.equal(connection.getConnection(ref) !== undefined, true);
     assert.equal(publishPort._trackedConnectionInfos.size, 1);
     assert.equal(tlsSocket.destroyed, false);

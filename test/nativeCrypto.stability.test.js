@@ -31,6 +31,17 @@ test('native UDP replay window accepts bounded reordering exactly once', () => {
   assert.equal(nativeCrypto.parseUdpPacket(rx, packets[2]), null);
 });
 
+test('native TCP rejects a forward counter gap while retaining duplicate suppression', () => {
+  const { tx, rx } = makeUdpPair();
+  const first = nativeCrypto.createTcpFrame(tx, Buffer.from('first'));
+  assert.deepEqual(nativeCrypto.consumeTcpFrames(rx, first), [Buffer.from('first')]);
+  assert.deepEqual(nativeCrypto.consumeTcpFrames(rx, first), []);
+  nativeCrypto.createTcpFrame(tx, Buffer.from('missing'));
+  const later = nativeCrypto.createTcpFrame(tx, Buffer.from('later'));
+  assert.throws(() => nativeCrypto.consumeTcpFrames(rx, later), /counter gap/);
+  assert.equal(rx.rxCounter, 1n); assert.equal(rx.rxBuffer.length, 0);
+});
+
 test('native frame readers reject declared oversized frames before buffering payloads', () => {
   const session = {
     rxKey: Buffer.alloc(32),

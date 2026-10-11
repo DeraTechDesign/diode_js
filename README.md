@@ -82,6 +82,46 @@ network performance. Native integration tests run with addons disabled using
 
 ### API transport stability
 
+Relay TCP fragments are assembled into a bounded frame buffer; complete frames
+avoid an extra assembly copy. Decoded batches yield after 64 messages so bulk
+traffic leaves event-loop time for interactive work. Published TLS connections
+must finish their handshake within the configured handshake timeout; established
+idle sessions keep their existing behavior. Native TCP rejects forward encrypted
+frame-counter gaps instead of silently delivering an incomplete byte stream.
+
+`npm run bench:stream-parser` measures parser fragmentation cost separately from
+WAN latency. The teleoperation benchmark also supports `--background-mode`,
+`control-reader-pause`, `bulk-reader-pause` and `stream-reset` fault cases.
+
+Release CI tests Node 18, 20 and 22 with native addons enabled and disabled.
+`node scripts/benchmark-compatibility.js --baseline <extracted-diodejs-package>`
+checks API TCP/TLS and Native TCP against a published peer in both directions,
+including slow readers and final-byte delivery. Put extracted baselines under
+a `node_modules` directory so the normal test runner does not discover their tests.
+
+For replaceable UDP values, an individual bind can opt into
+`udpSendPolicy: { mode: 'latest', maxAgeMs: 50, maxPendingClients: 64 }`.
+While opening a port or awaiting a send, it retains only the newest pending
+datagram from each local source address/port. It checks age with a monotonic
+clock immediately before submission and drops expired values. The optional
+source limit bounds simultaneous pending clients (default 64, maximum 4096).
+`bind.getUdpSendStats(localPort)` returns submission, supersession, expiration,
+overload, cancellation and error counters. No policy is applied by default.
+
+Use a complete replacement value per datagram; keep discrete actions and
+unrelated topics on separate streams. The policy affects only the bind's
+outbound direction. It bounds local queue age, not network delivery age, and
+cannot retract submitted packets. API UDP still shares the reliable relay
+transport and this policy waits for its current send acknowledgement before
+submitting another datagram. Native UDP waits for local send completion.
+Applications still need receiver-side command age, sequence, session ownership
+and watchdog checks. For local control producers, bind to `127.0.0.1` explicitly.
+
+Run `npm run bench:teleoperation -- --help` for a fixed-rate control workload
+with independent endpoint processes, direct-loopback comparison, competing bulk
+traffic and explicit fault injections. Results distinguish measurement completion
+from deadline qualification. This is a synthetic workload, not robot certification.
+
 API TCP and TLS streams use an ordered send window capped at 256 KiB and 16
 unacknowledged frames per direction. This avoids waiting a full relay round trip
 for every write while preserving Node stream backpressure. Frames remain below

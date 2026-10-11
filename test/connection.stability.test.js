@@ -265,6 +265,7 @@ test('disconnect rejects pending RPCs, drains buffers, and tears down sessions o
   connection.addClientSocket(Buffer.from('01', 'hex'), client);
   connection.addConnection(Buffer.from('02', 'hex'), { localSocket: local });
   connection.receiveBuffer = Buffer.from([0, 10, 1]);
+  connection._receiveFrameStorage = Buffer.alloc(65537);
 
   let disconnects = 0;
   connection.on('disconnect', () => { disconnects += 1; });
@@ -278,6 +279,7 @@ test('disconnect rejects pending RPCs, drains buffers, and tears down sessions o
   await assert.rejects(pending, (actual) => actual === error);
   assert.equal(connection.pendingRequests.size, 0);
   assert.equal(connection.receiveBuffer.length, 0);
+  assert.equal(connection._receiveFrameStorage, null);
   assert.equal(connection.clientSockets.size, 0);
   assert.equal(connection.connections.size, 0);
   assert.equal(client.destroyed, true);

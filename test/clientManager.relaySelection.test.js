@@ -15,6 +15,34 @@ const networkSnapshot = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'fixtures', 'dio-network-snapshot.json'), 'utf8')
 );
 
+test('a cached device route in failed-probe cooldown does not override the healthy relay', async t => {
+  const temp = makeTempDir();
+  const manager = new DiodeClientManager({ keyLocation: path.join(temp, 'keys.json'), relaySelection: { scoreCachePath: null } });
+  t.after(() => { manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  const stale = new FakeConnection('stale:41046'), healthy = new FakeConnection('healthy:41046');
+  manager._registerConnection(stale, 'stale:41046');
+  manager._registerConnection(healthy, 'healthy:41046');
+  manager.relayScores.set('stale:41046', { ewmaLatencyMs: 1, cooldownUntil: Date.now() + 30000 });
+  manager.relayScores.set('healthy:41046', { ewmaLatencyMs: 20, lastSuccessAt: Date.now() });
+  const device = Buffer.alloc(20, 7);
+  manager._setDeviceCacheEntry(device.toString('hex'), { hostKey: 'stale:41046' });
+  assert.equal(await manager.getConnectionForDevice(device), healthy);
+});
+
+test('closing during a shared device lookup rejects every waiter and clears pending work', async t => {
+  const temp = makeTempDir();
+  const manager = new DiodeClientManager({ keyLocation: path.join(temp, 'keys.json'), relaySelection: { scoreCachePath: null } });
+  t.after(() => { manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  let finish;
+  manager._getConnectionForDevice = () => new Promise(resolve => { finish = resolve; });
+  const first = manager.getConnectionForDevice(Buffer.alloc(20, 7));
+  const second = manager.getConnectionForDevice(Buffer.alloc(20, 7));
+  manager.close(); finish({});
+  const results = await Promise.allSettled([first, second]);
+  assert.ok(results.every(result => result.status === 'rejected' && /closed/.test(result.reason.message)));
+  assert.equal(manager.pendingDeviceResolutions.size, 0);
+});
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -864,7 +892,9 @@ test('device relay reconciliation does not query alternate control relays when t
       },
     },
   }, new Map([
-    ['acceptable-target:41046', { connection: acceptableTarget, pingDelayMs: 40 }],
+    // This is a ranking test, not a host scheduler benchmark. Preserve the
+    // simulated RTT even when unrelated test/build work delays timer callbacks.
+    ['acceptable-target:41046', { connection: acceptableTarget, pingDelayMs: 40, measuredLatencyMs: 40 }],
   ]));
 
   manager._registerConnection(primary, 'primary:41046');

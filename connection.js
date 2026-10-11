@@ -126,6 +126,7 @@ class DiodeConnection extends EventEmitter {
     this.totalBytes = 128000; // start with 128KB
     // Add buffer to handle partial data
     this.receiveBuffer = Buffer.alloc(0);
+    this._receiveFrameStorage = null;
     this.RPC = new DiodeRPC(this);
     this.isReconnecting = false;
     this.connectPromise = null;
@@ -551,6 +552,7 @@ class DiodeConnection extends EventEmitter {
 
   _resetSessionState(error) {
     this.receiveBuffer = Buffer.alloc(0);
+    this._receiveFrameStorage = null;
     for (const immediate of this._deferredUnsolicited) clearImmediate(immediate);
     this._deferredUnsolicited.clear();
     this._queuedUnsolicited.length = 0;
@@ -764,11 +766,16 @@ class DiodeConnection extends EventEmitter {
       this._deferredUnsolicited.delete(immediate);
       // The physical socket is already paused. Stop the current decoded batch
       // too, preserving byte order without delivering more to a blocked reader.
-      while (this._queuedUnsolicited.length > 0 && !isRelayInputPaused(this)) {
+      let delivered = 0;
+      while (this._queuedUnsolicited.length > 0 && !isRelayInputPaused(this) && delivered < 64) {
         const { message, generation } = this._queuedUnsolicited.shift();
+        delivered++;
         if (generation !== this._socketGeneration || generation === this._lastDisconnectedGeneration) continue;
         this.emit('unsolicited', message);
       }
+      // A coalesced bulk read must leave time for timers, socket drains and
+      // interactive writers. Keep the same ordering and generation checks.
+      this._scheduleUnsolicitedDrain();
     });
     this._deferredUnsolicited.add(immediate);
   }
@@ -852,24 +859,49 @@ class DiodeConnection extends EventEmitter {
   }
 
   _handleData(data, generation = this._socketGeneration) {
-    // Append new data to the receive buffer
-    this.receiveBuffer = Buffer.concat([this.receiveBuffer, data]);
-    // logger.debug(() => `Received data: ${data.toString('hex')}`);
-  
     let offset = 0;
-    while (offset + 2 <= this.receiveBuffer.length) {
-      // Read the length of the message (2 bytes)
-      const lengthBuffer = this.receiveBuffer.slice(offset, offset + 2);
-      const length = lengthBuffer.readUInt16BE(0);
-  
-      if (offset + 2 + length > this.receiveBuffer.length) {
-        // Not enough data received yet, wait for more
-        break;
+    while (offset < data.length) {
+      if (generation !== this._socketGeneration || generation === this._lastDisconnectedGeneration) return;
+      let messageBuffer;
+      if (this.receiveBuffer.length > 0) {
+        const pending = this.receiveBuffer;
+        let storage = this._receiveFrameStorage;
+        if (!storage) {
+          storage = Buffer.allocUnsafe(pending.length < 2 ? 2 : 2 + pending.readUInt16BE(0));
+          pending.copy(storage);
+        }
+        let filled = pending.length;
+        if (filled < 2) {
+          storage[filled++] = data[offset++];
+          const expanded = Buffer.allocUnsafe(2 + storage.readUInt16BE(0));
+          storage.copy(expanded, 0, 0, 2); storage = expanded;
+        }
+        const count = Math.min(storage.length - filled, data.length - offset);
+        data.copy(storage, filled, offset, offset + count); filled += count; offset += count;
+        this._receiveFrameStorage = storage;
+        this.receiveBuffer = storage.subarray(0, filled);
+        if (filled < storage.length) return;
+        messageBuffer = storage.subarray(2);
+        this.receiveBuffer = Buffer.alloc(0); this._receiveFrameStorage = null;
+      } else {
+        const remaining = data.length - offset;
+        const frameBytes = remaining < 2 ? 2 : 2 + data.readUInt16BE(offset);
+        if (remaining < frameBytes) {
+          // One allocation per fragmented frame (at most 65,537 bytes), not
+          // a copy of all accumulated bytes for each network fragment.
+          this._receiveFrameStorage = Buffer.allocUnsafe(frameBytes);
+          data.copy(this._receiveFrameStorage, 0, offset);
+          this.receiveBuffer = this._receiveFrameStorage.subarray(0, remaining);
+          return;
+        }
+        messageBuffer = data.subarray(offset + 2, offset + frameBytes);
+        offset += frameBytes;
       }
-  
-      const messageBuffer = this.receiveBuffer.slice(offset + 2, offset + 2 + length);
-      offset += 2 + length;
-  
+      this._decodeRelayFrame(messageBuffer, generation);
+    }
+  }
+
+  _decodeRelayFrame(messageBuffer, generation) {
       try {
         // Avoid copying: pass Buffer directly to RLP.decode
         const decodedMessage = RLP.decode(messageBuffer);
@@ -887,8 +919,8 @@ class DiodeConnection extends EventEmitter {
           logger.debug(() => `Parsed requestId: ${requestId}`);
     
           if (requestId !== null && this._handleResponse(requestId, responseArray)) {
-            // Response handled synchronously; continue parsing any coalesced
-            // frames before trimming receiveBuffer below.
+            // Response handled synchronously; the parser can continue with
+            // the next coalesced frame.
           } else {
             // This is an unsolicited message
             logger.debug(() => `Received unsolicited message`);
@@ -901,11 +933,6 @@ class DiodeConnection extends EventEmitter {
       } catch (error) {
         logger.error(() => `Error decoding message: ${error}`);
       }
-    }
-    
-  
-    // Remove processed data from the buffer
-    this.receiveBuffer = this.receiveBuffer.slice(offset);
   }
 
   _handleUnsolicitedMessage(message) {

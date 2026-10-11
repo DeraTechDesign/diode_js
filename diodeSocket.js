@@ -36,7 +36,14 @@ class DiodeSocket extends Duplex {
   }
 
   _write(chunk, encoding, callback) {
-    this._pendingWrite = { chunk, offset: 0, callback };
+    this._writev([{ chunk }], callback);
+  }
+
+  _writev(chunks, callback) {
+    // Coalesce only writes that Node has already buffered under pressure. The
+    // first interactive write still goes immediately; a burst of small writes
+    // no longer consumes one frame/ACK slot for every byte-sized write.
+    this._pendingWrite = { chunks, index: 0, offset: 0, callback };
     this._pumpWrites();
   }
 
@@ -46,18 +53,31 @@ class DiodeSocket extends Duplex {
     try {
       while (this._pendingWrite && !this.destroyed) {
         const pending = this._pendingWrite;
-        if (pending.offset === pending.chunk.length) {
+        while (pending.index < pending.chunks.length && pending.offset === pending.chunks[pending.index].chunk.length) {
+          pending.index += 1;
+          pending.offset = 0;
+        }
+        if (pending.index === pending.chunks.length) {
           this._pendingWrite = null;
           pending.callback();
           continue;
         }
-        const length = Math.min(MAX_FRAME_BYTES, pending.chunk.length - pending.offset);
-        if (this._sending.size >= SEND_WINDOW_FRAMES || this._sendingBytes + length > SEND_WINDOW_BYTES) break;
+        if (this._sending.size >= SEND_WINDOW_FRAMES || this._sendingBytes >= SEND_WINDOW_BYTES) break;
+        const capacity = Math.min(MAX_FRAME_BYTES, SEND_WINDOW_BYTES - this._sendingBytes);
+        const parts = [];
+        let length = 0;
+        while (pending.index < pending.chunks.length && length < capacity) {
+          const chunk = pending.chunks[pending.index].chunk;
+          const count = Math.min(chunk.length - pending.offset, capacity - length);
+          if (count) parts.push(chunk.subarray(pending.offset, pending.offset + count));
+          length += count;
+          pending.offset += count;
+          if (pending.offset === chunk.length) { pending.index += 1; pending.offset = 0; }
+        }
 
         // Node/TLS may reuse its source buffer after the write callback. Keep
         // each in-flight frame alive independently until the relay answers.
-        const frame = Buffer.from(pending.chunk.subarray(pending.offset, pending.offset + length));
-        pending.offset += length;
+        const frame = Buffer.concat(parts, length);
         const send = { length };
         this._sending.add(send);
         this._sendingBytes += length;

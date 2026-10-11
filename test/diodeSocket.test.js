@@ -89,6 +89,30 @@ test('a synchronous RPC failure is reported through stream error', async (t) => 
   assert.match(error.message, /not writable/);
 });
 
+test('small buffered writes coalesce without delaying the first byte or corrupting reused buffers', async (t) => {
+  const { socket, sends } = fixture(t);
+  const expected = [];
+  for (let i = 0; i < 256; i++) {
+    const chunk = Buffer.alloc(128, i);
+    expected.push(Buffer.from(chunk));
+    socket.write(chunk, () => chunk.fill(0));
+    if (i === 0) assert.equal(sends.length, 1, 'first write is sent synchronously');
+  }
+  const finished = once(socket, 'finish');
+  socket.end();
+  let acknowledged = 0;
+  while (!socket.writableFinished) {
+    const batch = sends.slice(acknowledged);
+    acknowledged = sends.length;
+    for (const send of batch) send.resolve();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(socket._sendingBytes <= 256 * 1024);
+  }
+  await finished;
+  assert.ok(sends.length < 24, `burst used ${sends.length} frames`);
+  assert.deepEqual(Buffer.concat(sends.map(send => send.frame)), Buffer.concat(expected));
+});
+
 test('slow inbound readers retain ordered bytes within the existing queue bound', async (t) => {
   const { socket } = fixture(t);
   const chunks = Array.from({ length: 40 }, (_, index) => Buffer.alloc(16384, index));

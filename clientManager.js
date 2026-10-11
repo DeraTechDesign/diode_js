@@ -2101,12 +2101,16 @@ class DiodeClientManager extends EventEmitter {
     const deviceIdBuffer = normalizeAddress(deviceId);
     if (!deviceIdBuffer) throw new Error('Invalid device ID');
     const key = deviceIdBuffer.toString('hex');
+    const generation = this._lifecycleGeneration;
     const existing = this.pendingDeviceResolutions.get(key);
     if (existing) return existing;
 
     // Applications often open several TCP sockets together. Share the device
     // ticket/node lookup and relay handshake while keeping their tunnels distinct.
-    const resolution = this._getConnectionForDevice(deviceIdBuffer).finally(() => {
+    const resolution = this._getConnectionForDevice(deviceIdBuffer).then(connection => {
+      if (this._closed || generation !== this._lifecycleGeneration) throw new Error('Diode client manager closed during device resolution');
+      return connection;
+    }).finally(() => {
       if (this.pendingDeviceResolutions.get(key) === resolution) {
         this.pendingDeviceResolutions.delete(key);
       }
@@ -2149,7 +2153,8 @@ class DiodeClientManager extends EventEmitter {
     if (cached) {
       const cachedConn = this.serverIdToConnection.get(cached.serverIdHex)
         || this.connectionByHost.get(cached.hostKey);
-      if (cachedConn && isConnected(cachedConn)) {
+      const score = this.relayScores.get(cachedConn?._managerHostKey || cached.hostKey);
+      if (cachedConn && isConnected(cachedConn) && !(score?.cooldownUntil > Date.now())) {
         trace.cacheHit = true;
         trace.finalServerIdHex = cached.serverIdHex;
         trace.finalHostKey = cached.hostKey;

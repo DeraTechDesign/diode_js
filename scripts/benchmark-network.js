@@ -172,7 +172,7 @@ async function udpBulk(socket, port) {
   } finally { socket.off('message', receive); }
 }
 
-async function transportSample(binder, publisher, protocol, transport, bytes) {
+async function transportSample(binder, publisher, protocol, transport, bytes, options = {}) {
   let publish, bind, client, backend;
   const sockets = new Set();
   const udp = protocol === 'udp';
@@ -215,7 +215,16 @@ async function transportSample(binder, publisher, protocol, transport, bytes) {
     const udpPort = udp ? address.localPort : null;
     const firstEchoMs = await exchange(client, Buffer.alloc(32, 0x71), udpPort);
     const rtt = [];
-    for (let i = 0; i < 5; i += 1) rtt.push(await exchange(client, Buffer.alloc(32, 0x72), udpPort));
+    const until = performance.now() + (options.durationMs || 0);
+    for (let i = 0; i < (options.rttSamples || 5) || performance.now() < until; i += 1) {
+      rtt.push(await exchange(client, Buffer.alloc(32, 0x72), udpPort));
+      if (options.pingIntervalMs) await delay(options.pingIntervalMs);
+    }
+    let afterIdleMs = null;
+    if (options.idleMs) {
+      await delay(options.idleMs);
+      afterIdleMs = await exchange(client, Buffer.alloc(32, 0x73), udpPort);
+    }
     let bulk;
     if (udp) bulk = await udpBulk(client, udpPort);
     else {
@@ -225,7 +234,7 @@ async function transportSample(binder, publisher, protocol, transport, bytes) {
       bulk = { bytes, ms, echoMbps: round(bytes * 8 / ms / 1000) };
     }
     const cpu = process.cpuUsage(cpuStart);
-    return { openedRelay, firstEchoMs, rtt, medianRttMs: median(rtt), bulk, cpuMs: round((cpu.user + cpu.system) / 1000), eventLoopP99Ms: round(loop.percentile(99) / 1e6) };
+    return { openedRelay, firstEchoMs, afterIdleMs, rtt, medianRttMs: median(rtt), bulk, cpuMs: round((cpu.user + cpu.system) / 1000), eventLoopP99Ms: round(loop.percentile(99) / 1e6) };
   } finally {
     loop.disable();
     if (client) { if (udp) { try { client.close(); } catch (_) {} } else client.destroy(); }
@@ -323,3 +332,5 @@ async function main() {
 }
 
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+
+module.exports = { selection, transports, routing, transportSample, exchange };

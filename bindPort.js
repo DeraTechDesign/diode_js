@@ -8,6 +8,7 @@ const { updateRelayBackpressure, releaseRelayBackpressure } = require('./relayBa
 const EventEmitter = require('events');
 const DiodeRPC = require('./rpc');
 const nativeCrypto = require('./nativeCrypto');
+const { LatestUdpSender, normalizeUdpSendPolicy } = require('./udpLatestSender');
 const { bridgeNativeTcp } = require('./nativeTcpBridge');
 const logger = require('./logger');
 
@@ -388,6 +389,7 @@ class BindPort extends EventEmitter {
   }
 
   _closeServerContexts(server, options) {
+    server?._diodeUdpSender?.close();
     if (!server || !server._diodeContexts) return;
     for (const context of Array.from(server._diodeContexts)) {
       this._closeContext(context, options);
@@ -486,6 +488,7 @@ class BindPort extends EventEmitter {
     let lastError = null;
 
     const open = async connection => {
+      if (this._disposed || options.cancelled?.()) throw new Error('Bind closed during relay selection');
       const rpc = this._getRpcFor(connection);
       const relayKey = this._connectionKey(connection) || 'unknown relay';
       const ref = await this._withTimeout(
@@ -624,6 +627,8 @@ class BindPort extends EventEmitter {
       socket: diodeSocket,
       ...tlsOptions
     });
+    // Node 18 does not consistently forward custom transport failures to TLS.
+    diodeSocket.on('error', error => tlsSocket.destroy(error));
     tlsSocket.setNoDelay(true);
 
     const socketWrapper = {
@@ -1062,7 +1067,8 @@ class BindPort extends EventEmitter {
           deviceId,
           deviceIdHex,
           formattedTargetPort,
-          'rw'
+          'rw',
+          { cancelled: () => server._diodeClosed }
         );
         const { ref, connection, rpc } = opened;
         if (server._diodeClosed) {
@@ -1124,6 +1130,7 @@ class BindPort extends EventEmitter {
     }
     
     const { targetPort, deviceIdHex, protocol = 'tls', listenHost } = config;
+    const udpSendPolicy = normalizeUdpSendPolicy(config.udpSendPolicy, protocol);
     if (listenHost !== undefined && (typeof listenHost !== 'string' || !net.isIP(listenHost))) {
       throw new Error('listenHost must be an IPv4 or IPv6 address');
     }
@@ -1154,7 +1161,7 @@ class BindPort extends EventEmitter {
         });
       });
       
-      server.on('message', async (data, rinfo) => {
+      const sendDatagram = async (data, rinfo, takeLatest) => {
         const clientKey = `${rinfo.address}:${rinfo.port}`;
         if (useNative) {
           let relayInfo;
@@ -1169,6 +1176,7 @@ class BindPort extends EventEmitter {
               rinfo,
             });
           } catch (error) {
+            if (takeLatest) throw error;
             logger.error(() => `Error opening native UDP ${formattedTargetPort} on device: ${error}`);
             return;
           }
@@ -1199,18 +1207,27 @@ class BindPort extends EventEmitter {
 
           try {
             await relayInfo.handshakePromise;
-          } catch (_) {
+          } catch (error) {
+            if (takeLatest) throw error;
             return;
           }
 
-          if (!relayInfo.session) return;
+          if (!relayInfo.session || relayInfo.context.closed || server._diodeClosed) return;
+          if (takeLatest) {
+            const latest = takeLatest();
+            if (!latest) return;
+            data = latest.data;
+          }
 
           // Send encrypted data to the server relay port
           try {
             this._touchContext(relayInfo.context);
             const packet = nativeCrypto.createUdpPacket(relayInfo.session, data);
-            relayInfo.socket.send(packet, relayInfo.physicalPort, relayInfo.relayHost);
+            if (takeLatest) {
+              await new Promise((resolve, reject) => relayInfo.socket.send(packet, relayInfo.physicalPort, relayInfo.relayHost, error => error ? reject(error) : resolve()));
+            } else relayInfo.socket.send(packet, relayInfo.physicalPort, relayInfo.relayHost);
           } catch (error) {
+            if (takeLatest) { this._closeContext(relayInfo.context); throw error; }
             logger.error(() => `Error sending udp data to relay: ${error}`);
           }
           return;
@@ -1227,27 +1244,43 @@ class BindPort extends EventEmitter {
             rinfo,
           });
         } catch (error) {
+          if (takeLatest) throw error;
           logger.error(() => `Error opening UDP ${formattedTargetPort} on device: ${error}`);
           return;
         }
 
         if (!entry || entry.context.closed || server._diodeClosed) return;
+        let sendTimeoutMs = this.ioTimeoutMs;
+        if (takeLatest) {
+          const latest = takeLatest();
+          if (!latest) return;
+          data = latest.data;
+          sendTimeoutMs = Math.max(1, Math.min(sendTimeoutMs, Math.ceil(latest.remainingMs)));
+        }
         
         // Send data to the device
         try {
           this._touchContext(entry.context);
           const rpc = this._getRpcFor(entry.connection);
-          await rpc.portSend(entry.ref, data, { timeoutMs: this.ioTimeoutMs });
+          await rpc.portSend(entry.ref, data, { timeoutMs: sendTimeoutMs });
         } catch (error) {
-          logger.error(() => `Error sending udp data to device: ${error}`);
           this._closeContext(entry.context);
+          if (takeLatest) throw error;
+          logger.error(() => `Error sending udp data to device: ${error}`);
         }
-      });
+      };
+      if (udpSendPolicy) {
+        server._diodeUdpSender = new LatestUdpSender(udpSendPolicy,
+          (_key, peer, takeLatest) => sendDatagram(null, peer, takeLatest),
+          error => logger.error(() => `UDP latest sender failed: ${error}`));
+        server.on('message', (data, peer) => server._diodeUdpSender.offer(`${peer.address}:${peer.port}`, data, peer));
+      } else server.on('message', sendDatagram);
       
       server.on('error', (err) => this._handleServerError(err, localPort, server));
       
       server.on('close', () => {
         server._diodeClosed = true;
+        server._diodeUdpSender?.close();
         this._closeServerContexts(server);
         server.nativeRelays = null;
         server.clientRefs = null;
@@ -1439,6 +1472,7 @@ class BindPort extends EventEmitter {
             }, () => {
               logger.info(() => `tls connection established to device ${deviceIdHex}`);
             });
+            diodeSocket.on('error', error => tlsSocket.destroy(error));
             tlsSocket.setNoDelay(true);
             
             // Pipe data between the client socket and the tls socket
@@ -1551,6 +1585,10 @@ class BindPort extends EventEmitter {
     }
     
     return true;
+  }
+
+  getUdpSendStats(localPort) {
+    return this.servers.get(Number(localPort))?._diodeUdpSender?.snapshot() || null;
   }
 
   bind() {

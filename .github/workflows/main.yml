@@ -11,13 +11,34 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
       - run: npm ci --no-audit --no-fund
       - run: npm test
+      - name: Verify pure JavaScript transport compatibility
+        run: node --no-addons --test
+      - name: Verify interoperability with deployed diodejs 0.5.10
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/release-compat/node_modules/diodejs
+          npm pack diodejs@0.5.10 --ignore-scripts --pack-destination out/release-compat
+          tar -xzf out/release-compat/diodejs-0.5.10.tgz --strip-components=1 -C out/release-compat/node_modules/diodejs
+          node --no-addons scripts/benchmark-compatibility.js --baseline out/release-compat/node_modules/diodejs --output out/compatibility.json
+      - name: Save compatibility measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-node-${{ matrix.node }}
+          path: out/compatibility.json
+          if-no-files-found: warn
 
   publish-npm:
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'

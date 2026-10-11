@@ -253,6 +253,9 @@ function consumeTcpFrames(session, data) {
   const decode = (frame) => {
     const counter = frame.readBigUInt64BE(4);
     if (counter < session.rxCounter) return;
+    // TCP is an ordered byte stream. A later authenticated frame cannot
+    // replace missing plaintext; fail the session instead of truncating it.
+    if (counter > session.rxCounter) throw new Error('Native TCP frame counter gap');
     const nonce = buildNonce(session.rxSalt, counter);
     const aad = frame.subarray(0, 12);
     const ciphertext = frame.subarray(12, frame.length - 16);

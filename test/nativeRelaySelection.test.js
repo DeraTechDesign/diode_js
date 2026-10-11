@@ -6,6 +6,25 @@ const { EventEmitter } = require('node:events');
 const BindPort = require('../bindPort');
 const net = require('node:net');
 
+test('disposing a bind during device lookup prevents a late application allocation', async () => {
+  for (const native of [false, true]) {
+    let resolve;
+    let opens = 0;
+    const relay = { _managerHostKey: 'ready', socket: { destroyed: false }, RPC: {
+      portOpen: async () => { opens++; return Buffer.from([1]); },
+      portOpen2: async () => { opens++; return 41001; },
+    } };
+    const manager = Object.assign(new EventEmitter(), { getConnectionForDevice: () => new Promise(done => { resolve = done; }),
+      getNearestConnection: () => relay, getConnections: () => [] });
+    const bind = new BindPort(manager, {});
+    const pending = bind._openPortWithRelayFallback(Buffer.alloc(20), '00'.repeat(20), 'tcp:42', 'rw', native);
+    while (!resolve) await new Promise(done => setImmediate(done));
+    bind.dispose(); resolve(relay);
+    await assert.rejects(pending, /Bind closed/);
+    assert.equal(opens, 0);
+  }
+});
+
 test('unreachable allocated TCP port retries another relay and releases the failed lease', async () => {
   const original = net.connect;
   const sockets = [], closedPorts = [], allocations = [];

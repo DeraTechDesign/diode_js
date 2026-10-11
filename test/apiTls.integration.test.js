@@ -140,7 +140,7 @@ function makeRelay(ackRttMs = 0, protocol = 'tls') {
   };
 }
 
-async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = false, failSend = false, slowReader = false, protocol = 'tls', clientEnds = false, slowBackend = false, readDelayMs = 10, flowObserver = null, flowSnapshotMs = 0 } = {}) {
+async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = false, failSend = false, slowReader = false, protocol = 'tls', clientEnds = false, slowBackend = false, readDelayMs = 10, flowObserver = null, flowSnapshotMs = 0, siblingPublishers = false, bindClass = BindPort, publishClass = PublishPort } = {}) {
   // TPKT/X.224-like prefix is a binary client-first request, not an HTTP probe.
   const request = Buffer.alloc(bytes);
   for (let index = 0; index < request.length; index += 1) request[index] = index % 251;
@@ -151,6 +151,7 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
   let backendBytes = 0;
   let relay;
   let publish;
+  const siblings = [];
   let bind;
   let client;
   let resumeTimer;
@@ -186,10 +187,22 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
     backend.listen(0, '127.0.0.1');
     await once(backend, 'listening');
     relay = makeRelay(ackRttMs, protocol);
-    publish = new PublishPort(relay.publisher, { [backend.address().port]: { host: '127.0.0.1' } });
+    if (siblingPublishers) {
+      siblings.push(new PublishPort(relay.publisher, { 1: { host: '127.0.0.1' } }));
+      const open = relay.binder.RPC.portOpen;
+      relay.binder.RPC.portOpen = async (...args) => {
+        const ref = await open(...args);
+        // Closing a different publisher after this backend opens must not
+        // close its stream or remove the shared unsolicited listener.
+        siblings[0].close();
+        return ref;
+      };
+    }
+    publish = new publishClass(relay.publisher, { [backend.address().port]: { host: '127.0.0.1' } });
+    if (siblingPublishers) siblings.push(new PublishPort(relay.publisher, { 2: { host: '127.0.0.1' } }));
     if (flowObserver) publish.setFlowObserver(flowObserver);
     if (flowSnapshotMs) flowTimer = setInterval(() => publish.snapshotFlows(), flowSnapshotMs);
-    bind = new BindPort(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: deviceId.toString('hex'), protocol, transport: 'api' } });
+    bind = new bindClass(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: deviceId.toString('hex'), protocol, transport: 'api' } });
     const listening = once(bind, 'listening');
     bind.bindSinglePort(0);
     const [address] = await listening;
@@ -197,6 +210,7 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
     client.setNoDelay(true);
     const chunks = [];
     let receivedBytes = 0;
+    let firstByteMs = null;
     let backendFinishedAt = null;
     const startedAt = performance.now();
     const result = await new Promise((resolve, reject) => {
@@ -204,10 +218,11 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
       const finish = (error) => {
         clearTimeout(timer);
         if (error) reject(error);
-        else resolve({ elapsedMs: performance.now() - startedAt, receivedBytes });
+        else resolve({ elapsedMs: performance.now() - startedAt, firstByteMs, receivedBytes });
       };
       finishBackendRead = finish;
       client.on('data', (chunk) => {
+        if (firstByteMs === null) firstByteMs = performance.now() - startedAt;
         chunks.push(Buffer.from(chunk));
         receivedBytes += chunk.length;
         if (slowReader) {
@@ -258,6 +273,7 @@ async function runTunnel({ bytes = 1024 * 1024, ackRttMs = 0, backendEnds = fals
     if (client) client.destroy();
     if (bind) bind.dispose();
     if (publish) publish.close();
+    for (const sibling of siblings) sibling.close();
     for (const socket of backendSockets) socket.destroy();
     await new Promise((resolve) => backend.close(resolve));
     if (relay) relay.close();
@@ -268,6 +284,9 @@ if (require.main === module) {
   const test = require('node:test');
   for (const protocol of ['tls', 'tcp']) {
     const label = `real API/${protocol.toUpperCase()}`;
+    test(`${label} survives unrelated publishers and closing a sibling on the same relay`, { timeout: 20000 }, async () => {
+      await runTunnel({ protocol, ackRttMs: 10, siblingPublishers: true });
+    });
     test(`${label} flow observations count plaintext bytes and preserve the final totals`, { timeout: 20000 }, async () => {
       const events = [];
       const bytes = 1024 * 1024;
@@ -306,7 +325,9 @@ if (require.main === module) {
     for (const direction of ['download', 'upload']) {
       test(`${label} preserves 8 MiB with sustained slow ${direction} consumption`, { timeout: 20000 }, async () => {
         const result = await runTunnel({
-          bytes: 8 * 1024 * 1024, ackRttMs: 10, protocol, readDelayMs: 20,
+          // Keep consumption below the encrypted producer even on slower CI
+          // hosts; a 20 ms delay can let Linux drain without any pressure.
+          bytes: 8 * 1024 * 1024, ackRttMs: 10, protocol, readDelayMs: 80,
           backendEnds: direction === 'download', slowReader: direction === 'download',
           clientEnds: direction === 'upload', slowBackend: direction === 'upload',
         });
@@ -317,4 +338,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { runTunnel };
+module.exports = { runTunnel, makeRelay };

@@ -6,6 +6,7 @@ process.env.DEBUG = 'false';
 const assert = require('node:assert/strict');
 const net = require('node:net');
 const { EventEmitter, once } = require('node:events');
+const { performance } = require('node:perf_hooks');
 const test = require('node:test');
 const { KEYUTIL } = require('jsrsasign');
 const { privateToAddress } = require('ethereumjs-util');
@@ -178,13 +179,15 @@ function binaryPayload(bytes, prefix) {
   return value;
 }
 
-async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false, rejectHandshakeShutdown = false, flowObserver = null } = {}) {
+async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serverFirst = false, slowBackend = false, slowClient = false, rejectHandshakeShutdown = false, flowObserver = null, siblingPublishers = false, bindClass = BindPort, publishClass = PublishPort } = {}) {
   const request = binaryPayload(requestBytes, '030000130ee0000000000100080003000000');
   const response = Buffer.concat([binaryPayload(responseBytes, '1201003400000100'), Buffer.from('\x00FINAL-RESPONSE-TAIL\xff', 'latin1')]);
   const banner = serverFirst ? Buffer.from('SSH-2.0-loopback-native-test\r\n') : Buffer.alloc(0);
   const expectedResponse = Buffer.concat([banner, response]);
   const backendSockets = new Set();
   const timers = new Set();
+  const siblings = [];
+  let startedAt, firstByteMs = null;
   const backendChunks = [];
   const clientChunks = [];
   let backendBytes = 0;
@@ -225,12 +228,15 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
     backend.listen(0, '127.0.0.1');
     await once(backend, 'listening');
     relay = await makeRelay(backend.address().port, { rejectHandshakeShutdown });
-    publish = new PublishPort(relay.publisher, { [backend.address().port]: { host: '127.0.0.1', mode: 'private', whitelist: [binderIdentity.address] } });
+    if (siblingPublishers) siblings.push(new PublishPort(relay.publisher, { 1: { host: '127.0.0.1' } }));
+    publish = new publishClass(relay.publisher, { [backend.address().port]: { host: '127.0.0.1', mode: 'private', whitelist: [binderIdentity.address] } });
+    if (siblingPublishers) siblings.push(new PublishPort(relay.publisher, { 2: { host: '127.0.0.1' } }));
     if (flowObserver) publish.setFlowObserver(flowObserver);
-    bind = new BindPort(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: publisherIdentity.address.slice(2), protocol: 'tcp', transport: 'native' } });
+    bind = new bindClass(relay.binder, { 0: { targetPort: backend.address().port, deviceIdHex: publisherIdentity.address.slice(2), protocol: 'tcp', transport: 'native' } });
     const listening = once(bind, 'listening');
     bind.bindSinglePort(0);
     const [address] = await listening;
+    startedAt = performance.now();
     client = net.connect({ host: '127.0.0.1', port: address.localPort, allowHalfOpen: true });
     client.setNoDelay(true);
     await new Promise((resolve, reject) => {
@@ -250,6 +256,7 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
       };
       client.on('connect', () => { if (!serverFirst) sendRequest(); });
       client.on('data', (chunk) => {
+        if (firstByteMs === null) firstByteMs = performance.now() - startedAt;
         clientChunks.push(Buffer.from(chunk));
         clientBytes += chunk.length;
         if (serverFirst && clientBytes >= banner.length) sendRequest();
@@ -278,19 +285,24 @@ async function runNativeTunnel({ requestBytes = 4096, responseBytes = 4096, serv
     assert.equal(relay.publisher._diodeActiveNativeSessions, 0);
     assert.equal(relay.binder.clientSockets.size, 0, 'binder handshake API ref is released');
     assert.equal(relay.publisher.connections.size, 0, 'publisher handshake API ref is released');
-    return relay.stats;
+    return { ...relay.stats, elapsedMs: performance.now() - startedAt, firstByteMs, requestBytes: request.length, responseBytes: expectedResponse.length, integrity: true };
   } finally {
     finish = () => {};
     for (const timer of timers) clearTimeout(timer);
     if (client) client.destroy();
     if (bind) bind.dispose();
     if (publish) publish.close();
+    for (const sibling of siblings) sibling.close();
     for (const socket of backendSockets) socket.destroy();
     await new Promise((resolve) => backend.close(resolve));
     if (relay) await relay.close();
   }
 }
 
+if (require.main === module) {
+test('native TCP routes only to its owning publisher on a shared relay', { timeout: 20000 }, async () => {
+  await runNativeTunnel({ siblingPublishers: true });
+});
 test('real native TCP carries client-first binary data and a delayed response after client half-close', { timeout: 20000 }, async () => {
   await runNativeTunnel();
 });
@@ -326,3 +338,6 @@ test('real native TCP drains an 8 MiB upload to a slow backend before EOF and it
 test('real native TCP drains an 8 MiB final response to a slow client after request EOF', { timeout: 20000 }, async () => {
   await runNativeTunnel({ responseBytes: 8 * 1024 * 1024, slowClient: true });
 });
+}
+
+module.exports = { runNativeTunnel };
