@@ -424,7 +424,10 @@ class DiodeRPC {
       }
 
       sendError(sessionId, ref, error) {
-        return this.connection.sendCommandWithSessionId(['response', ref, 'error', error], sessionId).catch((error) => {
+        // Edge protocol rejection is [error, ref, reason]. The success envelope
+        // cannot carry an error: relays otherwise leave the port in pre_open,
+        // consuming pending slots for unrelated apps and configuration reads.
+        return this.connection.sendCommandWithSessionId(['error', ref, error], sessionId).catch((error) => {
           logger.error(() => `Error during send error: ${error}`);
           throw error;
         });
