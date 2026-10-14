@@ -1,108 +1,117 @@
 const WebSocket = require('ws');
+const dns = require('node:dns');
+const net = require('node:net');
 
 const MAX_NODE_TIMER_MS = 0x7fffffff;
+const DEFAULT_TIMEOUT_MS = 10000;
+const ADDRESS_STAGGER_MS = 250;
 
 function normalizeTimerMs(value, fallback) {
   const parsed = Number(value);
-  const parsedFallback = Number(fallback);
-  const safeFallback = Number.isFinite(parsedFallback) && parsedFallback > 0
-    ? Math.max(1, Math.min(Math.floor(parsedFallback), MAX_NODE_TIMER_MS))
-    : 1;
-  if (!Number.isFinite(parsed) || parsed <= 0) return safeFallback;
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return Math.max(1, Math.min(Math.floor(parsed), MAX_NODE_TIMER_MS));
 }
 
 function fetchNetworkDirectory(options = {}) {
   const endpoint = typeof options.endpoint === 'string' && options.endpoint.trim()
-    ? options.endpoint
-    : 'wss://prenet.diode.io:8443/ws';
+    ? options.endpoint : 'wss://prenet.diode.io:8443/ws';
   const method = typeof options.method === 'string' && options.method.trim()
-    ? options.method
-    : 'dio_network';
-  const timeoutMs = normalizeTimerMs(options.timeoutMs, 1500);
+    ? options.method : 'dio_network';
+  const timeoutMs = normalizeTimerMs(options.timeoutMs, DEFAULT_TIMEOUT_MS);
 
   return new Promise((resolve, reject) => {
-    let settled = false;
-    let socket = null;
-    let timer = null;
-
-    const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      if (socket) {
-        const closingSocket = socket;
-        closingSocket.removeAllListeners();
-        // Closing a ws while it is still CONNECTING emits an asynchronous
-        // `error`. Keep a consumer installed through shutdown so a discovery
-        // timeout cannot become an uncaught process-level exception.
-        closingSocket.on('error', () => {});
-        closingSocket.once('close', () => closingSocket.removeAllListeners());
-        try {
-          closingSocket.close();
-        } catch (_) {}
-        socket = null;
-      }
+    const hostname = new URL(endpoint).hostname.replace(/^\[|\]$/g, '');
+    const deadline = Date.now() + timeoutMs;
+    const sockets = new Set();
+    let addresses = [], next = 0, settled = false, stagger = null, lastError;
+    const closeSocket = socket => {
+      sockets.delete(socket);
+      socket.removeAllListeners();
+      // Aborting a CONNECTING ws emits a later error; keep it consumed.
+      socket.on('error', () => {});
+      socket.once('close', () => socket.removeAllListeners());
+      // A stalled peer need not acknowledge a close handshake. Release the
+      // transport immediately when its result is no longer usable.
+      try { socket.terminate(); } catch (_) {}
     };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(stagger);
+      for (const socket of sockets) closeSocket(socket);
+      if (error) reject(error); else resolve(value);
+    };
+    const timer = setTimeout(() => finish(new Error(`Network discovery timed out after ${timeoutMs}ms`)), timeoutMs);
 
-    const finish = (fn, value) => {
-      if (settled) {
+    const startNext = () => {
+      clearTimeout(stagger);
+      stagger = null;
+      if (settled) return;
+      if (next >= addresses.length) {
+        if (!sockets.size) finish(lastError || new Error('No network directory addresses available'));
         return;
       }
-      settled = true;
-      cleanup();
-      fn(value);
-    };
-
-    socket = new WebSocket(endpoint, {
-      // Avoid the Node 20.11 multi-address cancellation assertion when the
-      // directory deadline closes a socket that is still connecting.
-      autoSelectFamily: false,
-      handshakeTimeout: timeoutMs,
-      origin: 'https://diode.io',
-    });
-
-    socket.on('open', () => {
-      socket.send(JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method,
-        params: [],
-      }));
-    });
-
-    socket.on('message', (raw) => {
+      const address = addresses[next++];
+      let socket;
+      const failed = error => {
+        if (settled || (socket && !sockets.has(socket))) return;
+        lastError = error;
+        if (socket) closeSocket(socket);
+        startNext();
+      };
       try {
-        const parsed = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
-        if (parsed && parsed.id === 1) {
-          if (parsed.error) {
-            finish(reject, new Error(parsed.error.message || 'Network discovery request failed'));
-            return;
-          }
-          finish(resolve, Array.isArray(parsed.result) ? parsed.result : []);
-        }
-      } catch (error) {
-        finish(reject, error);
-      }
-    });
-
-    socket.on('error', (error) => {
-      finish(reject, error);
-    });
-
-    socket.on('close', () => {
-      if (!settled) {
-        finish(reject, new Error('Network discovery socket closed before a response was received'));
-      }
-    });
-
-    timer = setTimeout(() => {
-      finish(reject, new Error(`Network discovery timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+        socket = new WebSocket(endpoint, {
+          // Race complete directory responses ourselves, retaining the URL's
+          // hostname for TLS verification/SNI. A fast TCP accept on a distant
+          // or stalled server must not cancel a better directory response.
+          // Keeping each socket single-address also avoids Node 20.11's
+          // multi-address cancellation assertion on deadline/loser cleanup.
+          autoSelectFamily: false,
+          lookup: (_host, lookupOptions, callback) => lookupOptions?.all
+            ? callback(null, [address]) : callback(null, address.address, address.family),
+          handshakeTimeout: Math.max(1, deadline - Date.now()),
+          origin: 'https://diode.io',
+        });
+      } catch (error) { failed(error); return; }
+      sockets.add(socket);
+      socket.on('open', () => {
+        if (settled) return;
+        try { socket.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: [] })); }
+        catch (error) { failed(error); }
+      });
+      socket.on('message', raw => {
+        if (settled) return;
+        try {
+          const payload = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf8'));
+          if (!payload || payload.id !== 1) return;
+          if (payload.error) throw new Error(payload.error.message || 'Network discovery request failed');
+          if (!Array.isArray(payload.result)) throw new Error('Network discovery returned a non-array result');
+          finish(null, payload.result);
+        } catch (error) { failed(error); }
+      });
+      socket.on('error', failed);
+      socket.on('close', () => failed(new Error('Network discovery socket closed before a response was received')));
+      if (next < addresses.length) stagger = setTimeout(startNext, ADDRESS_STAGGER_MS);
+    };
+    const resolved = (error, results) => {
+      if (settled) return;
+      if (error) { finish(error); return; }
+      const seen = new Set();
+      addresses = (Array.isArray(results) ? results : []).filter(entry => {
+        if (!entry || !net.isIP(entry.address) || seen.has(entry.address)) return false;
+        seen.add(entry.address);
+        return true;
+      }).slice(0, 8);
+      startNext();
+    };
+    const family = net.isIP(hostname);
+    if (family) resolved(null, [{ address: hostname, family }]);
+    else {
+      try { (options.lookup || dns.lookup)(hostname, { all: true }, resolved); }
+      catch (error) { finish(error); }
+    }
   });
 }
 
-module.exports = {
-  fetchNetworkDirectory,
-};
+module.exports = { fetchNetworkDirectory };

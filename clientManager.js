@@ -283,7 +283,7 @@ class DiodeClientManager extends EventEmitter {
       method: typeof networkDiscovery.method === 'string' && networkDiscovery.method.trim()
         ? networkDiscovery.method.trim()
         : DEFAULT_NETWORK_DISCOVERY_METHOD,
-      timeoutMs: parsePositiveInteger(networkDiscovery.timeoutMs, 1500),
+      timeoutMs: parsePositiveInteger(networkDiscovery.timeoutMs, 10000),
       startupProbeCount: parsePositiveInteger(networkDiscovery.startupProbeCount, 2, { allowZero: true }),
       backgroundBatchSize: parsePositiveInteger(networkDiscovery.backgroundBatchSize, 12, { allowZero: true }),
       includePrivateAddresses: parseBoolean(networkDiscovery.includePrivateAddresses, false),
@@ -2081,6 +2081,10 @@ class DiodeClientManager extends EventEmitter {
       ...backgroundNetworkCandidates,
       ...remainingCandidates.filter((candidate) => candidate.source !== 'network'),
     ];
+    const laterNetworkCandidates = this.relaySelection.networkDiscovery.backgroundBatchSize > 0
+      ? remainingCandidates.filter((candidate) => candidate.source === 'network'
+        && !backgroundNetworkCandidates.includes(candidate))
+      : [];
 
     const additionalRequiredResults = remainingRequiredCoverageCandidates.length > 0
       ? await runWithConcurrency(
@@ -2112,16 +2116,25 @@ class DiodeClientManager extends EventEmitter {
 
     if (backgroundCandidates.length > 0 && this.relaySelection.continueProbingUntestedSeeds) {
       const generation = this._lifecycleGeneration;
-      const warmupPromise = runWithConcurrency(
-        backgroundCandidates,
-        this.relaySelection.startupConcurrency,
-        (candidate) => {
-          if (this._closed || generation !== this._lifecycleGeneration) {
-            throw new Error('Diode client manager closed during background warmup');
-          }
-          return this._probeHost(candidate.hostKey, candidate.source);
+      const warmupPromise = (async () => {
+        // Finish the current directory snapshot in bounded batches. Stopping
+        // after the first batch permanently excluded later relays until restart.
+        // This work is independent of first-connection readiness; ordinary idle
+        // pruning retains the warm budget and protects active tunnels.
+        let batch = backgroundCandidates;
+        let offset = 0;
+        while (batch.length && !this._closed && generation === this._lifecycleGeneration) {
+          await runWithConcurrency(batch, this.relaySelection.startupConcurrency, (candidate) => {
+            if (this._closed || generation !== this._lifecycleGeneration) {
+              throw new Error('Diode client manager closed during background warmup');
+            }
+            return this._probeHost(candidate.hostKey, candidate.source);
+          });
+          const size = this.relaySelection.networkDiscovery.backgroundBatchSize;
+          batch = laterNetworkCandidates.slice(offset, offset + size);
+          offset += size;
         }
-      ).catch((error) => {
+      })().catch((error) => {
         logger.debug(() => `Background relay measurement failed: ${error}`);
       }).finally(() => {
         if (this._backgroundWarmupPromise === warmupPromise) {

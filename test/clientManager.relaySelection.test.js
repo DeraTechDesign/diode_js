@@ -611,6 +611,22 @@ test('connect becomes ready while another relay is still establishing its handsh
   }
 });
 
+test('first relay readiness does not wait for a pending directory response', { timeout: 2000 }, async t => {
+  const temp = makeTempDir();
+  const manager = new TestClientManager({ keyLocation: path.join(temp, 'key.json'),
+    relaySelection: { scoreCachePath: null } });
+  let release;
+  const directory = new Promise(resolve => { release = resolve; });
+  manager._fetchNetworkDiscoveryNodes = () => directory;
+  t.after(() => { release([]); manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  assert.equal(await manager.connect(), manager);
+  assert.equal(manager._lastNetworkDiscoveryStats, null);
+  assert.ok(manager.getNearestConnection());
+  release([]);
+  await manager._startupWorkPromise;
+  await manager._backgroundWarmupPromise;
+});
+
 test('startup rejects when every relay handshake fails', async () => {
   const manager = new TestClientManager({
     keyLocation: path.join(makeTempDir(), 'keys.json'),
@@ -1295,6 +1311,63 @@ test('live network discovery reduces startup seed coverage to one seed per regio
     '144.126.157.138:41046',
   ]));
   manager.close();
+});
+
+test('background discovery eventually measures a faster relay beyond the first batch without delaying readiness', async t => {
+  const temp = makeTempDir();
+  const nodes = Array.from({ length: 7 }, (_, index) => ({
+    ...networkSnapshot[0],
+    node: ['server', `203.0.113.${index + 1}`, '0xa056', '0xa055', 'test', []],
+    node_id: `0x${String(index + 1).padStart(40, '0')}`,
+  }));
+  const behaviors = new Map(nodes.map((node, index) => [
+    `${node.node[1]}:41046`, { pingDelayMs: index === 6 ? 1 : 40 },
+  ]));
+  for (const host of ['as1', 'as2', 'us1', 'us2', 'eu1', 'eu2']) {
+    behaviors.set(`${host}.prenet.diode.io:41046`, { pingDelayMs: 30 });
+  }
+  const manager = new TestClientManager({ keyLocation: path.join(temp, 'key.json'), relaySelection: {
+    scoreCachePath: null, startupConcurrency: 2, warmConnectionBudget: 3,
+    networkDiscovery: { startupProbeCount: 1, backgroundBatchSize: 2 },
+  } }, behaviors, nodes);
+  t.after(() => { manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  let active = 0, maxActive = 0;
+  const probe = manager._probeHost.bind(manager);
+  manager._probeHost = async (...args) => {
+    active++; maxActive = Math.max(maxActive, active);
+    try { return await probe(...args); } finally { active--; }
+  };
+  await manager.connect();
+  assert.equal(manager.ensureCalls.includes('203.0.113.7:41046'), false);
+  await manager._startupWorkPromise;
+  await manager._backgroundWarmupPromise;
+  assert.equal(manager.ensureCalls.includes('203.0.113.7:41046'), true);
+  assert.equal(manager.getNearestConnection()._managerHostKey, '203.0.113.7:41046');
+  assert.ok(manager.getConnections().length <= 3);
+  assert.ok(maxActive <= 2);
+});
+
+test('closing during a directory batch prevents later batches from starting', async t => {
+  const temp = makeTempDir();
+  const nodes = Array.from({ length: 7 }, (_, index) => ({ ...networkSnapshot[0],
+    node: ['server', `203.0.113.${index + 1}`, '0xa056', '0xa055', 'test', []],
+    node_id: `0x${String(index + 1).padStart(40, '0')}`,
+  }));
+  const manager = new TestClientManager({ keyLocation: path.join(temp, 'key.json'), relaySelection: {
+    scoreCachePath: null, startupConcurrency: 1,
+    networkDiscovery: { startupProbeCount: 0, backgroundBatchSize: 1 },
+  } }, new Map(), nodes);
+  t.after(() => { manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+  const probe = manager._probeHost.bind(manager);
+  manager._probeHost = async (host, source) => {
+    if (source === 'network') { manager.close(); throw new Error('Closed during probe'); }
+    return probe(host, source);
+  };
+  await manager.connect();
+  await manager._startupWorkPromise;
+  await manager._backgroundWarmupPromise;
+  assert.equal(manager.ensureCalls.some(host => host.startsWith('203.0.113.')), false);
+  assert.equal(manager.getConnections().length, 0);
 });
 
 test('untested network candidates outrank cache-only candidates', () => {

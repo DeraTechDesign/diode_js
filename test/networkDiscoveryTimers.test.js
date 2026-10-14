@@ -34,7 +34,7 @@ function loadWithFakeWebSocket({ autoOpen = true, emitErrorOnClose = false } = {
       })));
     }
 
-    close() {
+    terminate() {
       this.closed = true;
       if (emitErrorOnClose) {
         queueMicrotask(() => {
@@ -72,6 +72,7 @@ test('network discovery clamps huge timeout and defaults invalid timer values', 
     for (const timeoutMs of [Number.MAX_SAFE_INTEGER, -1, Number.POSITIVE_INFINITY, Number.NaN, 0.5]) {
       assert.deepEqual(await fetchNetworkDirectory({
         endpoint: 'ws://fake-relay.test',
+        lookup: (_host, _options, callback) => callback(null, [{ address: '127.0.0.1', family: 4 }]),
         timeoutMs,
       }), []);
     }
@@ -80,11 +81,10 @@ test('network discovery clamps huge timeout and defaults invalid timer values', 
     global.clearTimeout = originalClearTimeout;
   }
 
-  assert.deepEqual(delays, [0x7fffffff, 1500, 1500, 1500, 1]);
-  assert.deepEqual(
-    FakeWebSocket.instances.map((socket) => socket.options.handshakeTimeout),
-    [0x7fffffff, 1500, 1500, 1500, 1]
-  );
+  assert.deepEqual(delays, [0x7fffffff, 10000, 10000, 10000, 1]);
+  FakeWebSocket.instances.forEach((socket, index) => {
+    assert.ok(socket.options.handshakeTimeout > 0 && socket.options.handshakeTimeout <= delays[index]);
+  });
   assert.equal(FakeWebSocket.instances.every((socket) => socket.closed), true);
 });
 
@@ -97,6 +97,7 @@ test('network discovery timeout safely closes a still-connecting WebSocket', asy
   await assert.rejects(
     fetchNetworkDirectory({
       endpoint: 'ws://hanging-relay.test',
+      lookup: (_host, _options, callback) => callback(null, [{ address: '127.0.0.1', family: 4 }]),
       timeoutMs: 5,
     }),
     /timed out after 5ms/
