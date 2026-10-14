@@ -301,7 +301,7 @@ const client = new DiodeClientManager({
 });
 ```
 
-Routing note: the initiating client can prefer a better local relay, but it cannot override the relay encoded in the remote device ticket. Best results come when both clients use the manager's relay ranking so each side reconnects toward a closer relay over time.
+Routing note: the ticket issuer can be a secondary relay. Device resolution follows the host's preferred relay from the ticket's `local_address` hint, then falls back to the advertised secondary and issuer if lookup or connection fails. Legacy `0x00`/`0x01` hints and `0x02` RLP metadata are supported; absent or malformed hints fall back to the issuer. Resolution considers at most two preferred IDs plus the issuer. `getObject()` preserves `serverIdHex` as the issuer and exposes the ordered hints as `preferredServerIds`. The existing bind deadlines and ready-relay fallback still apply.
 
 Discovery note: startup discovery sources are now `configured/seed`, `discoveryProvider`, built-in live `dio_network` discovery, cached non-provider/non-network relays, and target-on-demand relay resolution from `getNode(serverId)`. Provider and network membership are not cached independently; only RTT/history is persisted in `relay-scores.json`.
 

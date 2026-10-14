@@ -8,6 +8,7 @@ const {
   toBufferView,
 } = require('./utils');
 const logger = require('./logger');
+const { RLP } = require('@ethereumjs/rlp');
 
 const MAX_NODE_TIMER_MS = 0x7fffffff;
 const TICKET_CHAIN_PREFIX = 'glmr:';
@@ -51,6 +52,28 @@ function normalizeAddressParam(value) {
     return value;
 }
 
+function preferredTicketRelays(localAddress, serverIdHex) {
+    const fallback = serverIdHex ? [serverIdHex] : [];
+    if (!(Buffer.isBuffer(localAddress) || localAddress instanceof Uint8Array)) return fallback;
+    const hint = toBufferView(localAddress);
+    let preferred = [];
+    if (hint.length === 21 && (hint[0] === 0 || hint[0] === 1)) {
+      const other = `0x${hint.subarray(1).toString('hex')}`;
+      preferred = hint[0] === 0 ? [other, ...fallback] : [...fallback, other];
+    } else if (hint.length > 1 && hint[0] === 2) {
+      try {
+        const metadata = RLP.decode(hint.subarray(1));
+        if (Array.isArray(metadata)) for (const pair of metadata) {
+          if (!Array.isArray(pair) || pair.length !== 2 || decodeToken(pair[0]) !== 's' || !Array.isArray(pair[1])) continue;
+          const ids = pair[1].filter(id => (Buffer.isBuffer(id) || id instanceof Uint8Array) && id.length === 20)
+            .map(id => `0x${toBufferView(id).toString('hex')}`);
+          if (ids.length) preferred = ids;
+        }
+      } catch (_) { /* Malformed optional metadata must not hide the issuing relay. */ }
+    }
+    return [...new Set([...preferred, ...fallback])];
+}
+
 function parseDeviceTicketObject(obj) {
     if (!Array.isArray(obj) || obj.length < 2) {
       return null;
@@ -75,6 +98,7 @@ function parseDeviceTicketObject(obj) {
       objectType,
       serverId,
       serverIdHex,
+      preferredServerIds: preferredTicketRelays(obj[objectType === 'ticketv2' ? 7 : 6], serverIdHex),
     };
 
     if (objectType === 'ticketv2') {

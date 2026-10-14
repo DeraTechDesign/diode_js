@@ -47,6 +47,38 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+for (const failure of [null, 'connect', 'missing-node', 'lookup-error']) {
+  test(`destination honors advertised preference before an already connected ticket issuer (preferred failure: ${failure})`, async t => {
+    const temp = makeTempDir();
+    const issuerId = '0x' + '11'.repeat(20), preferredId = '0x' + '22'.repeat(20);
+    const control = new FakeConnection('control:41046', {
+      getObject: async () => ({ serverIdHex: issuerId, preferredServerIds: [preferredId, issuerId] }),
+      getNode: async id => {
+        if (failure === 'lookup-error') throw new Error('Lookup timed out');
+        if (failure === 'missing-node') return null;
+        return id.equals(Buffer.from(preferredId.slice(2), 'hex')) ? { host: 'preferred', edgePort: 41046 } : null;
+      },
+    });
+    const issuer = new FakeConnection('issuer:41046', { serverEthereumAddress: issuerId });
+    const preferred = new FakeConnection('preferred:41046', { serverEthereumAddress: preferredId });
+    const manager = new DiodeClientManager({ keyLocation: path.join(temp, 'key.json'), relaySelection: { scoreCachePath: null } });
+    t.after(() => { manager.close(); fs.rmSync(temp, { recursive: true, force: true }); });
+    manager._registerConnection(control, 'control:41046');
+    manager._registerConnection(issuer, 'issuer:41046');
+    manager.serverIdToConnection.set(issuerId, issuer);
+    manager.getNearestConnection = () => control;
+    const attempts = [];
+    manager._probeHost = async host => {
+      attempts.push(host);
+      if (failure === 'connect') throw new Error('Preferred relay unavailable');
+      return preferred;
+    };
+    assert.equal(await manager.getConnectionForDevice(Buffer.alloc(20, 3)), failure ? issuer : preferred);
+    assert.deepEqual(attempts, failure === 'missing-node' || failure === 'lookup-error' ? [] : ['preferred:41046']);
+    assert.equal(manager.deviceRelayCache.get(Buffer.alloc(20, 3).toString('hex')).serverIdHex, failure ? issuerId : preferredId);
+  });
+}
+
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'diode-relay-test-'));
 }

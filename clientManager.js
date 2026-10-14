@@ -1698,11 +1698,25 @@ class DiodeClientManager extends EventEmitter {
     const rpc = this._getRpcFor(connection);
     const commandOptions = { timeoutMs: this.relaySelection.deviceLookupTimeoutMs };
     const ticket = await rpc.getObject(deviceIdBuffer, commandOptions);
-    const serverIdHex = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
-    if (!serverIdHex) {
-      return null;
+    const issuer = normalizeServerIdHex(ticket && (ticket.serverIdHex || ticket.serverId));
+    const preferred = Array.isArray(ticket?.preferredServerIds)
+      ? ticket.preferredServerIds.map(normalizeServerIdHex).filter(id => /^0x[0-9a-f]{40}$/.test(id))
+      : [];
+    // The ticket's signer may be a secondary relay. Its routing hint carries
+    // the host's preference, including when that signer is already connected.
+    // Bound lookups to the primary/secondary hints plus the issuing relay.
+    const serverIds = [...new Set([...preferred.slice(0, 2), issuer].filter(Boolean))];
+    for (let index = 0; index < serverIds.length; index++) {
+      const candidate = await this._resolveServerRelayCandidate(connection, serverIds[index]);
+      if (candidate) {
+        candidate.alternateServerIds = serverIds.slice(index + 1);
+        return candidate;
+      }
     }
+    return null;
+  }
 
+  async _resolveServerRelayCandidate(connection, serverIdHex) {
     const existing = this.serverIdToConnection.get(serverIdHex);
     if (existing && isConnected(existing)) {
       return {
@@ -1714,7 +1728,15 @@ class DiodeClientManager extends EventEmitter {
     }
 
     const nodeId = Buffer.from(serverIdHex.slice(2), 'hex');
-    const nodeInfo = await rpc.getNode(nodeId, commandOptions);
+    let nodeInfo;
+    try {
+      nodeInfo = await this._getRpcFor(connection).getNode(nodeId, {
+        timeoutMs: this.relaySelection.deviceLookupTimeoutMs,
+      });
+    } catch (error) {
+      logger.debug(() => `Ticket relay lookup failed for ${serverIdHex}: ${error}`);
+      return null;
+    }
     if (!nodeInfo || !nodeInfo.host) {
       return null;
     }
@@ -1736,13 +1758,26 @@ class DiodeClientManager extends EventEmitter {
     if (!candidate || !candidate.hostKey) {
       return null;
     }
-    if (candidate.relayConnection && isConnected(candidate.relayConnection)) {
-      return candidate.relayConnection;
+    let lastError;
+    for (;;) {
+      if (candidate.relayConnection && isConnected(candidate.relayConnection)) return candidate.relayConnection;
+      try {
+        candidate.relayConnection = this.relaySelection.enabled
+          ? await this._probeHost(candidate.hostKey, 'target')
+          : await this._ensureConnection(candidate.hostKey);
+        return candidate.relayConnection;
+      } catch (error) {
+        lastError = error;
+      }
+      if (this._closed) throw lastError;
+      let next = null;
+      const alternatives = candidate.alternateServerIds || [];
+      while (alternatives.length && !next) {
+        next = await this._resolveServerRelayCandidate(candidate.controlConnection, alternatives.shift());
+      }
+      if (!next) throw lastError;
+      Object.assign(candidate, next, { alternateServerIds: alternatives });
     }
-    candidate.relayConnection = this.relaySelection.enabled
-      ? await this._probeHost(candidate.hostKey, 'target')
-      : await this._ensureConnection(candidate.hostKey);
-    return candidate.relayConnection;
   }
 
   _shouldReconcileDeviceRelay(controlHostKey, targetHostKey) {
