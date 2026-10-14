@@ -256,6 +256,12 @@ You can connect to multiple Diode relays and automatically route binds to the re
 
 When neither `host` nor `hosts` is specified, the manager starts from the default seed pool, any discovery-provider candidates, built-in `dio_network` candidates, and previously successful non-provider relays saved in `relay-scores.json`. Without live network discovery it probes all default seeds once. When live network discovery returns usable relays, coverage uses a region-diverse seed bootstrap subset plus the bounded discovery sample, then continues measuring the remaining seeds while keeping region diversity in the warm set. If you pass `host` or `hosts`, startup stays constrained to those configured relays unless you explicitly opt into using the discovery provider alongside them.
 
+Connections to the standard relay port `41046` also try the same host on `443`, `993`, `1723`, and `10000`, starting another TLS attempt every 250 ms while earlier attempts are pending. A failed TLS attempt starts the next port immediately. The first completed TLS handshake wins; unused sockets and timers are closed. The normal Diode identity and ticket handshake must still succeed before the connection is ready. Reconnection tries the last working port first. This applies to seed, discovered, and target-device relay connections, including direct `DiodeConnection` use.
+
+This allows operation on networks that block `41046` but permit Diode TLS on `443` or `993`. These are Diode node's default alternate listeners; individual operators may configure different ports. Port `443` carries the existing Diode protocol, not HTTPS, so a network that only permits HTTP through a proxy may still reject it. Explicit nonstandard ports stay pinned. Set `relayPortFallback: false` to pin `41046` too. The configured `connection.port` stays unchanged; `connection.socket.remotePort` identifies the active listener. API/TLS remains the default app transport, and explicit Native TCP/UDP selections retain their existing behavior and network requirements.
+
+For direct connections, pass this option as the fourth constructor argument: `new DiodeConnection(host, 41046, keyLocation, { relayPortFallback: false })`.
+
 ```javascript
 const { DiodeClientManager, BindPort } = require('diodejs');
 
@@ -523,6 +529,7 @@ main();
 - **Constructor**: `new DiodeClientManager(options)`
   - `options.host` (string, optional): Single relay host (with or without port). If provided, only this relay is used initially.
   - `options.port` (number, optional): Port to use when `options.host` has no port. Defaults to `41046`.
+  - `options.relayPortFallback` (boolean, optional): Try standard alternate listeners when connecting to port `41046`. Defaults to `true`. Set to `false` to dial only the configured port.
   - `options.hosts` (string[] or comma-separated string, optional): Explicit relay list.
   - `options.keyLocation` (string, optional): Key storage path (default: `./db/keys.json`).
   - `options.fleetContract` (string, optional): Fleet contract used for relay tickets. Must be a 20-byte EVM address hex string. Defaults to `0x6000000000000000000000000000000000000000`.

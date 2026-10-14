@@ -159,6 +159,7 @@ class DiodeClientManager extends EventEmitter {
 
     this.keyLocation = options.keyLocation || './db/keys.json';
     this.defaultPort = Number.isFinite(options.port) && options.port > 0 ? options.port : 41046;
+    this.relayPortFallback = options.relayPortFallback !== false;
     this.deviceCacheTtlMs = Number.isFinite(options.deviceCacheTtlMs)
       ? options.deviceCacheTtlMs
       : 30000;
@@ -1427,7 +1428,9 @@ class DiodeClientManager extends EventEmitter {
       return existing;
     }
 
-    const connection = new DiodeConnection(host, port, this.keyLocation);
+    const connection = new DiodeConnection(host, port, this.keyLocation, {
+      relayPortFallback: this.relayPortFallback,
+    });
     connection._managerReady = false;
     this._registerConnection(connection, hostKey);
     const generation = this._lifecycleGeneration;

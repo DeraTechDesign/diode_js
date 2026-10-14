@@ -1,5 +1,5 @@
 // connection.js
-const tls = require('tls');
+const { connectRelayPorts } = require('./relayPorts');
 const fs = require('fs');
 const { RLP } = require('@ethereumjs/rlp');
 const EventEmitter = require('events');
@@ -114,10 +114,12 @@ const TICKET_HEADROOM_LEVELS = [1024, 64 * 1024, 256 * 1024, 1024 * 1024];
 const RELAY_USAGE_HELLO_VERSION = 1001;
 
 class DiodeConnection extends EventEmitter {
-  constructor(host, port, keyLocation = './db/keys.json') {
+  constructor(host, port, keyLocation = './db/keys.json', options = {}) {
     super();
     this.host = host;
     this.port = port;
+    this.relayPortFallback = options.relayPortFallback !== false;
+    this._preferredRelayPort = null;
     this.keyLocation = keyLocation;
     this.socket = null;
     this.requestId = 0; // Initialize request ID counter
@@ -291,10 +293,12 @@ class DiodeConnection extends EventEmitter {
     const attempt = new Promise((resolve, reject) => {
       let settled = false;
       let connectTimer = null;
+      let cancelDial = null;
 
       const settle = (error) => {
         if (settled) return;
         settled = true;
+        if (cancelDial) cancelDial();
         if (connectTimer) {
           clearTimeout(connectTimer);
           connectTimer = null;
@@ -322,119 +326,138 @@ class DiodeConnection extends EventEmitter {
         maxVersion: 'TLSv1.2',
       };
 
-      let socket;
-      try {
-        socket = tls.connect(this.port, this.host, options, async () => {
-          if (generation !== this._socketGeneration || socket !== this.socket || this._closed) return;
-          this._transportReady = true;
-          const relayHost = this.getServerRelayHost(socket);
-          const relayPort = socket.remotePort || this.port;
-          logger.info(() => `Connected to Diode relay ${relayHost}:${relayPort}`);
-          socket.setKeepAlive(true, 1500);
-          socket.setNoDelay(true);
+      const onSecure = async (socket, relayPort) => {
+        if (settled || generation !== this._socketGeneration || this._closed) {
+          socket.destroy();
+          return;
+        }
+        this.socket = socket;
+        attachSocket(socket);
+        this._transportReady = true;
+        const relayHost = this.getServerRelayHost(socket);
+        logger.info(() => `Connected to Diode relay ${relayHost}:${relayPort}`);
+        socket.setKeepAlive(true, 1500);
+        socket.setNoDelay(true);
 
-          try {
-            const handshakeOptions = {
-              allowTransportReady: true,
-              expectedSocket: socket,
-              expectedGeneration: generation,
-            };
-            this._assertCurrentTransport(socket, generation, 'Diode handshake');
-            const cachedServerAddress = await this._waitForServerEthereumAddress(handshakeOptions);
-            this._assertCurrentTransport(socket, generation, 'Diode server identity lookup');
-            if (cachedServerAddress) this._serverEthAddress = cachedServerAddress;
-            this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
-            await this._refreshTicketUsage(handshakeOptions);
-            this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
-            const ticketCommand = await this.createTicketCommand(handshakeOptions);
-            this._assertCurrentTransport(socket, generation, 'Diode ticket creation');
-            const ticketResponse = await this._sendCommandTransportReady(ticketCommand, handshakeOptions);
-            this._assertCurrentTransport(socket, generation, 'Diode ticket submission');
-            const ticketStatus = ticketResponse && ticketResponse[0] !== undefined
-              ? parseResponseType(ticketResponse[0])
-              : '';
-            if (ticketStatus !== 'thanks!') {
-              throw new DiodeConnectionError(
-                `Diode relay rejected the connection ticket (${ticketStatus || 'empty response'})`,
-                'DIODE_TICKET_REJECTED'
-              );
-            }
+        try {
+          const handshakeOptions = {
+            allowTransportReady: true,
+            expectedSocket: socket,
+            expectedGeneration: generation,
+          };
+          this._assertCurrentTransport(socket, generation, 'Diode handshake');
+          const cachedServerAddress = await this._waitForServerEthereumAddress(handshakeOptions);
+          this._assertCurrentTransport(socket, generation, 'Diode server identity lookup');
+          if (cachedServerAddress) this._serverEthAddress = cachedServerAddress;
+          this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
+          await this._refreshTicketUsage(handshakeOptions);
+          this._assertCurrentTransport(socket, generation, 'Diode relay usage synchronization');
+          const ticketCommand = await this.createTicketCommand(handshakeOptions);
+          this._assertCurrentTransport(socket, generation, 'Diode ticket creation');
+          const ticketResponse = await this._sendCommandTransportReady(ticketCommand, handshakeOptions);
+          this._assertCurrentTransport(socket, generation, 'Diode ticket submission');
+          const ticketStatus = ticketResponse && ticketResponse[0] !== undefined
+            ? parseResponseType(ticketResponse[0])
+            : '';
+          if (ticketStatus !== 'thanks!') {
+            throw new DiodeConnectionError(
+              `Diode relay rejected the connection ticket (${ticketStatus || 'empty response'})`,
+              'DIODE_TICKET_REJECTED'
+            );
+          }
 
-            this._assertCurrentTransport(socket, generation, 'Diode handshake completion');
-            this._ready = true;
-            this.isReconnecting = false;
-            this.retryCount = 0;
-            this._startTicketUpdateTimer();
-            // A bounded handshake ticket can leave a large unpaid backlog.
-            // Continue paying it promptly instead of waiting for the timer or
-            // another packet to arrive.
-            if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
-              setImmediate(() => {
-                if (generation !== this._socketGeneration || !this.isReady()) return;
-                this._updateTicketIfNeeded(true).catch((error) => {
-                  logger.error(() => `Error catching up connection tickets: ${error}`);
-                });
+          this._assertCurrentTransport(socket, generation, 'Diode handshake completion');
+          this._ready = true;
+          this._preferredRelayPort = relayPort;
+          this.isReconnecting = false;
+          this.retryCount = 0;
+          this._startTicketUpdateTimer();
+          // A bounded handshake ticket can leave a large unpaid backlog.
+          // Continue paying it promptly instead of waiting for the timer or
+          // another packet to arrive.
+          if (this.accumulatedBytes >= this.ticketUpdateThreshold) {
+            setImmediate(() => {
+              if (generation !== this._socketGeneration || !this.isReady()) return;
+              this._updateTicketIfNeeded(true).catch((error) => {
+                logger.error(() => `Error catching up connection tickets: ${error}`);
               });
-            }
-            if (this._resolveReconnectWaiter) this._resolveReconnectWaiter();
-            settle();
+            });
+          }
+          if (this._resolveReconnectWaiter) this._resolveReconnectWaiter();
+          settle();
+        } catch (error) {
+          logger.error(() => `Error completing Diode handshake: ${error}`);
+          settle(error instanceof Error ? error : new DiodeConnectionError(String(error)));
+          if (!socket.destroyed) socket.destroy();
+        }
+      };
+      const attachSocket = (socket) => {
+        socket._diodeGeneration = generation;
+
+        socket.on('data', (data) => {
+          if (generation !== this._socketGeneration || socket !== this.socket) return;
+          this._recordTrafficBytes(data.length);
+          try {
+            this._handleData(data, generation);
           } catch (error) {
-            logger.error(() => `Error completing Diode handshake: ${error}`);
-            settle(error instanceof Error ? error : new DiodeConnectionError(String(error)));
-            if (!socket.destroyed) socket.destroy();
+            logger.error(() => `Error handling data: ${error}`);
           }
         });
-      } catch (error) {
-        settle(error instanceof Error ? error : new DiodeConnectionError(String(error)));
+
+        socket.on('error', (err) => {
+          if (generation !== this._socketGeneration) return;
+          logger.error(() => `Connection error: ${err}`);
+          settle(err instanceof Error ? err : new DiodeConnectionError(String(err)));
+          this._handleDisconnect(socket, generation, err);
+        });
+
+        socket.on('end', () => {
+          logger.info(() => 'Disconnected from server');
+          const error = new DiodeDisconnectedError('Diode relay ended the connection');
+          settle(error);
+          this._handleDisconnect(socket, generation, error);
+        });
+
+        socket.on('close', (hadError) => {
+          logger.info(() => `Connection closed${hadError ? ' due to error' : ''}`);
+          const error = new DiodeDisconnectedError(
+            hadError ? 'Diode relay connection closed due to an error' : 'Diode relay connection closed'
+          );
+          settle(error);
+          this._handleDisconnect(socket, generation, error);
+        });
+
+        socket.on('timeout', () => {
+          const error = new DiodeConnectionError(
+            'Diode relay socket timed out',
+            'DIODE_SOCKET_TIMEOUT',
+            { retryable: true }
+          );
+          logger.warn(() => error.message);
+          settle(error);
+          this._handleDisconnect(socket, generation, error);
+        });
+      };
+
+      cancelDial = connectRelayPorts({
+        host: this.host,
+        port: this.port,
+        tlsOptions: options,
+        fallback: this.relayPortFallback,
+        preferredPort: this._preferredRelayPort,
+        onAttempt: (socket) => {
+          if (!this.socket || this.socket.destroyed) this.socket = socket;
+        },
+        onSecure,
+        onError: (error) => {
+          settle(error);
+          this._handleDisconnect(this.socket, generation, error);
+        },
+      });
+      if (settled) {
+        cancelDial();
         return;
       }
-
-      this.socket = socket;
-      socket._diodeGeneration = generation;
-
-      socket.on('data', (data) => {
-        if (generation !== this._socketGeneration || socket !== this.socket) return;
-        this._recordTrafficBytes(data.length);
-        try {
-          this._handleData(data, generation);
-        } catch (error) {
-          logger.error(() => `Error handling data: ${error}`);
-        }
-      });
-
-      socket.on('error', (err) => {
-        if (generation !== this._socketGeneration) return;
-        logger.error(() => `Connection error: ${err}`);
-        settle(err instanceof Error ? err : new DiodeConnectionError(String(err)));
-        this._handleDisconnect(socket, generation, err);
-      });
-
-      socket.on('end', () => {
-        logger.info(() => 'Disconnected from server');
-        const error = new DiodeDisconnectedError('Diode relay ended the connection');
-        settle(error);
-        this._handleDisconnect(socket, generation, error);
-      });
-
-      socket.on('close', (hadError) => {
-        logger.info(() => `Connection closed${hadError ? ' due to error' : ''}`);
-        const error = new DiodeDisconnectedError(
-          hadError ? 'Diode relay connection closed due to an error' : 'Diode relay connection closed'
-        );
-        settle(error);
-        this._handleDisconnect(socket, generation, error);
-      });
-
-      socket.on('timeout', () => {
-        const error = new DiodeConnectionError(
-          'Diode relay socket timed out',
-          'DIODE_SOCKET_TIMEOUT',
-          { retryable: true }
-        );
-        logger.warn(() => error.message);
-        settle(error);
-        this._handleDisconnect(socket, generation, error);
-      });
 
       connectTimer = setTimeout(() => {
         if (settled) return;
@@ -444,7 +467,7 @@ class DiodeConnection extends EventEmitter {
           { retryable: true }
         );
         settle(error);
-        this._handleDisconnect(socket, generation, error);
+        this._handleDisconnect(this.socket, generation, error);
       }, connectTimeoutMs);
     });
 
