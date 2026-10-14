@@ -180,6 +180,7 @@ class DiodeClientManager extends EventEmitter {
     this.pendingConnections = new Map();
     this.pendingProbes = new Map();
     this.pendingDeviceResolutions = new Map();
+    this._networkDiscoveryControllers = new Set();
     this.deviceRelayCache = new Map();
     this.relayScores = new Map();
     this._rpcByConnection = new Map();
@@ -756,11 +757,19 @@ class DiodeClientManager extends EventEmitter {
   }
 
   async _fetchNetworkDiscoveryNodes() {
-    return fetchNetworkDirectory({
-      endpoint: this.relaySelection.networkDiscovery.endpoint,
-      method: this.relaySelection.networkDiscovery.method,
-      timeoutMs: this.relaySelection.networkDiscovery.timeoutMs,
-    });
+    if (this._closed) throw new Error('Diode client manager is closed');
+    const controller = new AbortController();
+    this._networkDiscoveryControllers.add(controller);
+    try {
+      return await fetchNetworkDirectory({
+        endpoint: this.relaySelection.networkDiscovery.endpoint,
+        method: this.relaySelection.networkDiscovery.method,
+        timeoutMs: this.relaySelection.networkDiscovery.timeoutMs,
+        signal: controller.signal,
+      });
+    } finally {
+      this._networkDiscoveryControllers.delete(controller);
+    }
   }
 
   _normalizeNetworkNode(entry, index) {
@@ -2300,6 +2309,8 @@ class DiodeClientManager extends EventEmitter {
     if (this._closed) return;
     this._closed = true;
     this._lifecycleGeneration += 1;
+    for (const controller of this._networkDiscoveryControllers) controller.abort();
+    this._networkDiscoveryControllers.clear();
     if (this._rejectStartupReady) {
       this._rejectStartupReady(new Error('Diode client manager closed during startup'));
       this._rejectStartupReady = null;

@@ -6,6 +6,33 @@ const tls = require('node:tls');
 const { KEYUTIL } = require('jsrsasign');
 const { generateCert } = require('../utils');
 const { fetchNetworkDirectory } = require('../networkDiscoveryClient');
+const DiodeClientManager = require('../clientManager');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+test('manager shutdown cancels an in-flight directory request immediately', async t => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'diode-discovery-close-'));
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await once(server, 'listening');
+  const manager = new DiodeClientManager({ keyLocation: path.join(temp, 'key.json'), relaySelection: {
+    scoreCachePath: null, networkDiscovery: { endpoint: `ws://127.0.0.1:${server.address().port}`, timeoutMs: 2000 },
+  } });
+  t.after(async () => {
+    manager.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(temp, { recursive: true, force: true });
+  });
+  const connected = once(server, 'connection');
+  const outcome = manager._fetchNetworkDiscoveryNodes().then(() => 'resolved', error => error.message);
+  const [socket] = await connected;
+  const closed = once(socket, 'close').then(() => 'closed');
+  manager.close();
+  const deadline = new Promise(resolve => setTimeout(() => resolve('still open'), 100));
+  assert.equal(await Promise.race([closed, deadline]), 'closed');
+  assert.match(await outcome, /aborted/);
+});
 
 test('directory address racing retains hostname SNI and rejects an untrusted certificate', async t => {
   const keys = KEYUTIL.generateKeypair('EC', 'secp256r1');
@@ -59,6 +86,21 @@ test('a directory deadline includes DNS and ignores a resolver callback after ex
   assert.equal(typeof callback, 'function');
   callback(null, [{ address: '127.0.0.1', family: 4 }]);
   await new Promise(resolve => setImmediate(resolve));
+});
+
+test('directory cancellation works before and during DNS resolution', async () => {
+  for (const before of [true, false]) {
+    const controller = new AbortController();
+    let callback;
+    if (before) controller.abort();
+    const pending = fetchNetworkDirectory({ endpoint: 'ws://directory.test', signal: controller.signal,
+      lookup: (_host, _options, done) => { callback = done; } });
+    if (!before) controller.abort();
+    await assert.rejects(pending, /aborted/);
+    assert.equal(typeof callback, before ? 'undefined' : 'function');
+    callback?.(null, [{ address: '127.0.0.1', family: 4 }]);
+    await new Promise(resolve => setImmediate(resolve));
+  }
 });
 
 for (const reply of ['invalid JSON', JSON.stringify({ id: 1, error: { message: 'Unavailable' } }), JSON.stringify({ id: 1, result: {} })]) {

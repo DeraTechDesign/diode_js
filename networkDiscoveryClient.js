@@ -22,6 +22,7 @@ function fetchNetworkDirectory(options = {}) {
   return new Promise((resolve, reject) => {
     const hostname = new URL(endpoint).hostname.replace(/^\[|\]$/g, '');
     const deadline = Date.now() + timeoutMs;
+    const signal = options.signal;
     const sockets = new Set();
     let addresses = [], next = 0, settled = false, stagger = null, lastError;
     const closeSocket = socket => {
@@ -39,10 +40,14 @@ function fetchNetworkDirectory(options = {}) {
       settled = true;
       clearTimeout(timer);
       clearTimeout(stagger);
+      signal?.removeEventListener('abort', aborted);
       for (const socket of sockets) closeSocket(socket);
       if (error) reject(error); else resolve(value);
     };
     const timer = setTimeout(() => finish(new Error(`Network discovery timed out after ${timeoutMs}ms`)), timeoutMs);
+    const aborted = () => finish(new Error('Network discovery aborted'));
+    signal?.addEventListener('abort', aborted, { once: true });
+    if (signal?.aborted) { aborted(); return; }
 
     const startNext = () => {
       clearTimeout(stagger);

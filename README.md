@@ -553,7 +553,7 @@ main();
       - `enabled` (boolean, optional): Enables live network discovery when no explicit `host` or `hosts` is configured. Defaults to `true` in default mode.
       - `endpoint` (string, optional): Directory endpoint. Defaults to `wss://prenet.diode.io:8443/ws`.
       - `method` (string, optional): JSON-RPC method name. Defaults to `dio_network`.
-      - `timeoutMs` (number, optional): Overall DNS, TLS and directory-response deadline. Defaults to `10000`. Discovery races complete responses across up to eight DNS addresses, staggered by 250 ms, with normal hostname/certificate validation. The first usable relay can become ready while discovery continues.
+      - `timeoutMs` (number, optional): Overall DNS, TLS and directory-response deadline. Defaults to `10000`. Discovery races complete responses across up to eight DNS addresses, staggered by 250 ms, with normal hostname/certificate validation. The first usable relay can become ready while discovery continues; closing the manager cancels pending directory requests and closes their sockets.
       - `startupProbeCount` (number, optional): Number of discovered network relays added to the startup coverage probe set. Defaults to `2`.
       - `backgroundBatchSize` (number, optional): Number of discovered relays per background batch. Defaults to `12`; subsequent batches cover the remaining current directory snapshot without blocking first-connection readiness. Set `0` to disable background directory probes. Probe concurrency and retained idle connections remain bounded by `startupConcurrency` and `warmConnectionBudget`.
       - `includePrivateAddresses` (boolean, optional): Allows private or unroutable discovery results to be used. Defaults to `false`.
