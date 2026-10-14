@@ -7,6 +7,7 @@ const { once } = require('events');
 const { Duplex } = require('node:stream');
 
 const BindPort = require('../bindPort');
+const DiodeClientManager = require('../clientManager');
 const nativeCrypto = require('../nativeCrypto');
 
 test('explicit loopback listeners bind only the requested interface for every protocol', async () => {
@@ -191,6 +192,36 @@ function makeFakeUdpServer() {
   server.sendCalls = [];
   server.send = (...args) => server.sendCalls.push(args);
   return server;
+}
+
+for (const native of [false, true]) {
+  test(`${native ? 'Native' : 'API'} bind prefers a reachable low-latency relay over the device ticket relay`, async () => {
+    const calls = [];
+    const ref = native ? 41000 : makeRef('01020304');
+    const missing = makeRelay('nearest.relay:41046', new Error('not found'), calls);
+    const nearby = makeRelay('nearby.relay:41046', ref, calls);
+    const distant = makeRelay('ticket.relay:41046', ref, calls);
+    if (native) for (const relay of [missing, nearby, distant]) relay.RPC.portOpen2 = relay.RPC.portOpen;
+    const manager = new FakeManager({ relays: [distant, nearby, missing], resolvedRelay: distant, nearestRelay: missing });
+    manager.relaySelection = { enabled: true };
+    manager.relayScores = new Map([[missing, 10], [nearby, 20], [distant, 240]].map(([relay, ms]) =>
+      [relay._managerHostKey, { ewmaLatencyMs: ms }]));
+    manager._isRelayScoreFresh = () => true;
+    manager._rankConnectedConnections = DiodeClientManager.prototype._rankConnectedConnections;
+    const bind = new BindPort(manager, {});
+    try {
+      const result = await bind._openPortWithRelayFallback(Buffer.alloc(20, 1), '01'.repeat(20), 'tcp:1433', 'rw', native);
+      assert.equal(result.connection, nearby);
+      assert.deepEqual(calls.map(call => call.hostKey), [missing._managerHostKey, nearby._managerHostKey]);
+      assert.equal(native ? result.physicalPort : result.ref, ref);
+      // An explicit opt-out retains ticket-first routing.
+      calls.length = 0;
+      manager.relaySelection.enabled = false;
+      const pinned = await bind._openPortWithRelayFallback(Buffer.alloc(20, 1), '01'.repeat(20), 'tcp:1433', 'rw', native);
+      assert.equal(pinned.connection, distant);
+      assert.deepEqual(calls.map(call => call.hostKey), [distant._managerHostKey]);
+    } finally { bind.dispose(); }
+  });
 }
 
 test('API portopen falls back to another relay and clears stale device cache', async () => {

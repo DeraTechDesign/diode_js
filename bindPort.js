@@ -469,6 +469,15 @@ class BindPort extends EventEmitter {
       push(this.connection);
     }
 
+    // A device ticket advertises one of its relays, not necessarily its only
+    // reachable relay. Putting that answer first can route an interactive
+    // stream overseas even when both peers already share a nearby relay.
+    // Try ready relays in measured latency order; portopen still checks actual
+    // device presence and authorization, with the ticket relay as a fallback.
+    if (this.connection?.relaySelection?.enabled &&
+        typeof this.connection._rankConnectedConnections === 'function') {
+      return this.connection._rankConnectedConnections(candidates);
+    }
     return candidates;
   }
 

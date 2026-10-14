@@ -301,7 +301,7 @@ const client = new DiodeClientManager({
 });
 ```
 
-Routing note: the initiating client can prefer a better local relay, but it cannot override the relay encoded in the remote device ticket. Best results come when both clients use the manager's relay ranking so each side reconnects toward a closer relay over time.
+Routing note: binds try ready relay connections in measured latency order. A device ticket advertises one relay, while the device may also be connected to faster shared relays. Each port-open attempt verifies that the target is reachable and permits access; the advertised relay remains a fallback. This applies to API and Native transports without changing saved transport choices. Disabling relay selection retains the original ticket-first order.
 
 Discovery note: startup discovery sources are now `configured/seed`, `discoveryProvider`, built-in live `dio_network` discovery, cached non-provider/non-network relays, and target-on-demand relay resolution from `getNode(serverId)`. Provider and network membership are not cached independently; only RTT/history is persisted in `relay-scores.json`.
 
