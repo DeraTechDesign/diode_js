@@ -73,8 +73,13 @@ function fetchNetworkDirectory(options = {}) {
           // Keeping each socket single-address also avoids Node 20.11's
           // multi-address cancellation assertion on deadline/loser cleanup.
           autoSelectFamily: false,
-          lookup: (_host, lookupOptions, callback) => lookupOptions?.all
-            ? callback(null, [address]) : callback(null, address.address, address.family),
+          // Match dns.lookup's asynchronous contract. An immediate IPv6
+          // ENETUNREACH can otherwise fire on TLSSocket before ClientRequest
+          // has attached its socket error listener (including Node 20).
+          lookup: (_host, lookupOptions, callback) => process.nextTick(() => {
+            if (lookupOptions?.all) callback(null, [address]);
+            else callback(null, address.address, address.family);
+          }),
           handshakeTimeout: Math.max(1, deadline - Date.now()),
           origin: 'https://diode.io',
         });

@@ -182,6 +182,7 @@ class BindPort extends EventEmitter {
     this.nativeQueueLimitBytes = parseInt(process.env.DIODE_NATIVE_QUEUE_LIMIT_BYTES, 10) || MAX_SOCKET_QUEUE_BYTES;
     this.udpSessionIdleTimeoutMs = normalizeTimerMs(process.env.DIODE_UDP_SESSION_IDLE_TIMEOUT_MS, 300000);
     this._activeContexts = new Set();
+    this._lastBindAttempts = new Map();
     this._disposed = false;
     
     // Set up listener for unsolicited messages once
@@ -412,6 +413,75 @@ class BindPort extends EventEmitter {
     const normalized = this._stripHexPrefix(deviceIdHex || '').toLowerCase();
     cache.delete(normalized);
     cache.delete(`0x${normalized}`);
+  }
+
+  getBindDiagnostics(localPort) {
+    return this._lastBindAttempts.get(Number(localPort)) || null;
+  }
+
+  _recordBindAttempt(localPort, connection, phase, error = null) {
+    const relay = this._connectionKey(connection);
+    const code = error ? String(error.code || 'DIODE_TUNNEL_FAILED').replace(/[^A-Z0-9_]/gi, '').slice(0, 80) : null;
+    this._lastBindAttempts.set(Number(localPort), {
+      phase, relay, code, checkedAt: new Date().toISOString(),
+      relayReady: this._isUsableConnection(connection),
+      ticketAccepted: connection?._ticketAcceptedOnTransport === true,
+    });
+    if (this._lastBindAttempts.size > 256) this._lastBindAttempts.delete(this._lastBindAttempts.keys().next().value);
+  }
+
+  async _prepareApiTlsAttempt(opened, parent) {
+    const { connection, rpc, ref } = opened;
+    const attempt = this._trackContext(parent.server, parent.localPort, {
+      connection, rpc, ref, sockets: new Set(),
+    });
+    parent.tlsAttempt = attempt;
+    parent.cleanup = () => this._closeContext(parent.tlsAttempt);
+    this._recordBindAttempt(parent.localPort, connection, 'tls-handshake');
+    try {
+      if (parent.closed) throw new Error('Bind closed before TLS handshake');
+      const cert = connection.getDeviceCertificate();
+      if (!cert) throw new Error('No device certificate available');
+      const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs, connection);
+      attempt.sockets.add(diodeSocket);
+      const tlsSocket = tls.connect({ socket: diodeSocket, cert, key: cert, rejectUnauthorized: false,
+        ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384', ecdhCurve: 'secp256k1',
+        minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' });
+      attempt.sockets.add(tlsSocket);
+      diodeSocket.on('error', error => tlsSocket.destroy(error));
+      tlsSocket.on('error', error => {
+        this._recordBindAttempt(parent.localPort, connection, 'tls-error', error);
+        if (attempt.ready) this._closeContext(parent);
+      });
+      tlsSocket.setNoDelay(true);
+      attempt.clientSocketWrapper = { diodeSocket, tlsSocket, _diodeOwner: this, _diodeContext: attempt };
+      this._replaceClientSocket(connection, ref, attempt.clientSocketWrapper);
+      await new Promise((resolve, reject) => {
+        const finish = error => {
+          clearTimeout(timer);
+          tlsSocket.removeListener('secureConnect', ready);
+          tlsSocket.removeListener('error', failed);
+          tlsSocket.removeListener('close', closed);
+          if (error) reject(error); else resolve();
+        };
+        const ready = () => finish();
+        const failed = error => finish(error);
+        const closed = () => finish(Object.assign(new Error('Private TLS tunnel closed during handshake'), { code: 'DIODE_TLS_CLOSED' }));
+        const timer = setTimeout(() => finish(Object.assign(new Error('Private TLS handshake timed out'), { code: 'DIODE_TLS_TIMEOUT' })), this.handshakeTimeoutMs);
+        tlsSocket.once('secureConnect', ready);
+        tlsSocket.once('error', failed);
+        tlsSocket.once('close', closed);
+        if (attempt.closed || parent.closed || tlsSocket.destroyed) closed();
+      });
+      if (parent.closed || attempt.closed || tlsSocket.destroyed) throw new Error('Bind closed during TLS handshake');
+      attempt.ready = true;
+      this._recordBindAttempt(parent.localPort, connection, 'tls-ready');
+      return { tlsAttempt: attempt, tlsSocket, diodeSocket };
+    } catch (error) {
+      this._recordBindAttempt(parent.localPort, connection, 'tls-failed', error);
+      this._closeContext(attempt);
+      throw error;
+    }
   }
 
   async _getApiRelayCandidates(deviceId, deviceIdHex, onDeferred = null) {
@@ -908,6 +978,7 @@ class BindPort extends EventEmitter {
     
     // Remove from config
     delete this.portsConfig[localPort];
+    this._lastBindAttempts.delete(Number(localPort));
     return true;
   }
   
@@ -919,6 +990,7 @@ class BindPort extends EventEmitter {
       logger.info(() => `Server on port ${localPort} closed`);
     }
     this.servers.clear();
+    this._lastBindAttempts.clear();
   }
 
   dispose() {
@@ -1418,20 +1490,25 @@ class BindPort extends EventEmitter {
           return;
         }
 
-        // Legacy API relay
+        // Complete TLS before forwarding any application bytes. A relay that
+        // accepts portopen but loses the private handshake must not monopolize
+        // every new request while another connected relay works.
+        let preparedTls;
         try {
           const opened = await this._openApiPortWithRelayFallback(deviceId, deviceIdHex, formattedTargetPort, 'rw',
-            { cancelled: () => context.closed || clientClosed || clientSocket.destroyed });
+            { cancelled: () => context.closed || clientClosed || clientSocket.destroyed,
+              prepare: protocol === 'tls' ? value => this._prepareApiTlsAttempt(value, context) : undefined });
+          preparedTls = opened;
           connection = opened.connection;
           rpc = opened.rpc;
           ref = opened.ref;
           context.connection = connection;
           context.rpc = rpc;
-          context.ref = ref;
+          context.ref = protocol === 'tls' ? null : ref;
           logger.info(() => `Port ${formattedTargetPort} opened on device with ref: ${ref.toString('hex')} for client`);
         } catch (error) {
           logger.error(() => `Error opening port ${formattedTargetPort} on device: ${error}`);
-          clientSocket.destroy();
+          this._closeContext(context);
           return;
         }
 
@@ -1443,83 +1520,19 @@ class BindPort extends EventEmitter {
         }
 
         if (protocol === 'tls') {
-          // For tls protocol, create a proper tls connection
           try {
-            // Create a DiodeSocket to handle communication with the device
-            const diodeSocket = new DiodeSocket(ref, rpc, this.ioTimeoutMs, connection);
-            
-            // Get the device certificate for tls
-            const certPem = connection.getDeviceCertificate();
-            if (!certPem) {
-              throw new Error('No device certificate available');
-            }
-            
-            // Setup tls options for client mode
-            const tlsOptions = {
-              cert: certPem,
-              key: certPem,
-              rejectUnauthorized: false,
-              ciphers: 'ECDHE-ECDSA-AES256-GCM-SHA384',
-              ecdhCurve: 'secp256k1',
-              minVersion: 'TLSv1.2',
-              maxVersion: 'TLSv1.2',
-            };
-            
-            // Create tls socket as client (not server)
-            const tlsSocket = tls.connect({
-              socket: diodeSocket,
-              ...tlsOptions
-            }, () => {
-              logger.info(() => `tls connection established to device ${deviceIdHex}`);
-            });
-            diodeSocket.on('error', error => tlsSocket.destroy(error));
-            tlsSocket.setNoDelay(true);
-            
-            // Pipe data between the client socket and the tls socket
-            tlsSocket.pipe(clientSocket).pipe(tlsSocket);
-            
-            // Handle tls socket errors
-            tlsSocket.on('error', (err) => {
-              logger.error(() => `tls Socket error: ${err}`);
-              closeRemoteRef();
-            });
-            
-            // Store reference to the diodeSocket so we can push data to it
-            const socketWrapper = {
-              diodeSocket,
-              tlsSocket,
-              end: () => {
-                try { tlsSocket.end(); } catch {}
-                try { diodeSocket.destroy(); } catch {}
-              }
-            };
-            tlsSocketWrapper = socketWrapper;
+            const { diodeSocket, tlsSocket, tlsAttempt } = preparedTls;
+            if (tlsAttempt.closed || tlsSocket.destroyed) throw new Error('Private TLS tunnel closed before forwarding');
+            tlsSocketWrapper = tlsAttempt.clientSocketWrapper;
             context.finishWrites = () => diodeSocket.finishTlsWrites(tlsSocket);
-            socketWrapper._diodeOwner = this;
-            socketWrapper._diodeContext = context;
-            context.sockets.add(tlsSocket);
-            context.sockets.add(diodeSocket);
-            
-            // Store the socket wrapper
-            context.clientSocketWrapper = socketWrapper;
-            this._replaceClientSocket(connection, ref, socketWrapper);
-            const secureTimer = setTimeout(() => {
-              logger.error(() => `TLS connection timed out for device ${deviceIdHex}`);
-              this._closeContext(context);
-            }, normalizeTimerMs(this.handshakeTimeoutMs, 10000));
-            tlsSocket.once('secureConnect', () => {
-              clearTimeout(secureTimer);
-              if (!clientSocket.destroyed) clientSocket.resume();
-            });
             tlsSocket.once('close', () => {
-              clearTimeout(secureTimer);
               if (!clientSocket.destroyed) {
                 clientSocket.end();
               }
               // The local socket's close event cleans up after its buffered
               // plaintext has drained. Errors still destroy the context.
             });
-            
+            tlsSocket.pipe(clientSocket).pipe(tlsSocket);
           } catch (error) {
             logger.error(() => `Error setting up tls connection: ${error}`);
             if (tlsSocketWrapper && typeof tlsSocketWrapper.end === 'function') {
